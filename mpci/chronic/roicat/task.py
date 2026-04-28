@@ -274,7 +274,7 @@ class ROICaTTask(SubjectAggregateTask):
         if sessions_to_include and sessions_to_exclude:
             raise ValueError('Cannot specify both sessions_to_include and sessions_to_exclude')
         paths = self.fetch_fov_list(sessions_to_exclude=sessions_to_exclude, sessions_to_include=sessions_to_include)
-        paths = paths[:24]  # TODO remove limit
+        # paths = paths[:24]  # TODO remove limit
         grouped = self.group_fovs(paths, **kwargs)
 
         if display:
@@ -444,7 +444,8 @@ class ROICaTTask(SubjectAggregateTask):
             'FOV_clusters.gif', 'clustering/dist.png'
         ]
         # TODO: Could add gif of ROI samples
-        note = dict(user=self.one.alyx.user, content_type='subject', object_id=self.subject_path.name,
+        subject_id = self.one.alyx.rest('subjects', 'read', id=self.subject_path.name)['id']
+        note = dict(user=self.one.alyx.user, content_type='subject', object_id=subject_id,
                     text='', json=kwargs or None)
         notes = []
         # TODO Handle duplicate notes

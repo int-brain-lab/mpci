@@ -26,6 +26,12 @@ dependencies = [
     "iblatlas"
 ]
 
+[project.optional-dependencies]
+masknmf = [
+    "masknmf-toolbox @ git+https://github.com/apasarkar/masknmf-toolbox.git@xarray-compatability",
+    "fastplotlib @ git+https://github.com/fastplotlib/fastplotlib.git@ndwidget"
+]
+
 [project.urls]
 Homepage = "https://github.com/int-brain-lab/mpci"
 Documentation = "https://one.internationalbrainlab.org"
