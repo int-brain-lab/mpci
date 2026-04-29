@@ -7,9 +7,12 @@ import os
 from typing import *
 from pathlib import Path
 
+import masknmf
 import numpy as np
+from ibllib.oneibl.data_handlers import ExpectedDataset
 
 from mpci.suite2p.task import MesoscopePreprocess
+from mpci.alyx.tasks import MesoscopeTask
 
 
 class MotionBinDataset:
@@ -76,7 +79,36 @@ class MotionBinDataset:
         return self.data[item].copy()
 
 
-class MasknmfPreprocess(MesoscopePreprocess):
+class Suite2pMotionCorrection(MesoscopePreprocess):
+    """Task to extract motion corrected bin files using suite2p."""
+
+    @property
+    def signature(self):
+        signature = super().signature
+        # Discard all outputs but the motion corrected bin files
+        signature['output_files'] = [
+            ('imaging.frames_motionRegistered.bin', 'suite2p/plane*', True),
+            ('ops.npy', 'suite2p/plane*', True)]
+        return signature
+
+    def _run(self, roidetect=False, rename_files=True, **kwargs):
+        # Run the parent method to extract the motion corrected bin files
+        out = super()._run(roidetect=False, rename_files=rename_files, **kwargs)
+
+    def _rename_outputs(self, suite2p_dir, frameQC_names, frameQC, rename_dict=None):
+        for plane_dir in self._get_plane_paths(suite2p_dir):
+            # TODO Can extract ops from zip if needed
+            assert plane_dir.joinpath('ops.npy').exists(), f'Expected ops.npy file in {plane_dir} not found.'
+
+            renamed = plane_dir.joinpath('imaging.frames_motionRegistered.bin')
+            if renamed.exists():
+                continue
+            # Rename the registered bin file
+            if (bin_file := plane_dir.joinpath('data.bin')).exists():
+                bin_file.rename(renamed)
+
+
+class MasknmfPreprocess(MesoscopeTask):
     """This pipeline does the following right now:
         1. Run motion correction + save out registered bin files using suite2p
         2. Compress + Denoise these .bin files
@@ -84,41 +116,32 @@ class MasknmfPreprocess(MesoscopePreprocess):
 
     @property
     def signature(self):
-        signature = super().signature
-        # Discard all outputs but the motion corrected bin files
-        signature['output_files'] = [('imaging.frames_motionRegistered.bin', 'suite2p/plane*', True)]
+        signature = {}
+        I, O = ExpectedDataset.input, ExpectedDataset.output
+        signature['input_files'] = [I('imaging.frames_motionRegistered.bin', 'suite2p/plane*', True, unique=False)]
+        signature['output_files'] = [
+            O('moco_rewrite_masknmf.hdf5', 'suite2p/plane*', True, unique=False),
+            O('demixing.hdf5', 'suite2p/plane*', True, unique=False)]
         return signature
 
     def _run(self, roidetect=False, rename_files=True, **kwargs):
-        import masknmf
-        # Run the parent method to extract the motion corrected bin files
-        if kwargs.get('do_registration', True):
-            out = super()._run(roidetect=False, rename_files=rename_files, **kwargs)
-        else:
-            out = []
-            for plane_dir in super()._get_plane_paths(super().session_path.joinpath('suite2p')):
-                out.append(plane_dir.joinpath('imaging.frames_motionRegistered.bin'))
-
-        #Now there is a list of out files
-        for file in out:
-            parent = os.path.abspath(file).parent
-            metadata_file = os.path.joinpath(parent, "ops.npy")
-            bin_file = os.path.abspath(file)
+        out = []
+        _, bin_files, _ = self.input_files[0].find_files(self.session_path)
+        for bin_file in bin_files:
+            # FIXME this is a hack
+            if (motion_file := Path.cwd() / 'motion_correction.hdf5').exists():
+                print(f'Removing existing motion correction file at {motion_file}')
+                motion_file.unlink()
+            metadata_file = bin_file.with_name('ops.npy')
             moco_data = MotionBinDataset(bin_file, metadata_file)
-            out_motion_path = os.path.joinpath(parent, "moco_rewrite_masknmf.hdf5") ## This will eventually be removed
+            out_motion_path = bin_file.with_name('moco_rewrite_masknmf.hdf5') ## This will eventually be removed
+            out_demix_path = out_motion_path.with_stem('demixing')
             pipeline = masknmf.TwoPhotonCalciumPipeline(motion_correct_config="skip", frame_batch_size=300, load_into_ram = False)
             demixing_results = pipeline.run(moco_data)
-            demixing_results.export(os.path.join(parent, "demixing.hdf5")) ## The demixing results are saved here now
+            demixing_results.export(out_demix_path) ## The demixing results are saved here now
+            out.extend([out_motion_path, out_demix_path])
+        return out
 
-    def _rename_outputs(self, suite2p_dir, frameQC_names, frameQC, rename_dict=None):
-        for plane_dir in self._get_plane_paths(suite2p_dir):
-            renamed = plane_dir.joinpath('imaging.frames_motionRegistered.bin')
-            if renamed.exists():
-                continue
-            # Rename the registered bin file
-            if (bin_file := plane_dir.joinpath('data.bin')).exists():
-                bin_file.rename(renamed)
-#
 #
 # if __name__ == '__main__':
 #     kwargs = {

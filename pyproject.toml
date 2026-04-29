@@ -27,19 +27,24 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+suite2p = [
+    "suite2p"
+]
+
 masknmf = [
-    "masknmf-toolbox @ git+https://github.com/apasarkar/masknmf-toolbox.git@xarray-compatability",
+    "mpci[suite2p]",  # suite2p is currently a requirement due to class inheritance
+    "masknmf @ git+https://github.com/apasarkar/masknmf-toolbox.git@xarray-compatability",
     "fastplotlib @ git+https://github.com/fastplotlib/fastplotlib.git@ndwidget"
 ]
 
 [project.urls]
 Homepage = "https://github.com/int-brain-lab/mpci"
-Documentation = "https://one.internationalbrainlab.org"
+Documentation = "https://docs.internationalbrainlab.org"
 Repository = "https://github.com/int-brain-lab/mpci.git"
 Issues = "https://github.com/int-brain-lab/mpci/issues"
 
 [tool.setuptools.dynamic]
-version = {attr = "one.__version__"}
+version = {attr = "mpci.__version__"}
 readme = {file = ["README.md"], content-type = "text/markdown"}
 
 [tool.setuptools.packages.find]

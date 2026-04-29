@@ -1,4 +1,5 @@
 import logging
+import importlib.metadata
 from itertools import chain
 
 from ibllib.pipes.base_tasks import DynamicTask, RegisterRawDataTask
@@ -13,7 +14,7 @@ _logger = logging.getLogger(__name__)
 
 class MesoscopeTask(DynamicTask):
 
-    version = mpci.__version__
+    version = importlib.metadata.version('mpci')
 
     def __init__(self, session_path, **kwargs):
         super().__init__(session_path, **kwargs)
