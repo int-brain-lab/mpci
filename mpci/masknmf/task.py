@@ -10,7 +10,6 @@ from pathlib import Path
 import masknmf
 import numpy as np
 from ibllib.oneibl.data_handlers import ExpectedDataset
-
 from mpci.suite2p.task import MesoscopePreprocess
 from mpci.alyx.tasks import MesoscopeTask
 
@@ -135,11 +134,25 @@ class MasknmfPreprocess(MesoscopeTask):
             metadata_file = bin_file.with_name('ops.npy')
             moco_data = MotionBinDataset(bin_file, metadata_file)
             out_motion_path = bin_file.with_name('moco_rewrite_masknmf.hdf5') ## This will eventually be removed
+            if out_motion_path.exists():  # FIXME this is a hack
+                print(f'Removing existing motion correction file at {out_motion_path}')
+                out_motion_path.unlink()
             out_demix_path = out_motion_path.with_stem('demixing')
-            pipeline = masknmf.TwoPhotonCalciumPipeline(motion_correct_config="skip", frame_batch_size=300, load_into_ram = False)
-            demixing_results = pipeline.run(moco_data)
-            demixing_results.export(out_demix_path) ## The demixing results are saved here now
+            out_compress_path = out_motion_path.with_stem('compression')
+            pipeline = masknmf.TwoPhotonCalciumPipeline(motion_correct_config="skip", 
+                                                        compress_config=masknmf.CompressDenoiseConfig(block_sizes=(32, 32)),
+                                                        frame_batch_size=300, 
+                                                        load_into_ram = True,
+                                                        outpath_motion_correction=out_motion_path,
+                                                        outpath_compression=out_compress_path,
+                                                        outpath_demixing=out_demix_path)
+            # Get the frame rate for the FOV
+            i = int(bin_file.parent.name.split('plane')[1])
+            ts = np.load(self.session_path.joinpath(f'alf/FOV_{i:02d}/mpci.times.npy'))
+            Fs = 1 / np.mean(np.diff(ts))
+            demixing_results = pipeline.run(moco_data, Fs, exclude_border_radius=8)
             out.extend([out_motion_path, out_demix_path])
+            break
         return out
 
 #

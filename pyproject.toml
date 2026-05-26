@@ -34,7 +34,7 @@ suite2p = [
 masknmf = [
     "mpci[suite2p]",  # suite2p is currently a requirement due to class inheritance
     "masknmf @ git+https://github.com/apasarkar/masknmf-toolbox.git@xarray-compatability",
-    "fastplotlib @ git+https://github.com/fastplotlib/fastplotlib.git@ndwidget"
+    "fastplotlib @ git+https://github.com/fastplotlib/fastplotlib.git@ndwidget-proper-async"
 ]
 
 [project.urls]
