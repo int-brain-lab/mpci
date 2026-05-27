@@ -5,6 +5,7 @@ the second runs masknmf on the extracted files.
 """
 import os
 from typing import *
+import logging
 from pathlib import Path
 
 import masknmf
@@ -12,6 +13,8 @@ import numpy as np
 from ibllib.oneibl.data_handlers import ExpectedDataset
 from mpci.suite2p.task import MesoscopePreprocess
 from mpci.alyx.tasks import MesoscopeTask
+
+logger = logging.getLogger('ibllib.' + __name__)
 
 
 class MotionBinDataset:
@@ -126,17 +129,25 @@ class MasknmfPreprocess(MesoscopeTask):
     def _run(self, roidetect=False, rename_files=True, **kwargs):
         out = []
         _, bin_files, _ = self.input_files[0].find_files(self.session_path)
+        local_dir = Path('/mnt/s0/Data/Subjects').joinpath(*self.session_path.parts[-3:])
+        local_dir.mkdir(parents=True, exist_ok=True)
+        import tempfile, shutil
+        
         for bin_file in bin_files:
             # FIXME this is a hack
             if (motion_file := Path.cwd() / 'motion_correction.hdf5').exists():
                 print(f'Removing existing motion correction file at {motion_file}')
                 motion_file.unlink()
-            metadata_file = bin_file.with_name('ops.npy')
-            moco_data = MotionBinDataset(bin_file, metadata_file)
-            out_motion_path = bin_file.with_name('moco_rewrite_masknmf.hdf5') ## This will eventually be removed
-            if out_motion_path.exists():  # FIXME this is a hack
-                print(f'Removing existing motion correction file at {out_motion_path}')
-                out_motion_path.unlink()
+            
+            (p := local_dir.joinpath(bin_file.parent.name)).mkdir()
+            _bin_file = shutil.copy(bin_file, p.joinpath(bin_file.name))
+            logger.info(f'Copied {bin_file.relative_to(self.session_path)} to temporary location {_bin_file}')
+            shutil.copy(bin_file.with_name('ops.npy'), _bin_file.with_name('ops.npy'))
+            metadata_file = _bin_file.with_name('ops.npy')
+            moco_data = MotionBinDataset(_bin_file, metadata_file)
+            out_path = _bin_file.parent.joinpath('masknmf_output')
+            out_path.mkdir(exist_ok=True)
+            out_motion_path = out_path.joinpath('moco_rewrite_masknmf.hdf5') ## This will eventually be removed
             out_demix_path = out_motion_path.with_stem('demixing')
             out_compress_path = out_motion_path.with_stem('compression')
             pipeline = masknmf.TwoPhotonCalciumPipeline(motion_correct_config="skip", 
@@ -150,9 +161,15 @@ class MasknmfPreprocess(MesoscopeTask):
             i = int(bin_file.parent.name.split('plane')[1])
             ts = np.load(self.session_path.joinpath(f'alf/FOV_{i:02d}/mpci.times.npy'))
             Fs = 1 / np.mean(np.diff(ts))
+            logger.info(f'Running masknmf on {bin_file} with frame rate {Fs:.2f} Hz')
             demixing_results = pipeline.run(moco_data, Fs, exclude_border_radius=8)
-            out.extend([out_motion_path, out_demix_path])
-            break
+            # Copy masknmf_output dir to the same location as the input bin file
+            shutil.copytree(out_path, bin_file.parent.joinpath('masknmf_output'), dirs_exist_ok=True)
+            # out.extend([out_motion_path, out_demix_path])
+            out.extend([
+                bin_file.parent.joinpath('masknmf_output/moco_rewrite_masknmf.hdf5'),
+                bin_file.parent.joinpath('masknmf_output/demixing.hdf5'),
+                bin_file.parent.joinpath('masknmf_output/compression.hdf5')])
         return out
 
 #
