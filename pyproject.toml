@@ -23,7 +23,8 @@ dependencies = [
     "scikit-image",
     "opencv-python-headless",
     "tqdm",
-    "iblatlas"
+    "iblatlas",
+    "sparse"
 ]
 
 [project.optional-dependencies]

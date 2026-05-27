@@ -13,6 +13,7 @@ import numpy as np
 from ibllib.oneibl.data_handlers import ExpectedDataset
 from mpci.suite2p.task import MesoscopePreprocess
 from mpci.alyx.tasks import MesoscopeTask
+import sparse
 
 logger = logging.getLogger('ibllib.' + __name__)
 
@@ -126,7 +127,60 @@ class MasknmfPreprocess(MesoscopeTask):
             O('demixing.hdf5', 'suite2p/plane*', True, unique=False)]
         return signature
 
+    def deconv_all_traces(self, trace_matrix):
+        """
+        Runs OASIS deconvolution on calcium imaging traces
+        Args:
+            trace_matrix (np.ndarray): Shape (num_frames, num_signals)
+        Returns:
+            deconv_output (np.ndarray): Shape (num_frames, num_signals)
+        """
+        from oasis.functions import deconvolve
+
+        deconv_output = np.zeros_like(trace_matrix, dtype=np.float64)
+        for k in range(trace_matrix.shape[1]):
+            _, s, _, _, _ = deconvolve(trace_matrix[:, k], penalty=1)
+            deconv_output[:, k] = s
+
+        deconv_output = np.nan_to_num(deconv_output, copy=False, nan=0)
+        return deconv_output
+
+    def _format_to_mpci(self, demixing_results: masknmf.DemixingResults):
+        """
+        Takes as input the masknmf .hdf5 file and outputs. Uses oasis to deconvolve the traces, and outputs key numpy arrays
+        for downstream analysis
+        Args:
+            demixing_results (masknmf.DemixingResults)
+        Returns:
+            fluorescence_traces (np.ndarray). Shape (num_frames, num_signals). The extracted fluorescence traces from masknmf.
+            deconvolved_traces (np.ndarray). Shape (num_frames, num_signals). The result of running oasis deconvolution on fluorescence_traces
+            spatial_footprints (sparse.GCXS). Shape (num_signals, fov height, fov width)
+        """
+        fluorescence_traces = np.ascontiguousarray(demixing_results.ac_array.export_c(), dtype=np.float64)
+        deconv_traces = self.deconv_all_traces(fluorescence_traces)
+        spatial_sparse = demixing_results.ac_array.a
+        frames, height, width = demixing_results.shape
+
+        ##Make the mpci masks
+        row_indices, col_indices = spatial_sparse.indices()
+        num_neurons = spatial_sparse.shape[1]
+
+        # Convert row indices back to (height, width)
+        height_indices = (row_indices // width).cpu().numpy()
+        width_indices = (row_indices % width).cpu().numpy()
+        col_indices = col_indices.cpu().numpy()
+        values = spatial_sparse.values().cpu().numpy()
+
+        # Stack indices as (ndim, nnz)
+        final_ind = np.vstack([height_indices, width_indices, col_indices])
+        spatial_footprints = sparse.COO(final_ind, values, shape=(height, width, num_neurons))
+        spatial_footprints = spatial_footprints.transpose(2, 0, 1).asformat('gcxs')
+        return fluorescence_traces.astype(np.float32), deconv_traces.astype(np.float32), spatial_footprints
+
+
+
     def _run(self, roidetect=False, rename_files=True, **kwargs):
+
         out = []
         _, bin_files, _ = self.input_files[0].find_files(self.session_path)
         local_dir = Path('/mnt/s0/Data/Subjects').joinpath(*self.session_path.parts[-3:])
@@ -150,27 +204,37 @@ class MasknmfPreprocess(MesoscopeTask):
             out_motion_path = out_path.joinpath('moco_rewrite_masknmf.hdf5') ## This will eventually be removed
             out_demix_path = out_motion_path.with_stem('demixing')
             out_compress_path = out_motion_path.with_stem('compression')
+            out_roi_masks = os.path.join(out_path, 'mpciROIs.masks.sparse_npz')
+            out_fluorescence_traces = os.path.join(out_path, 'mpci.ROIActivityF.npy')
+            out_deconvolved_traces = os.path.join(out_path, 'mpci.ROIActivityDeconvolved.npy')
             pipeline = masknmf.TwoPhotonCalciumPipeline(motion_correct_config="skip", 
                                                         compress_config=masknmf.CompressDenoiseConfig(block_sizes=(32, 32)),
                                                         frame_batch_size=300, 
                                                         load_into_ram = True,
                                                         outpath_motion_correction=out_motion_path,
                                                         outpath_compression=out_compress_path,
-                                                        outpath_demixing=out_demix_path)
+                                                        outpath_demixing=out_demix_path,
+                                                        remove_intermediates=True)
             # Get the frame rate for the FOV
             i = int(bin_file.parent.name.split('plane')[1])
             ts = np.load(self.session_path.joinpath(f'alf/FOV_{i:02d}/mpci.times.npy'))
             Fs = 1 / np.mean(np.diff(ts))
             logger.info(f'Running masknmf on {bin_file} with frame rate {Fs:.2f} Hz')
             demixing_results = pipeline.run(moco_data, Fs, exclude_border_radius=8)
+
+            logger.info(f'Saving results')
+            F, Deconv_F, masks = self._format_to_mpci(demixing_results)
+            np.save(out_fluorescence_traces, F)
+            np.save(out_deconvolved_traces, Deconv_F)
+            sparse.save_npz(out_roi_masks, masks)
+            ##
             # Copy masknmf_output dir to the same location as the input bin file
             shutil.copytree(out_path, bin_file.parent.joinpath('masknmf_output'), dirs_exist_ok=True)
-            # out.extend([out_motion_path, out_demix_path])
-            out.extend([
-                bin_file.parent.joinpath('masknmf_output/moco_rewrite_masknmf.hdf5'),
-                bin_file.parent.joinpath('masknmf_output/demixing.hdf5'),
-                bin_file.parent.joinpath('masknmf_output/compression.hdf5')])
+            out.extend([bin_file.parent.joinpath('masknmf_output/demixing.hdf5')])
         return out
+
+
+
 
 #
 # if __name__ == '__main__':
