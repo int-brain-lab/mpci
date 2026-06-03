@@ -237,7 +237,7 @@ class MasknmfPreprocess(MesoscopeTask):
             np.save(out_fluorescence_traces, F)
             np.save(out_deconvolved_traces, Deconv_F)
             sparse.save_npz(out_roi_masks, masks)
-            xy_centers = demixing_results.ac_array.centers  # shape (num_rois, 2) tensor
+            xy_centers = demixing_results.ac_array.centers.cpu().numpy()  # shape (num_rois, 2) tensor
             np.save(out_stack_pos, np.c_[xy_centers, np.zeros(len(xy_centers))])
             out.extend([out_demix_path, out_fluorescence_traces, out_deconvolved_traces, out_roi_masks, out_stack_pos])
         return out
