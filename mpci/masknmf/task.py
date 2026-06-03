@@ -126,9 +126,15 @@ class MasknmfPreprocess(MesoscopeTask):
     def signature(self):
         signature = {}
         I, O = ExpectedDataset.input, ExpectedDataset.output
+        try:
+            n = int(self.device_collection.split("plane")[-1])
+            alf_collection = f'alf/FOV_{n:02d}'
+        except ValueError:
+            alf_collection = 'alf/FOV_??'
         signature['input_files'] = [
             I('imaging.frames_motionRegistered.bin', self.device_collection, True, unique=False),
-            I('ops.npy', self.device_collection, True, unique=False)]
+            I('ops.npy', self.device_collection, True, unique=False),
+            I('mpci.times.npy', alf_collection, True, unique=False),]
         # TODO Move these to alf/FOV_XX/masknmf when stable
         signature['output_files'] = [
             O('demixing.hdf5', f'{self.device_collection}/masknmf_output', True, unique=False),
