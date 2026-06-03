@@ -190,9 +190,9 @@ class MasknmfPreprocess(MesoscopeTask):
         values = spatial_sparse.values().cpu().numpy()
 
         # Stack indices as (ndim, nnz)
-        final_ind = np.vstack([height_indices, width_indices, col_indices])
-        spatial_footprints = sparse.COO(final_ind, values, shape=(height, width, num_neurons))
-        spatial_footprints = spatial_footprints.transpose(2, 0, 1).asformat('gcxs')
+        final_ind = np.vstack([col_indices, height_indices, width_indices])
+        spatial_footprints = sparse.COO(final_ind, values, shape=(num_neurons, height, width))
+        spatial_footprints = spatial_footprints.asformat('gcxs')
         return fluorescence_traces.astype(np.float32), deconv_traces.astype(np.float32), spatial_footprints
 
     def _run(self, roidetect=False, rename_files=True, **kwargs):
