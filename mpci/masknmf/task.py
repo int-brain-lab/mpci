@@ -215,14 +215,16 @@ class MasknmfPreprocess(MesoscopeTask):
                 load_into_ram = True,
                 outpath_motion_correction=out_demix_path.with_stem('moco_rewrite_masknmf'),  # This will eventually be removed,
                 outpath_compression=out_demix_path.with_stem('compression'),
-                outpath_demixing=out_demix_path,
-                remove_intermediates=True)
+                outpath_demixing=out_demix_path)
             # Get the frame rate for the FOV
             i = int(bin_file.parent.name.split('plane')[1])
             ts = np.load(self.session_path.joinpath(f'alf/FOV_{i:02d}/mpci.times.npy'))
             Fs = 1 / np.mean(np.diff(ts))
             logger.info(f'Running masknmf on {bin_file} with frame rate {Fs:.2f} Hz')
-            demixing_results = pipeline.run(moco_data, Fs, exclude_border_radius=8)
+            demixing_results = pipeline.run(moco_data, 
+                                            Fs, 
+                                            exclude_border_radius=8,
+                                            remove_intermediates=True)
 
             logger.info(f'Saving results for FOV_{i:02}')
             F, Deconv_F, masks = self._format_to_mpci(demixing_results)
