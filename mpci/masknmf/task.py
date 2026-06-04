@@ -88,6 +88,7 @@ class Suite2pMotionCorrection(MesoscopePreprocess):
     @property
     def signature(self):
         signature = super().signature
+        # signature['input_files'].append(('_suite2p_ROIData.raw.zip', 'alf/FOV*', False))
         # Discard all outputs but the motion corrected bin files
         signature['output_files'] = [
             ('imaging.frames_motionRegistered.bin', 'suite2p/plane*', True),
@@ -133,7 +134,7 @@ class MasknmfPreprocess(MesoscopeTask):
             alf_collection = 'alf/FOV_??'
         signature['input_files'] = [
             I('imaging.frames_motionRegistered.bin', self.device_collection, True, unique=False),
-            I('ops.npy', self.device_collection, True, unique=False),
+            I('ops.npy', self.device_collection, False, unique=False), #| I('_suite2p_ROIData.raw.zip', alf_collection, True),
             I('mpci.times.npy', alf_collection, True, unique=False),]
         # TODO Move these to alf/FOV_XX/masknmf when stable
         signature['output_files'] = [
@@ -200,12 +201,7 @@ class MasknmfPreprocess(MesoscopeTask):
         out = []
         _, bin_files, _ = self.input_files[0].find_files(self.session_path)
         
-        for bin_file in bin_files:
-            # FIXME this is a hack
-            if (motion_file := Path.cwd() / 'motion_correction.hdf5').exists():
-                logger.info(f'Removing existing motion correction file at {motion_file}')
-                motion_file.unlink()
-            
+        for bin_file in bin_files:            
             metadata_file = bin_file.with_name('ops.npy')
             moco_data = MotionBinDataset(bin_file, metadata_file)
             (out_path := bin_file.parent.joinpath('masknmf_output')).mkdir(exist_ok=True)
@@ -214,13 +210,24 @@ class MasknmfPreprocess(MesoscopeTask):
             out_stack_pos = out_path / 'mpciROIs.stackPos.npy'
             out_fluorescence_traces = out_path / 'mpci.ROIActivityF.npy'
             out_deconvolved_traces = out_path / 'mpci.ROIActivityDeconvolved.npy'
+            
+            # FIXME this is a hack
+            out_motion_corrected = out_demix_path.with_stem('moco_rewrite_masknmf')
+            if out_motion_corrected.exists():
+                logger.info(f'Removing existing motion correction file at {out_motion_corrected}')
+                out_motion_corrected.unlink()
+            out_compressed = out_demix_path.with_stem('compressed')
+            if out_compressed.exists():
+                logger.info(f'Removing existing compressed file at {out_compressed}')
+                out_compressed.unlink()
+
             pipeline = masknmf.TwoPhotonCalciumPipeline(
                 motion_correct_config="skip", 
                 compress_config=masknmf.CompressDenoiseConfig(block_sizes=(32, 32)),
                 frame_batch_size=300, 
                 load_into_ram = True,
-                outpath_motion_correction=out_demix_path.with_stem('moco_rewrite_masknmf'),  # This will eventually be removed,
-                outpath_compression=out_demix_path.with_stem('compression'),
+                outpath_motion_correction=out_motion_corrected,  # This will eventually be removed,
+                outpath_compression=out_compressed,
                 outpath_demixing=out_demix_path)
             # Get the frame rate for the FOV
             i = int(bin_file.parent.name.split('plane')[1])
@@ -236,7 +243,8 @@ class MasknmfPreprocess(MesoscopeTask):
             F, Deconv_F, masks = self._format_to_mpci(demixing_results)
             np.save(out_fluorescence_traces, F)
             np.save(out_deconvolved_traces, Deconv_F)
-            sparse.save_npz(out_roi_masks, masks)
+            with open(out_roi_masks, 'wb') as fp:
+                sparse.save_npz(fp, masks)
             xy_centers = demixing_results.ac_array.centers.cpu().numpy()  # shape (num_rois, 2) tensor
             np.save(out_stack_pos, np.c_[xy_centers, np.zeros(len(xy_centers))])
             out.extend([out_demix_path, out_fluorescence_traces, out_deconvolved_traces, out_roi_masks, out_stack_pos])
