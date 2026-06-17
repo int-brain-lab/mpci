@@ -26,14 +26,6 @@ jobs:
       - name: Install lightning-sdk
         run: pip install "lightning-sdk==2026.6.8"
 
-      - name: Verify auth env present
-        env:
-          LIGHTNING_USER_ID: ${{ secrets.LIGHTNING_USER_ID }}
-          LIGHTNING_API_KEY: ${{ secrets.LIGHTNING_API_KEY }}
-        run: |
-          echo "USER_ID set: ${LIGHTNING_USER_ID:+yes}"
-          echo "API_KEY set: ${LIGHTNING_API_KEY:+yes}"
-
       - name: Dispatch Lightning job (blocking)
         env:
           # --- Lightning auth (read by lightning-sdk automatically) ---
@@ -46,7 +38,9 @@ jobs:
           PY_VERSION: ${{ matrix.python_version }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           JOB_TIMEOUT_SECONDS: '7200'
-        run: python .github/scripts/dispatch.py
+        run: |
+          lightning login
+          python .github/scripts/dispatch.py
 
       - name: Cleanup orphaned job
         if: always()
@@ -56,6 +50,7 @@ jobs:
           LIGHTNING_TEAMSPACE: ${{ vars.LIGHTNING_TEAMSPACE }}
           PY_VERSION: ${{ matrix.python_version }}
         run: |
+          lightning login
           python - <<'PY'
           import os, re
           from lightning_sdk import Job, Status
