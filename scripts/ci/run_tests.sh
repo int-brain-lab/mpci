@@ -2,8 +2,9 @@ bash
 #!/usr/bin/env bash
 # Entry point for the Lightning CI job.
 # cwd is repo root (set by dispatch command). Repo already cloned/checked out.
+echo ">>> run_tests.sh STARTED <<<" >&2   # stderr, unbuffered
 set -uo pipefail   # NOT -e: we want coveralls to report even on test failure
-
+set -x
 source scripts/ci/prep_env.sh
 source /workspace/venv/bin/activate   # ensure venv active in this shell; should be unnecessary
 

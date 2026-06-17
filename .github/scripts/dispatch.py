@@ -53,11 +53,13 @@ owner, _, teamspace = TEAMSPACE.partition("/")
 #   guard -> clone @ commit -> hand off to repo-versioned CI scripts.
 command = (
     "set -e && "
-    "command -v git >/dev/null || { echo 'ERROR: git not present in image'; exit 127; } && "
+    "command -v git >/dev/null || { echo 'ERROR: no git'; exit 127; } && "
     'git clone --no-checkout "$REPO_URL" /workspace/repo && '
     "cd /workspace/repo && "
     'git checkout "$GITHUB_SHA" && '
-    "bash scripts/ci/run_tests.sh"
+    "echo '>>> CHECKOUT DONE, listing scripts/ci <<<' && "   # prove we got here
+    "ls -la scripts/ci/ && "                                  # prove the file exists
+    "stdbuf -oL -eL bash scripts/ci/run_tests.sh"            # line-buffer output
 )
 
 print(f"🚀 Submitting {JOB_NAME} (image={CI_IMAGE}, py={PY_VERSION})", flush=True)
@@ -91,8 +93,6 @@ job = Job.run(
     org=owner,
     interruptible=False,
 )
-
-print(f"🔗 {job.link}", flush=True)
 
 try:
     job.wait(interval=15, timeout=JOB_TIMEOUT, stop_on_timeout=True)
