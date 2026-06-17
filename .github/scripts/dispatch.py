@@ -53,13 +53,16 @@ owner, _, teamspace = TEAMSPACE.partition("/")
 #   guard -> clone @ commit -> hand off to repo-versioned CI scripts.
 command = (
     "set -e && "
-    "command -v git >/dev/null || { echo 'ERROR: no git'; exit 127; } && "
     'git clone --no-checkout "$REPO_URL" /workspace/repo && '
     "cd /workspace/repo && "
     'git checkout "$GITHUB_SHA" && '
-    "echo '>>> CHECKOUT DONE, listing scripts/ci <<<' && "   # prove we got here
-    "ls -la scripts/ci/ && "                                  # prove the file exists
-    "stdbuf -oL -eL bash scripts/ci/run_tests.sh"            # line-buffer output
+    "echo '>>> PRE-RUN DIAGNOSTICS <<<' && "
+    "file scripts/ci/run_tests.sh && "
+    "head -c 100 scripts/ci/run_tests.sh | od -c && "   # raw bytes: shebang, hidden chars
+    "chmod +x scripts/ci/*.sh && "                       # your permission fix, included
+    "echo '>>> INVOKING (bash -x) <<<' && "
+    "bash -x scripts/ci/run_tests.sh; "                  # external trace; ; not &&
+    "echo \">>> EXITED WITH CODE $? <<<\""               # always show exit status
 )
 
 print(f"🚀 Submitting {JOB_NAME} (image={CI_IMAGE}, py={PY_VERSION})", flush=True)
