@@ -1,10 +1,8 @@
-bash
 #!/usr/bin/env bash
 # Runs INSIDE the Lightning job image.
 # Assumes: git present, repo already cloned + checked out at $GITHUB_SHA,
 # and cwd is the repo root (handled by the dispatch command).
 set -euo pipefail
-set -x
 
 : "${PY_VERSION:?PY_VERSION must be set}"
 
