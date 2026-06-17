@@ -3,12 +3,7 @@ name: Integration Tests (Lightning)
 on:
   push:
     branches: [main, ci]
-  workflow_dispatch:
-    inputs:
-      python_versions:
-        description: 'Comma separated python versions'
-        required: false
-        default: '3.10,3.12'
+
 
 # No top-level env: each step declares exactly what it consumes (explicit wiring).
 
@@ -20,9 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python_version: >-
-          ${{ fromJson(format('["{0}"]',
-              join(github.event.inputs.python_versions || '3.10,3.12', '","'))) }}
+        python_version: ['3.12', '3.10']
     steps:
       - uses: actions/checkout@v4
 
@@ -32,6 +25,14 @@ jobs:
 
       - name: Install lightning-sdk
         run: pip install "lightning-sdk==2026.6.8"
+
+      - name: Verify auth env present
+        env:
+          LIGHTNING_USER_ID: ${{ secrets.LIGHTNING_USER_ID }}
+          LIGHTNING_API_KEY: ${{ secrets.LIGHTNING_API_KEY }}
+        run: |
+          echo "USER_ID set: ${LIGHTNING_USER_ID:+yes}"
+          echo "API_KEY set: ${LIGHTNING_API_KEY:+yes}"
 
       - name: Dispatch Lightning job (blocking)
         env:
