@@ -4,11 +4,12 @@ bash
 # Assumes: git present, repo already cloned + checked out at $GITHUB_SHA,
 # and cwd is the repo root (handled by the dispatch command).
 set -euo pipefail
+set -x
 
 : "${PY_VERSION:?PY_VERSION must be set}"
 
 echo "Installing uv"
-pip install --quiet uv
+pip install uv
 
 echo "Setting up Python ${PY_VERSION} via uv"
 uv python install "${PY_VERSION}"
@@ -17,6 +18,7 @@ uv venv --python "${PY_VERSION}" /workspace/venv
 source /workspace/venv/bin/activate
 
 echo "Installing project + coverage tooling"
+uv pip install -e .
 uv pip install coverage coveralls
 
 echo "Env ready ($(python --version))"
