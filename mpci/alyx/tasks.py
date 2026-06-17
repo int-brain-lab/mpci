@@ -1,4 +1,5 @@
 import logging
+import importlib.metadata
 from itertools import chain
 
 from ibllib.pipes.base_tasks import DynamicTask, RegisterRawDataTask
@@ -13,7 +14,7 @@ _logger = logging.getLogger(__name__)
 
 class MesoscopeTask(DynamicTask):
 
-    version = mpci.__version__
+    version = importlib.metadata.version('mpci')
 
     def __init__(self, session_path, **kwargs):
         super().__init__(session_path, **kwargs)
@@ -29,7 +30,8 @@ class MesoscopeTask(DynamicTask):
         Necessary because we don't know in advance how many device collection folders ("imaging bouts") to expect
         """
         # Glob for all device collection (raw imaging data) folders
-        raw_imaging_folders = [p.name for p in self.session_path.glob(self.device_collection)]
+        raw_imaging_folders = [p.relative_to(self.session_path).as_posix()
+                               for p in self.session_path.glob(self.device_collection)]
         super().get_signatures(**kwargs)  # Set inputs and outputs
         if not raw_imaging_folders:
             _logger.warning('No folders found for device collection "%s"', self.device_collection)
