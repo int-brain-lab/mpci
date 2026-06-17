@@ -120,7 +120,7 @@ class MasknmfPreprocess(MesoscopeTask):
 
     def __init__(self, session_path, device_collection=None, **kwargs):
         if device_collection is None:
-            device_collection = 'suite2p/plane?'
+            device_collection = 'suite2p/plane*'
         super().__init__(session_path, device_collection=device_collection, **kwargs)
 
     @property
@@ -220,6 +220,9 @@ class MasknmfPreprocess(MesoscopeTask):
             if out_compressed.exists():
                 logger.info(f'Removing existing compressed file at {out_compressed}')
                 out_compressed.unlink()
+            if out_demix_path.exists():
+                logger.info(f'Removing existing demixing file at {out_demix_path}')
+                out_demix_path.unlink()
 
             pipeline = masknmf.TwoPhotonCalciumPipeline(
                 motion_correct_config="skip", 
