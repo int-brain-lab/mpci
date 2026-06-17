@@ -10,7 +10,7 @@ echo "Running full test suite under coverage (PY_VERSION=${PY_VERSION})"
 # INTEGRATION_DATA_DIR is set by CI (Step 3) -> integration tests run.
 # In Step 1 it's unset -> integration tests auto-skip, unit tests run.
 set +e
-coverage run -m unittest discover -s tests -p "test_*.py"
+coverage run -m unittest discover -s mpci/tests -t . -p "test_*.py"
 TEST_EXIT=$?
 set -e
 
