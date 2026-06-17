@@ -71,6 +71,7 @@ job = Job.run(
         # --- runtime / bootstrap ---
         "PY_VERSION": PY_VERSION,
         "REPO_URL": REPO_URL,
+        "INTEGRATION_DATA_DIR": "/data",
         # --- Coveralls auth + parallel grouping ---
         "COVERALLS_REPO_TOKEN": COVERALLS_TOKEN,
         "COVERALLS_PARALLEL": "true",
@@ -82,11 +83,8 @@ job = Job.run(
         "GITHUB_REPOSITORY": GITHUB_REPO,
         "GITHUB_REF_NAME": GITHUB_REF,
         **({"GITHUB_PR_NUMBER": PR_NUMBER} if PR_NUMBER else {}),
-        # --- Step 3: enable integration tests by also adding ---
-        # "INTEGRATION_DATA_DIR": "/data",
     },
-    # --- Step 3: read-only S3 mount ---
-    # path_mappings={"/data": "ibl-brain-wide-map-private"},
+    path_mappings={"/data": "ibl-brain-wide-map-private"},
     teamspace=teamspace,
     org=owner,
     interruptible=False,
