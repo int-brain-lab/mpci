@@ -1,8 +1,8 @@
 name: Integration Tests (Lightning)
 
 on:
-  pull_request:
-    branches: [ci]
+  push:
+    branches: [main, ci]
   workflow_dispatch:
     inputs:
       python_versions:
