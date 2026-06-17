@@ -20,11 +20,6 @@ import sys
 
 from lightning_sdk import Job, Machine, Status
 
-print("USER_ID in py process:", "yes" if os.environ.get("LIGHTNING_USER_ID") else "NO", flush=True)
-print("API_KEY in py process:", "yes" if os.environ.get("LIGHTNING_API_KEY") else "NO", flush=True)
-print('SDK auth options:')
-import lightning_sdk
-print([x for x in dir(lightning_sdk) if any(k in x.lower() for k in ('auth','login','config','client'))])
 
 def sanitize(s: str) -> str:
     return re.sub(r"[^a-zA-Z0-9-]", "-", s).strip("-").lower()
