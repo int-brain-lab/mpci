@@ -25,8 +25,10 @@ from iblatlas.atlas import ALLEN_CCF_LANDMARKS_MLAPDV_UM, MRITorontoAtlas
 from iblutil.util import Bunch
 
 import ibllib.oneibl.data_handlers as dh
-from ibllib.mpci.brain_meshes import get_plane_at_point_mlap, get_surface_points
-from ibllib.mpci.linalg import intersect_line_plane, surface_normal, find_triangle, _update_points
+from mpci.chronic.registration.brain_meshes import get_plane_at_point_mlap, get_surface_points
+from mpci.chronic.registration.linalg import surface_normal, find_triangle, _update_points
+from plane2brain.linalg import intersect_line_plane
+
 from ibllib.pipes.base_tasks import RegisterRawDataTask
 
 from mpci.chronic.registration.scanimage import Provenance, register_reference_stacks
@@ -369,7 +371,7 @@ class MesoscopeFOV(MesoscopeTask):
         connectivity_list : numpy.array
             An N by 3 integer array of vertex indices defining all points that form a triangle.
         """
-        fixture_path = Path(mesoscope.__file__).parent.joinpath('mesoscope')
+        fixture_path = Path(__file__).parent.joinpath('fixtures')
         surface_triangulation = np.load(fixture_path / 'surface_triangulation.npz')
         points = surface_triangulation['points'].astype('f8')
         connectivity_list = surface_triangulation['connectivity_list']
@@ -614,7 +616,7 @@ class MesoscopeFOVHistology(MesoscopeFOV):
         reference_image = self.load_reference_stack()
         # Load main meta
         _, meta_files, _ = self.input_files[0].find_files(self.session_path)
-        meta = mesoscope.patch_imaging_meta(alfio.load_file_content(meta_files[0]) or {})
+        meta = patch_imaging_meta(alfio.load_file_content(meta_files[0]) or {})
         nFOV = len(meta.get('FOV', []))
         if self.provenance is Provenance.HISTOLOGY:
             _logger.info('Extracting histology MLAPDV datasets')
@@ -858,7 +860,7 @@ class MesoscopeFOVHistology(MesoscopeFOV):
         # Load the reference image and all metadata
         stack, ref_meta = self.load_reference_stack()
         _, meta_files, _ = self.input_files[0].find_files(self.session_path)
-        meta = mesoscope.patch_imaging_meta(alfio.load_file_content(meta_files[0]) or {})
+        meta = patch_imaging_meta(alfio.load_file_content(meta_files[0]) or {})
         f, ax = plt.subplots()
         import cv2
         stack_max = np.max(stack, axis=0)
@@ -1465,7 +1467,7 @@ class MesoscopeFOVHistology(MesoscopeFOV):
         except StopIteration:
             raise FileNotFoundError('Reference stack not found')
         meta_path = stack_path.with_name('referenceImage.meta.json')
-        meta = mesoscope.patch_imaging_meta(alfio.load_file_content(meta_path) or {})
+        meta = patch_imaging_meta(alfio.load_file_content(meta_path) or {})
         reference_image = {'stack': skimage.io.imread(stack_path), 'meta': meta}
         if stack_path.with_name('referenceImage.points.json').exists():
             points_path = stack_path.with_name('referenceImage.points.json')

@@ -1,19 +1,21 @@
 """Tests for mpci.chronic.registration."""
-import sys
 import unittest
-from unittest import mock
+from unittest import mock, patch
 import tempfile
 from pathlib import Path
 import uuid
+import shutil
 
 from one.api import ONE
+import one.alf.io as alfio
 import numpy as np
 
-from ibllib.mpci.linalg import _nearest_neighbour_1d, surface_normal, find_triangle
-from ibllib.tests import TEST_DB
+from mpci.chronic.registration.linalg import _nearest_neighbour_1d, surface_normal, find_triangle  # None in p2b
+from iblatlas.atlas import AllenAtlas
 
 from mpci.chronic.registration.scanimage import Provenance
 from mpci.chronic.registration.task import MesoscopeFOV
+from mpci.tests import IntegrationTestCase, TEST_DB
 
 
 class TestMesoscopeFOV(unittest.TestCase):
@@ -165,6 +167,165 @@ class TestRegisterFOV(unittest.TestCase):
         Here we return the mode back to the default after testing behaviour in offline mode.
         """
         self.one.mode = 'remote'
+
+
+class TestMesoscopeFOVOutput(IntegrationTestCase):
+    session_path = None
+
+    def setUp(self) -> None:
+        self.one = ONE(**TEST_DB)
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        self.session_path = Path(tmpdir.name, 'subject', '2020-01-01', '001')
+        self.session_path.joinpath('alf').mkdir(parents=True)
+        # Make some toy datasets
+        self.n_pixels = 512  # Number of pixels xy pixels in each FOV
+        self.n_fov = 2  # Number of fields of view
+        self.n_roi = 128  # Number of ROIs (will be multiplied by FOV number)
+        self.expected_roi_mlapdv = {}  # Save the expected extracted ROI MLAPDV coordinates
+        self.offset = 5.  # Offset between pixel number and MLAPDV coordinate
+        self.mean_img_mlapdv = dict.fromkeys(range(self.n_fov))
+        self.mean_img_ids = dict.fromkeys(range(self.n_fov))
+        for i in range(self.n_fov):
+            (alf_path := self.session_path.joinpath('alf', f'FOV_{i:02}')).mkdir()
+            # Mean image MLAPDV coordinates
+            ml = np.tile(np.arange(self.n_pixels), (self.n_pixels, 1)).astype(float) + self.offset
+            self.mean_img_mlapdv[i] = np.dstack([ml, ml.T, np.zeros_like(ml)])
+
+            # Mean image brain location IDs (a grid of 32x32 brain locations)
+            n_tiles = 32
+            tile_sz = int(self.n_pixels / n_tiles)
+            x = np.repeat(np.arange(tile_sz), n_tiles)
+            y = np.repeat(np.r_[0, (2 ** np.arange(tile_sz) * tile_sz)[:-1]], n_tiles)
+            self.mean_img_ids[i] = x + y[..., None]
+
+            # mpciROIs.stackPos (evenly spaced along the diagonal)
+            n_roi = self.n_roi * (i + 1)  # 2nd FOV has twice as many as first
+            v = np.linspace(0, self.n_pixels - 1, n_roi).astype(int)
+            roi_mlapdv = np.vstack([v, v, np.zeros_like(v)]).T
+            self.expected_roi_mlapdv[i] = np.c_[roi_mlapdv[:, :2] + self.offset, roi_mlapdv[:, 2]]
+            np.save(alf_path / 'mpciROIs.stackPos.npy', roi_mlapdv)
+        # For now the meta only contains number of FOVs
+        alf_path = self.session_path.joinpath('raw_imaging_data')
+        alf_path.mkdir()
+        with open(alf_path / '_ibl_rawImagingData.meta.json', 'w') as fp:
+            fp.write('{"nFrames": 2000, "FOV":[%s]}' % ','.join(['{}'] * self.n_fov))
+
+    def test_mesoscope_fov(self):
+        """Test for MesoscopeFOV._run and MesoscopeFOV.roi_mlapdv methods.
+
+        This stubs both register_fov and project_mlapdv, which are tested separately.
+        """
+        # Test generation of mpciROI datasets
+        task = MesoscopeFOV(self.session_path, device_collection='raw_imaging_data', one=self.one)
+        mean_img_map = (self.mean_img_mlapdv, self.mean_img_ids)
+        with patch.object(task, 'register_fov') as mock_obj, \
+                patch.object(task, 'project_mlapdv', return_value=mean_img_map):
+            self.assertEqual(0, task.run())
+            mock_obj.assert_called_once_with(unittest.mock.ANY, 'estimate')
+        self.assertEqual(self.n_fov * 4 + 1, len(task.outputs))  # + 1 for modified meta file
+        # Mean image brain locations should be int
+        file = next(f for f in task.outputs if 'mpciMeanImage.brainLocationIds_ccf_2017_estimate' in f.name)
+        self.assertIs(np.load(file).dtype, np.dtype('int'))
+        # Check ROI MLAPDV and brain locations
+        rois = alfio.load_object(self.session_path / 'alf' / 'FOV_00', 'mpciROIs')
+        expected = {'brainLocationIds_ccf_2017_estimate', 'mlapdv_estimate', 'stackPos'}
+        self.assertCountEqual(expected, rois.keys())
+        expected = self.expected_roi_mlapdv[0]
+        np.testing.assert_array_equal(expected, rois['mlapdv_estimate'])
+        expected = np.repeat(np.array([0, 17, 34, 67]), 8)
+        self.assertIs(rois['brainLocationIds_ccf_2017_estimate'].dtype, np.dtype(int))
+        np.testing.assert_array_equal(expected, rois['brainLocationIds_ccf_2017_estimate'][:32])
+
+        # Test that we preferentially use the final coordinates
+        # Copy data from another FOV and use as final
+        for file in self.session_path.joinpath('alf', 'FOV_01').glob('mpciMeanImage.*'):
+            file = file.replace(file.with_name(file.name.replace('_estimate', '')))
+            shutil.copy(file, self.session_path.joinpath('alf', 'FOV_00', file.name))
+
+        task = MesoscopeFOV(self.session_path, device_collection='raw_imaging_data', one=self.one)
+        with patch.object(task, 'register_fov') as mock_obj, \
+                patch.object(task, 'project_mlapdv', return_value=mean_img_map):
+            self.assertEqual(0, task.run(provenance=Provenance.HISTOLOGY))
+            mock_obj.assert_called_once_with(unittest.mock.ANY, None)
+        self.assertEqual((self.n_fov * 4) + 1, len(task.outputs))  # + 1 for modified meta file
+        self.assertFalse(any('_estimate' in x.name for x in task.outputs))
+        rois = alfio.load_object(self.session_path / 'alf' / 'FOV_00', 'mpciROIs')
+        expected = {'brainLocationIds_ccf_2017', 'mlapdv', 'stackPos'}
+        self.assertTrue(expected <= set(rois.keys()))
+
+        # Check behaviour when there are incomplete datasets
+        self.session_path.joinpath('alf', 'FOV_00', 'mpciROIs.stackPos.npy').unlink()
+        self.assertRaises(FileNotFoundError, task.roi_mlapdv, self.n_fov)
+
+
+class TestProjectFOV(IntegrationTestCase):
+    """Test MesoscopeFOV.project_mlapdv method."""
+    session_path = None
+
+    def setUp(self) -> None:
+        # Load fixtures and create simple meta map
+        self.session_path = Path('subject', '2020-01-01', '001')
+        self.n_pixels = 64  # Number of pixels xy pixels in each FOV
+        self.n_fov = 2  # Number of fields of view
+
+        self.atlas = AllenAtlas(res_um=50)  # Use low res atlas for speed
+        self.one = ONE(**TEST_DB, mode='local')
+
+        # Create a toy meta file
+        self.meta = {'centerMM': {'ML': 2.6, 'AP': -1.9}}
+        MM = {'topLeft': [2.307, -1.607], 'topRight': [2.892, -1.607],
+              'bottomLeft': [2.30, -2.193], 'bottomRight': [2.893, -2.193]}
+        self.meta['FOV'] = [{'nXnYnZ': [self.n_pixels, self.n_pixels, 1], 'MM': MM}] * self.n_fov
+
+    def test_project_mlapdv(self):
+        """Test the full MesoscopeFOV.project_mlapdv method."""
+        # Test generation of mpciROI datasets
+        task = MesoscopeFOV(self.session_path, device_collection='raw_imaging_data', one=self.one)
+        mlapdv, ids = task.project_mlapdv(self.meta, self.atlas)
+
+        # Check MLAPDV coordinates
+        self.assertCountEqual(mlapdv.keys(), range(self.n_fov))
+        self.assertEqual(mlapdv[0].shape, (self.n_pixels, self.n_pixels, 3))
+        # NB: Both FOVs will have the same values as the corner coords were duplicated
+        expected = [
+            [[2309.19916861, -1601.44040887, -231.35034825],
+             [2317.83114255, -1601.89273938, -234.74282709],
+             [2326.4631165, -1602.34506989, -238.13530593]],
+            [[2309.09588003, -1610.65498922, -230.0804221],
+             [2317.72972769, -1611.10741792, -233.47363734],
+             [2326.36357535, -1611.55984662, -236.86685258]],
+            [[2308.99259145, -1619.86956957, -228.81049596],
+             [2317.62831283, -1620.32209646, -232.20444759],
+             [2326.26403421, -1620.77462334, -235.59839922]]
+        ]
+        np.testing.assert_array_almost_equal(mlapdv[0][:3, :3, :], expected)
+
+        # Check brain location IDs
+        expected = [[1006, 981, 981],
+                    [312782550, 981, 981],
+                    [312782550, 981, 981]]
+        np.testing.assert_array_almost_equal(ids[0][:3, 49:52], expected)
+        self.assertCountEqual(ids.keys(), range(self.n_fov))
+        self.assertEqual(ids[0].shape, (self.n_pixels, self.n_pixels))
+
+        # Check meta map was modified
+        FOV_00 = self.meta['FOV'][0]
+        self.assertTrue(set(FOV_00.keys()) >= {'MLAPDV', 'brainLocationIds'})
+        expected = {'topLeft': 312782550, 'topRight': 981, 'bottomLeft': 312782550,
+                    'bottomRight': 312782604, 'center': 312782550}
+        self.assertDictEqual(FOV_00['brainLocationIds'], expected)
+        expected = [2575.3890558071657, -1901.209002390902, -297.8571573244117]
+        np.testing.assert_array_almost_equal(FOV_00['MLAPDV']['center'], expected)
+
+        # Test behaviour when outside of the brain (also remove one of the FOVs for speed)
+        FOV_00 = self.meta['FOV'].pop()
+        for k in FOV_00['MM']:
+            FOV_00['MM'][k] = np.array(FOV_00['MM'][k]) + 10
+        with self.assertLogs('ibllib.pipes.mesoscope_tasks', 'WARNING'):
+            mlapdv, ids = task.project_mlapdv(self.meta, self.atlas)
+        self.assertTrue(np.all(np.isnan(mlapdv[0])))
+        np.testing.assert_array_equal(ids[0], np.zeros((self.n_pixels, self.n_pixels), dtype=int))
 
 
 if __name__ == '__main__':
