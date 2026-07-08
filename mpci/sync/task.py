@@ -2,7 +2,7 @@ import logging
 from fnmatch import fnmatch
 
 from mpci.sync.timeline import MesoscopeSyncTimeline
-from mpci.task import MesoscopeTask
+from mpci.alyx.tasks import MesoscopeTask
 from mpci.scanimage.io import patch_imaging_meta
 
 from one.api import ONE

@@ -210,7 +210,7 @@ def _update_points(t, normal_vector, coords, axis_ml_um, axis_ap_um, axis_dv_um,
     return MLAPDV, annotation
 
 
-@nb.njit("Tuple((float64[:], float64[:]))(float64[:,:])")
+@nb.njit("Tuple((float64[::1], float64[::1]))(float64[:,::1])")
 def plane_normal_form(face: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """form a plane from a face (=3 points)
 
@@ -222,7 +222,8 @@ def plane_normal_form(face: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     TODO Replace with direct call to surface_normal
     """
 
-    p0, p1, p2 = face
+    # explicit row indexing (rather than tuple unpacking) preserves contiguity typing
+    p0, p1, p2 = face[0, :], face[1, :], face[2, :]
     n = np.cross(p0 - p1, p0 - p2)
     n /= linalg.norm(n)
     return p0, n
@@ -269,7 +270,7 @@ def plane_normal_form(face: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 #         return ln0 + d.reshape(-1, 1) * ln
 
 
-@nb.njit("float64[:](float64[:],float64[:],float64[:],float64[:])")
+@nb.njit("float64[::1](float64[::1],float64[::1],float64[::1],float64[::1])")
 def intersect_line_plane(
     ln0: np.ndarray, ln: np.ndarray, p0: np.ndarray, n: np.ndarray
 ) -> np.ndarray:
@@ -385,7 +386,7 @@ def point_in_face_np(face: np.ndarray, point: np.ndarray) -> np.bool_:
     return np.all(np.logical_and(w > 0, w < 1))
 
 
-@nb.njit("float64(float64[:],float64[:])")
+@nb.njit("float64(float64[::1],float64[::1])")
 def _get_angle(a, b):
     # the angle between two vectors a and b
     return np.arccos(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
@@ -410,7 +411,7 @@ def fast_dot_product_check(plane_normal: np.ndarray, line_vector: np.ndarray) ->
 
 ###### GEORG'S ORIGINAL #####
 
-@nb.njit("float64(float64[:],float64[:])")
+@nb.njit("float64(float64[::1],float64[::1])")
 def get_angle(a, b):
     # the angle between two vectors a and b
     return np.arccos(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
@@ -439,7 +440,7 @@ def point_in_face(face: np.ndarray, point: np.ndarray) -> np.bool_:
 
 
 @nb.njit(
-    "Tuple((float64[:,:,:], float64[:,:], int64[:]))(float64[:,:], int32[:,:], float64[:], float64[:])",
+    "Tuple((float64[:,:,:], float64[:,:], int64[:]))(float64[:,:], int32[:,:], float64[::1], float64[::1])",
     parallel=True,
 )
 def intersect_line_mesh(
@@ -593,11 +594,14 @@ def get_closest_face(
     Returns:
         Tuple[np.ndarray, np.ndarray]: the closest face and it's index
     """
-    # faces is
-    dists = np.array(
-        [linalg.norm(point - np.average(face, axis=0)) for face in faces],
-        dtype="float64",
-    )
+    # np.average(..., axis=0) is not supported in nopython mode (it silently types as
+    # None, causing a TypingError), so the centroid is computed manually instead
+    n_faces = faces.shape[0]
+    dists = np.empty(n_faces, dtype=np.float64)
+    for i in range(n_faces):
+        centroid = (faces[i, 0, :] + faces[i, 1, :] + faces[i, 2, :]) / 3.0
+        diff = point - centroid
+        dists[i] = np.sqrt(diff[0] ** 2 + diff[1] ** 2 + diff[2] ** 2)
     min_ix = np.argmin(dists)
     return faces[min_ix], min_ix
 
@@ -613,7 +617,7 @@ def find_closest_point_from_line_np(
 
 
 # numba compatible version
-@nb.njit("float64[:](float64[:,:], float64[:], float64[:])")
+@nb.njit("float64[:](float64[:,:], float64[:], float64[::1])")
 def find_closest_point_from_line_nb(
     points: np.ndarray, ln0: np.ndarray, ln: np.ndarray
 ) -> np.ndarray:
@@ -634,7 +638,7 @@ def find_closest_point_from_line_nb(
     return point
 
 
-@nb.njit("float64[:,:](float64[:,:],float64[:,:],float64[:])", parallel=True)
+@nb.njit("float64[:,:](float64[:,:],float64[:,:],float64[::1])", parallel=True)
 def find_closest_points_on_surface(
     points_eval: np.ndarray, brain_surface_points: np.ndarray, n: np.ndarray
 ) -> np.ndarray:

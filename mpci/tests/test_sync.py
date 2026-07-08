@@ -167,7 +167,7 @@ class TestMesoscopeSync(IntegrationTestCase):
             with self.subTest(FOV=i):
                 np.testing.assert_array_almost_equal(neural_times, volume_times, decimal=3)
 
-    @patch('ibllib.io.extractors.mesoscope.plt')
+    @patch('mpci.sync.timeline.plt')
     def test_get_bout_edges(self, plt_mock):
         """Test for ibllib.io.extractors.mesoscope.MesoscopeSyncTimeline.get_bout_edges.
 

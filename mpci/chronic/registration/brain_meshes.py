@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.spatial import ConvexHull
-from ibllib.mpci.linalg import (
+from mpci.chronic.registration.linalg import (
     intersect_line_mesh,
     get_closest_face,
     plane_normal_form,

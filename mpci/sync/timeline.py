@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import one.alf.io as alfio
 from one.alf.path import session_path_parts
 from ibllib.io.extractors.base import BaseExtractor
-from ibllib.plots.misc import vertical_lines
+from ibllib.plots import vertical_lines
 
 from mpci.scanimage.io import patch_imaging_meta
 

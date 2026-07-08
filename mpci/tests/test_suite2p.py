@@ -284,7 +284,7 @@ class TestMesoscopePreprocessRename(IntegrationTestCase):
         task = MesoscopePreprocess(session_path, one=self.one)
 
         frameQC_names = pd.DataFrame([(0, 'ok'), (1, 'foo')], columns=['qc_values', 'qc_labels'])
-        with self.assertLogs('ibllib.pipes.mesoscope_tasks', 'DEBUG') as log:
+        with self.assertLogs('mpci.suite2p.task', 'DEBUG') as log:
             files = task._rename_outputs(self.suite2pdir.parent, frameQC_names, np.zeros(15))
         # Check old output files removed
         log_messages = (x.getMessage() for x in log.records)
