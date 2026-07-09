@@ -33,6 +33,7 @@ GITHUB_REPO     = os.environ["GITHUB_REPOSITORY"]      # "owner/repo"
 GITHUB_REF      = os.environ.get("GITHUB_REF_NAME", "")
 REPO_URL        = os.environ["REPO_URL"]
 TEAMSPACE       = os.environ["LIGHTNING_TEAMSPACE"]    # "owner/teamspace"
+INTEGRATION_DATA_DIR = os.environ.get("INTEGRATION_DATA_DIR", "/data")
 COVERALLS_TOKEN = os.environ["COVERALLS_REPO_TOKEN"]
 PR_NUMBER       = os.environ.get("PR_NUMBER", "")
 JOB_TIMEOUT     = int(os.environ.get("JOB_TIMEOUT_SECONDS", "7200"))
@@ -71,7 +72,7 @@ job = Job.run(
         # --- runtime / bootstrap ---
         "PY_VERSION": PY_VERSION,
         "REPO_URL": REPO_URL,
-        "INTEGRATION_DATA_DIR": "/data",
+        "INTEGRATION_DATA_DIR": INTEGRATION_DATA_DIR,
         # --- Coveralls auth + parallel grouping ---
         "COVERALLS_REPO_TOKEN": COVERALLS_TOKEN,
         "COVERALLS_PARALLEL": "true",
