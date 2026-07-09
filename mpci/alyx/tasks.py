@@ -15,6 +15,7 @@ _logger = logging.getLogger(__name__)
 class MesoscopeTask(DynamicTask):
 
     version = importlib.metadata.version('mpci')
+    env = 'mpci'
 
     def __init__(self, session_path, **kwargs):
         super().__init__(session_path, **kwargs)
