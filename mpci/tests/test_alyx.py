@@ -1,9 +1,11 @@
 from itertools import chain
 from unittest.mock import patch
+from collections import OrderedDict
 
 from one.api import ONE
-
+from ibllib.pipes.dynamic_pipeline import make_pipeline_dict, load_pipeline_dict
 from mpci.alyx.tasks import MesoscopeRegisterSnapshots
+from mpci.alyx.pipeline import make_pipeline
 from mpci.tests import TEST_DB, IntegrationTestCase
 
 
@@ -48,6 +50,34 @@ class TestMesoscopeRegisterSnapshots(IntegrationTestCase):
         self.assertEqual(len(task.signature['input_files']) * N, n_input_files)
         n_output_files = len(list(chain.from_iterable(x.glob_pattern for x in task.output_files)))
         self.assertEqual(len(task.signature['output_files']) * N, n_output_files)
+
+
+class TestStandardPipelines(IntegrationTestCase):
+
+    required_files = [
+        'dynamic_pipeline/mesoscope/pipeline_tasks.yaml',
+        'mesoscope/test/2023-03-03/002/_ibl_experiment.description.yaml']
+
+    def setUp(self) -> None:
+        expected_tasks, experiment_description = self.required_files
+        self.expected_pipe = load_pipeline_dict(self.data_path.joinpath(expected_tasks).parent)
+        self.experiment_description = self.data_path.joinpath(experiment_description)
+
+    def test_standard_pipeline(self):
+        session_path = self.experiment_description.parent
+        pipe = make_pipeline(self.experiment_description, session_path=session_path)
+
+        pipe_dict = make_pipeline_dict(pipe, save=False)
+        expected_pipe = self.expected_pipe[-len(pipe_dict):]  # Ignore non-mesoscope tasks in the expected pipeline
+        self.compare_dicts(pipe_dict, expected_pipe)
+
+    def compare_dicts(self, dict1, dict2):
+        self.assertSetEqual(set([pl['name'] for pl in dict1]),
+                            set([pl['name'] for pl in dict2]))
+        for d1, d2 in zip(dict1, dict2):
+            for k in ('executable', 'parents', 'name', 'arguments'):
+                with self.subTest(key=k, name_1=d1.get('name'), name_2=d2.get('name')):
+                    self.assertEqual(d2[k], d1[k])
 
 
 if __name__ == '__main__':

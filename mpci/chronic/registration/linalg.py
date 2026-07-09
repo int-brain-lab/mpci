@@ -34,7 +34,7 @@ def surface_normal(triangle):
     return A.squeeze()
 
 
-@nb.njit('b1(f8[:,:], f8[:])')
+@nb.njit('b1(f8[:,:], f8[:])', cache=True)
 def in_triangle(triangle, point):
     """
     Check whether `point` lies within `triangle`.
@@ -67,7 +67,7 @@ def in_triangle(triangle, point):
     return diff <= np.abs(REL_TOL * A)  # isclose not yet implemented in numba 0.57
 
 
-@nb.njit('i8(f8[:], f8[:,:], intp[:,:])', nogil=True)
+@nb.njit('i8(f8[:], f8[:,:], intp[:,:])', nogil=True, cache=True)
 def find_triangle(point, vertices, connectivity_list):
     """
     Find which vertices contain a given point.
@@ -97,7 +97,7 @@ def find_triangle(point, vertices, connectivity_list):
     return face_ind
 
 
-@nb.njit('Tuple((f8[:], intp[:]))(f8[:], f8[:])', nogil=True)
+@nb.njit('Tuple((f8[:], intp[:]))(f8[:], f8[:])', nogil=True, cache=True)
 def _nearest_neighbour_1d(x, x_new):
     """
     Nearest neighbour interpolation with extrapolation.
@@ -134,7 +134,10 @@ def _nearest_neighbour_1d(x, x_new):
     return y_new, ind[x_new_indices]
 
 
-@nb.njit('Tuple((f8[:,:], u2[:]))(f8[:], f8[:], f8[:,:], f8[:], f8[:], f8[:], u2[:,:,:])', nogil=True)
+@nb.njit(
+    'Tuple((f8[:,:], u2[:]))(f8[:], f8[:], f8[:,:], f8[:], f8[:], f8[:], u2[:,:,:])',
+    nogil=True, cache=True,
+)
 def _update_points(t, normal_vector, coords, axis_ml_um, axis_ap_um, axis_dv_um, atlas_labels):
     """
     Determine the MLAPDV coordinate and brain location index for each of the given coordinates.
@@ -210,7 +213,7 @@ def _update_points(t, normal_vector, coords, axis_ml_um, axis_ap_um, axis_dv_um,
     return MLAPDV, annotation
 
 
-@nb.njit("Tuple((float64[::1], float64[::1]))(float64[:,::1])")
+@nb.njit("Tuple((float64[::1], float64[::1]))(float64[:,::1])", cache=True)
 def plane_normal_form(face: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """form a plane from a face (=3 points)
 
@@ -270,7 +273,7 @@ def plane_normal_form(face: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 #         return ln0 + d.reshape(-1, 1) * ln
 
 
-@nb.njit("float64[::1](float64[::1],float64[::1],float64[::1],float64[::1])")
+@nb.njit("float64[::1](float64[::1],float64[::1],float64[::1],float64[::1])", cache=True)
 def intersect_line_plane(
     ln0: np.ndarray, ln: np.ndarray, p0: np.ndarray, n: np.ndarray
 ) -> np.ndarray:
@@ -302,7 +305,7 @@ def intersect_line_plane(
     return ln0 + d * ln
 
 
-@nb.njit
+@nb.njit(cache=True)
 def point_in_face_original_method(face: np.ndarray, point: np.ndarray) -> np.bool_:
     """Exactly replicates the original point_in_face algorithm."""
     # Ensure point is 1D
@@ -367,7 +370,7 @@ def point_in_face_original_method(face: np.ndarray, point: np.ndarray) -> np.boo
             w[2] > 0 and w[2] < 1)
 
 
-@nb.njit
+@nb.njit(cache=True)
 def point_in_face_fast(face: np.ndarray, point: np.ndarray) -> np.bool_:
     """Optimized check if point is within triangular face using barycentric coordinates.
 
@@ -386,13 +389,13 @@ def point_in_face_np(face: np.ndarray, point: np.ndarray) -> np.bool_:
     return np.all(np.logical_and(w > 0, w < 1))
 
 
-@nb.njit("float64(float64[::1],float64[::1])")
+@nb.njit("float64(float64[::1],float64[::1])", cache=True)
 def _get_angle(a, b):
     # the angle between two vectors a and b
     return np.arccos(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 
-@nb.njit("float64(float64[:],float64[:])")
+@nb.njit("float64(float64[:],float64[:])", cache=True)
 def fast_dot_product_check(plane_normal: np.ndarray, line_vector: np.ndarray) -> np.float64:
     """Fast check if plane normal and line vector are nearly parallel.
 
@@ -411,13 +414,13 @@ def fast_dot_product_check(plane_normal: np.ndarray, line_vector: np.ndarray) ->
 
 ###### GEORG'S ORIGINAL #####
 
-@nb.njit("float64(float64[::1],float64[::1])")
+@nb.njit("float64(float64[::1],float64[::1])", cache=True)
 def get_angle(a, b):
     # the angle between two vectors a and b
     return np.arccos(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 
-@nb.njit("bool_(float64[:,:], float64[:])")
+@nb.njit("bool_(float64[:,:], float64[:])", cache=True)
 def point_in_face(face: np.ndarray, point: np.ndarray) -> np.bool_:
     """check if the point is within the triangular face
 
@@ -441,7 +444,7 @@ def point_in_face(face: np.ndarray, point: np.ndarray) -> np.bool_:
 
 @nb.njit(
     "Tuple((float64[:,:,:], float64[:,:], int64[:]))(float64[:,:], int32[:,:], float64[::1], float64[::1])",
-    parallel=True,
+    parallel=True, cache=True,
 )
 def intersect_line_mesh(
     vertices: np.ndarray,
@@ -483,7 +486,7 @@ def intersect_line_mesh(
 
 @nb.njit(
     "Tuple((float64[:,:,:], float64[:,:], int64[:]))(float64[:,:], int32[:,:], float64[:], float64[:])",
-    parallel=True, nogil=True
+    parallel=True, nogil=True, cache=True,
 )
 def _intersect_line_mesh(
     vertices: np.ndarray,
@@ -581,7 +584,7 @@ def _intersect_line_mesh(
     return faces, intersection_points, indices
 
 
-@nb.njit("Tuple((float64[:,:], int64))(float64[:,:,:],float64[:])")
+@nb.njit("Tuple((float64[:,:], int64))(float64[:,:,:],float64[:])", cache=True)
 def get_closest_face(
     faces: np.ndarray, point: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -617,7 +620,7 @@ def find_closest_point_from_line_np(
 
 
 # numba compatible version
-@nb.njit("float64[:](float64[:,:], float64[:], float64[::1])")
+@nb.njit("float64[:](float64[:,:], float64[:], float64[::1])", cache=True)
 def find_closest_point_from_line_nb(
     points: np.ndarray, ln0: np.ndarray, ln: np.ndarray
 ) -> np.ndarray:
@@ -638,7 +641,7 @@ def find_closest_point_from_line_nb(
     return point
 
 
-@nb.njit("float64[:,:](float64[:,:],float64[:,:],float64[::1])", parallel=True)
+@nb.njit("float64[:,:](float64[:,:],float64[:,:],float64[::1])", parallel=True, cache=True)
 def find_closest_points_on_surface(
     points_eval: np.ndarray, brain_surface_points: np.ndarray, n: np.ndarray
 ) -> np.ndarray:
