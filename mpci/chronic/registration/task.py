@@ -26,8 +26,7 @@ from iblutil.util import Bunch
 
 import ibllib.oneibl.data_handlers as dh
 from mpci.chronic.registration.brain_meshes import get_plane_at_point_mlap, get_surface_points
-from mpci.chronic.registration.linalg import surface_normal, find_triangle, _update_points
-from plane2brain.linalg import intersect_line_plane
+from mpci.chronic.registration.linalg import surface_normal, find_triangle, _update_points, intersect_line_plane
 
 from ibllib.pipes.base_tasks import RegisterRawDataTask
 
