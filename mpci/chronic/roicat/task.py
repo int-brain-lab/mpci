@@ -253,7 +253,7 @@ class ROICaTTask(SubjectAggregateTask):
 
     def _run(self, sessions_to_exclude=None, sessions_to_include=None, display=False, **kwargs):
         """Run ROICaT processing for the subject.
-        
+
         Parameters
         ----------
         sessions_to_exclude : list of str, optional
@@ -283,7 +283,7 @@ class ROICaTTask(SubjectAggregateTask):
                 # Load mean images for this group
                 if kwargs.get('display_processed_images', True):
                     mean_images = self.load_data(paths).FOV_images
-                else:                     
+                else:
                     mean_images = [np.load(path / 'mpciMeanImage.images.npy') for path in paths]
                 # Create a figure with as many subplots as paths in the cluster
                 fig, axs = plt.subplots(1, len(paths), figsize=(5 * len(paths), 5))
@@ -295,7 +295,7 @@ class ROICaTTask(SubjectAggregateTask):
                     center_y, center_x = mean_img.shape[0] // 2, mean_img.shape[1] // 2
                     ax.axhline(center_y, color='red', linestyle='--')
                     ax.axvline(center_x, color='red', linestyle='--')
-                    
+
                     ax.set_title(f'{path.session_path_short()} - {path.name}')
                     ax.axis('off')
                     # Overlay a number in the corner for reference
@@ -366,7 +366,7 @@ class ROICaTTask(SubjectAggregateTask):
             # Drop rows with cluster_id NA (these are the unclustered ROIs that didn't track across sessions)
             roi_table = roi_table.dropna(subset=['cluster_id'])
             roi_tables.append(roi_table)
-            
+
             # Upload some of the images to Alyx for visualization purposes
             self.upload_visualization_images(
                 defaults['results_saving']['dir_save'] / 'visualization',
@@ -419,12 +419,12 @@ class ROICaTTask(SubjectAggregateTask):
                 assert self.one and not self.one.offline, 'Remote data handling requires an active One instance'
                 eids = self.one.search(subject=self.subject_path.name, datasets=['_ibl_mpciMeanImage.mlapdv_estimate.npy'])
                 raise NotImplementedError('Remote data handling not implemented yet')
-        # Find ordered list of 
+        # Find ordered list of
         success, files, _ = self.input_files[0].find_files(self.subject_path)
         # Filter sessions with both meanimage and raw zip present
         files_grouped = groupby(sorted(files, key=lambda x: x.parent), key=lambda x: x.parent)
         alf_paths = [ALFPath(k) for k, g in files_grouped if len(list(g)) == 2]  # both files present
-        
+
         if sessions_to_exclude:
             alf_paths = [path for path in alf_paths if path.session_path_short() not in sessions_to_exclude]
         if sessions_to_include:
@@ -436,7 +436,7 @@ class ROICaTTask(SubjectAggregateTask):
         if not self.one or self.one.offline or not save_dir or not save_dir.exists():
              logger.warning('Skipping upload of visualization images to Alyx.')
              return
-        
+
         images = [
             'alignment/all_to_all_geometric.png', 'alignment/all_to_all_nonrigid.png',
             'FOV_images_aligned_geometric/FOV_images_aligned_geometric.gif',
@@ -454,6 +454,8 @@ class ROICaTTask(SubjectAggregateTask):
             # If animated GIF, do not resize
             note['width'] = 'orig' if RegisterRawDataTask._is_animated_gif(img_path) else None
             if group_id is not None:
+                # To avoid image overwrites on Alyx we rename the image to include the group_id if provided
+                img_path = img_path.rename(img_path.with_stem(f'{group_id}_{img_path.stem}'))
                 note['text'] = f'FOV group {group_id} - {img_path.stem}'
             else:
                 note['text'] = img_path.stem
@@ -465,13 +467,13 @@ class ROICaTTask(SubjectAggregateTask):
             else:
                 logger.warning(f'Visualization image {img} not found at {img_path}, skipping upload.')
         return notes
-            
-        
+
+
     def group_fovs(self, alf_paths, threshold=300.):
         """Group FOVs by their location.
-        
+
         NB: This can be simplified when we've accounted for objective angle
-        
+
         Parameters
         ----------
         alf_paths : list of ALFPath
@@ -481,27 +483,27 @@ class ROICaTTask(SubjectAggregateTask):
             This is a strict threshold used for complete-linkage clustering, which enforces that all
             members of a cluster are within this distance of each other.
         """
-    
+
         def most_common_suffix(paths):
             """
             Finds the most common numerical string suffix from a list of file paths.
             Assumes each path ends with a numerical string (e.g., '00', '04').
-            
+
             Parameters:
             paths (list of str): List of file paths.
-            
+
             Returns:
             str: Most common numerical suffix.
             """
             # Extract the suffix from each path (last 2 characters assumed)
             suffixes = [path.name[-2:] for path in paths]
-            
+
             # Count occurrences of each suffix
             count = Counter(suffixes)
-            
+
             # Find the most common one
             most_common = count.most_common(1)
-            
+
             return most_common[0][0] if most_common else None
 
         # Exclude paths without mlapdv estimates
@@ -550,7 +552,7 @@ class ROICaTTask(SubjectAggregateTask):
                 #in cases where two clustered FOVs come from the same session, choose the top one (TODO this is a HACK for now)
                 inferred_name = 'FOV_' + most_common_suffix(path_list)
                 cluster_name = f"cFOV_{cID:02d}"
-                
+
                 logger.info('\nCluster name: %s   Inferred name: %s', cluster_name, inferred_name)
                 [logger.info(f"{i:02d} {path}") for i,path in enumerate(path_list)]
 
@@ -577,11 +579,11 @@ if __name__ == '__main__':
     ROOT = Path('/mnt/whiterussian/Subjects')
     subject = 'SP072'
     subject_path = ROOT / subject
-    
+
     task = ROICaTTask(subject_path)#, one=ONE())
     task.get_signatures()
     # task.assert_expected_inputs()  # TODO support subject path
-    
+
     # FOV_paths_all = list(np.unique([(Path(path) / '..').resolve() for path in paths_allMLAPDV]))  # parent
     # RFM_paths_all = list(np.unique([(Path(path) / '..').resolve() for path in paths_allRFM]))
 
