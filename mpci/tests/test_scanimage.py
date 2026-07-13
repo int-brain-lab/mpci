@@ -1,11 +1,17 @@
 
 import unittest
+import tempfile
+import tarfile
+from pathlib import Path
 from copy import deepcopy
 from itertools import chain
 
 import numpy as np
+from one.api import ONE
 
 from mpci.scanimage.io import patch_imaging_meta
+from mpci.scanimage.task import MesoscopeCompress
+from mpci.tests import TEST_DB, IntegrationTestCase
 
 
 class TestImagingMeta(unittest.TestCase):
@@ -70,6 +76,48 @@ class TestImagingMeta(unittest.TestCase):
         meta['coordsTF'] = expected
         new_meta = patch_imaging_meta(meta)
         self.assertEqual(expected, new_meta['coordsTF'])
+
+
+class TestMesoscopeCompress(IntegrationTestCase):
+    """Test for MesoscopeCompress task."""
+
+    def setUp(self) -> None:
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+
+        self.alf_path = Path(tempdir.name, 'test', '2023-03-03', '002', 'raw_imaging_data_00')
+        self.alf_path.mkdir(parents=True)
+        for i in range(2):
+            with open(str(self.alf_path / f'2023-03-03_2_test_2P_00001_{i:05}.tif'), 'wb') as fp:
+                np.save(fp, np.zeros((512, 512, 2), dtype=np.int16))
+
+        # Touch some unnecessary files
+        for name in ('_ibl_rawImagingData.meta.json', '2023-03-03_2_test_2P_00001_00001.mat'):
+            self.alf_path.joinpath(name).touch()
+
+        self.one = ONE(**TEST_DB)
+
+    def test_compress(self):
+        task = MesoscopeCompress(self.alf_path.parent, one=self.one)
+
+        # Check fails if compressed file too small
+        self.assertEqual(-1, task.run(remove_uncompressed=True))
+        self.assertIn('Compressed file < 1KB', task.log)
+
+        # Shouldn't unlink files if compression failed
+        tif_files = list(self.alf_path.glob('*.tif'))
+        self.assertEqual(2, len(tif_files), 'deleted tif files after failed compression')
+
+        self.alf_path.joinpath('imaging.frames.tar.bz2').unlink()
+        # With a mocked file size the task should complete
+        status = task.run(verify_min_size=False, remove_uncompressed=True)
+        self.assertFalse(status, 'compression task failed')
+
+        self.assertTrue(self.alf_path.joinpath('imaging.frames.tar.bz2').exists())
+        # Should delete the tifs after compression
+        self.assertFalse(any(x.exists() for x in tif_files), 'failed to remove tifs')
+        tfile = tarfile.open(self.alf_path.joinpath('imaging.frames.tar.bz2'))
+        self.assertEqual(set(tfile.getnames()), set(x.name for x in tif_files))
 
 
 if __name__ == '__main__':
