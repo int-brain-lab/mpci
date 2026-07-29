@@ -1,10 +1,12 @@
 """WIP ROICaT processing task for MPCI data."""
 import uuid
 import logging
-import shutil
 import tempfile
 from itertools import groupby
 from collections import Counter
+import shutil
+import pickle
+import importlib
 
 from scipy.cluster.hierarchy import linkage, fcluster
 import numpy as np
@@ -19,6 +21,7 @@ from roicat.data_importing import Data_roicat
 from ibllib.pipes.tasks import Task
 from ibllib.pipes.base_tasks import RegisterRawDataTask
 from ibllib.oneibl.data_handlers import ExpectedDataset
+from ibllib.oneibl.registration import nickname2lab
 from typing import *
 import scipy
 import scipy.sparse
@@ -32,7 +35,7 @@ class SubjectAggregateTask(Task):
     """A base class for tasks that operate on a subject level, aggregating data across sessions."""
 
     def __init__(self, subject_path, **kwargs):
-        """A task for running ROICaT across a subject's imaging sessions.
+        """A task for running ROICaT accross a subject's imaging sessions.
 
         Parameters
         ----------
@@ -41,6 +44,17 @@ class SubjectAggregateTask(Task):
         """
         self.subject_path = subject_path
         super().__init__(self.subject_path, **kwargs)
+        assert self.one and not self.one.offline
+        idx = list(map(str.lower, subject_path.parts)).index('subjects')
+        lab = nickname2lab(subject_path.name, self.one.alyx)
+        if self.location == 'server':
+            # Not in lab folder
+            self.aggregate_path = ALFPath(*subject_path.parts[:idx]).joinpath(
+                'aggregates', 'Subjects', lab, subject_path.name)
+        else:
+            assert lab != 'Data'
+            self.aggregate_path = ALFPath(*subject_path.parts[:idx - 1]).joinpath(
+                'aggregates', 'Subjects', lab, subject_path.name)
 
     def register_datasets(self, **kwargs):
         """
@@ -58,9 +72,39 @@ class SubjectAggregateTask(Task):
         """
         if self.location != 'server':
             raise NotImplementedError('Dataset registration is only implemented for server-side execution.')
+        # Get subject ID
+        subject_name = self.subject_path.name
+        subject_id = self.one.alyx.rest('subjects', 'read', id=subject_name)['id']
+
         # TODO Register to aggregates endpoint
-        raise NotImplementedError
-        return self.data_handler.uploadData(self.outputs, self.version, **kwargs)
+        clobber = kwargs.get('clobber', False)
+        version = kwargs.get('version') or self.version
+        versions = [version] * len(self.outputs)
+        from ibllib.oneibl.registration import register_dataset
+        from iblutil.util import ensure_list
+        # If clobber = False, do not re-upload the outputs that have already been processed
+        outputs = ensure_list(outputs)
+        to_upload = list(filter(None if clobber else lambda x: x not in self.processed, outputs))
+        records = register_dataset(
+            to_upload, one=self.one, versions=versions, repository='flatiron_aggregates', content_type='subject',
+            object_id=subject_id, **kwargs)
+
+        records = records or []
+        if kwargs.get('dry', False):
+            return records
+
+        # from one.remote.globus import Globus
+        # globus = Globus('server', headless=True)
+        # if globus.is_logged_in:
+        #     for record, file in zip(records, to_upload):
+        #         if not record:
+        #             return
+        #     # globus.transfer_data(data_path, source_endpoint, destination_endpoint,
+        #     #           recursive=False, **kwargs)
+
+        # Store processed outputs
+        self.processed.update({k: v for k, v in zip(to_upload, records) if v})
+        return [self.processed[x] for x in outputs if x in self.processed]
 
 
 def extract_masknmf_spatial_footprints(dr):
@@ -218,6 +262,7 @@ class ROICaTTask(SubjectAggregateTask):
     ram = 12  # RAM needed to run (GB)
     job_size = 'large'  # either 'small' or 'large', defines whether task should be run as part of the large or small job services
     env = 'roicat'  # the environment name within which to run the task (NB: the env is not activated automatically!)
+    version = importlib.metadata.version('mpci')
 
     def __init__(self, subject_path, select_RFM_days_only=False, **kwargs):
         """A task for running ROICaT accross a subject's imaging sessions.
@@ -231,6 +276,9 @@ class ROICaTTask(SubjectAggregateTask):
         """
         super().__init__(subject_path, **kwargs)
         self.select_RFM_days_only = select_RFM_days_only
+        # Get the subject and lab for output
+        self.subject = self.subject_path.name
+        subject
 
     @property
     def signature(self):
@@ -243,15 +291,14 @@ class ROICaTTask(SubjectAggregateTask):
             raise NotImplementedError('AND with aggregates not implemented yet')
             # FIXME may be in 'alf/' if only one protocol run that session
             inputs &= I('_ibl_passiveRFM.times.npy', '????-??-??/???/alf/task_??', True, unique=False)
-        # TODO define output files
-        outputs = []
+        outputs = [('_ibl_mpciROIs.tracked.pqt', ''), ('_roicat_ROIData.raw.zip', '')]
         return {'input_files': [inputs], 'output_files': outputs}
 
     def get_data_handler(self, **kwargs):
         """Data handlers not supported yet."""
         return None
 
-    def _run(self, sessions_to_exclude=None, sessions_to_include=None, display=False, **kwargs):
+    def _run(self, sessions_to_exclude=None, sessions_to_include=None, display=False, overwrite=True, **kwargs):
         """Run ROICaT processing for the subject.
 
         Parameters
@@ -273,49 +320,111 @@ class ROICaTTask(SubjectAggregateTask):
         # Load the list of sessions to process
         if sessions_to_include and sessions_to_exclude:
             raise ValueError('Cannot specify both sessions_to_include and sessions_to_exclude')
-        paths = self.fetch_fov_list(sessions_to_exclude=sessions_to_exclude, sessions_to_include=sessions_to_include)
-        # paths = paths[:24]  # TODO remove limit
-        grouped = self.group_fovs(paths, **kwargs)
 
-        if display:
-            # Display all mean images for user to optionally exclude any additional sessions before processing
-            for gID, paths in grouped.items():
-                # Load mean images for this group
-                if kwargs.get('display_processed_images', True):
-                    mean_images = self.load_data(paths).FOV_images
-                else:
-                    mean_images = [np.load(path / 'mpciMeanImage.images.npy') for path in paths]
-                # Create a figure with as many subplots as paths in the cluster
-                fig, axs = plt.subplots(1, len(paths), figsize=(5 * len(paths), 5))
-                fig.suptitle(f'FOV group {gID}', fontsize=16)
-                for i, (ax, path) in enumerate(zip(axs, paths)):
-                    mean_img = mean_images[i]
-                    ax.imshow(mean_img, cmap='gray')
-                    # Add crosshairs at the center
-                    center_y, center_x = mean_img.shape[0] // 2, mean_img.shape[1] // 2
+        # tmp_output = tempfile.TemporaryDirectory(prefix=f'roicat_{self.subject_path.name}_')
+        tmp_loc = Path(tempfile.gettempdir())
+        tmp_selected_sessions = next(tmp_loc.glob(f'roicat_{self.subject_path.name}_*/selected_sessions.pkl'), None)
+        if tmp_selected_sessions and not overwrite:
+            tmp_output = tmp_selected_sessions.parent
+            logger.info(f'loading previously selected sessions from {tmp_output}')
+            with open(tmp_output / 'selected_sessions.pkl', 'rb') as f:
+                grouped = pickle.load(f)
+            assert not sessions_to_include, 'sessions_to_include should not be specified when loading previously selected sessions'
+        else:
+            tmp_output = Path(tempfile.mkdtemp(prefix=f'roicat_{self.subject_path.name}_'))
+            paths = self.fetch_fov_list(sessions_to_exclude=sessions_to_exclude, sessions_to_include=sessions_to_include)
+            if kwargs.get('limit'):
+                paths = paths[:kwargs['limit']]
+            grouped = self.group_fovs(paths, **kwargs)
+
+            if display:
+                # Display all mean images for user to optionally exclude any additional sessions before processing
+                for gID, paths in grouped.items():
+                    # Load mean images for this group
+                    if kwargs.get('display_processed_images', True):
+                        mean_images = self.load_data(paths).FOV_images
+                    else:
+                        mean_images = [np.load(path / 'mpciMeanImage.images.npy') for path in paths]
+                    if not paths:
+                        continue
+
+                    fig, ax = plt.subplots(1, 1, figsize=(7, 7))
+                    current_idx = 0
+                    excluded_indices = set()
+                    img_artist = ax.imshow(mean_images[current_idx], cmap='gray')
+                    center_y, center_x = mean_images[current_idx].shape[0] // 2, mean_images[current_idx].shape[1] // 2
                     ax.axhline(center_y, color='red', linestyle='--')
                     ax.axvline(center_x, color='red', linestyle='--')
-
-                    ax.set_title(f'{path.session_path_short()} - {path.name}')
+                    idx_text = ax.text(
+                        0.02,
+                        0.98,
+                        '',
+                        transform=ax.transAxes,
+                        fontsize=11,
+                        color='yellow',
+                        ha='left',
+                        va='top'
+                    )
                     ax.axis('off')
-                    # Overlay a number in the corner for reference
-                    ax.text(0.05, 0.95, f'{i}', transform=ax.transAxes, fontsize=12, color='yellow', ha='left', va='top')
-                logger.info('Displaying mean images for FOV group %s. Please inspect and decide if any sessions should be excluded based on image quality or other factors.', gID)
-                plt.tight_layout()
-                plt.show()  # plt.savefig("debug_cluster.png", dpi=150)
-                # Prompt the user to input any indices of sessions to exclude from this cluster, separated by commas (e.g., "0,2" to exclude the first and third sessions in the cluster)
-                exclude_input = input(f'Enter indices of sessions to exclude from FOV group {gID}, separated by commas (or press Enter to keep all): ')
-                if exclude_input.strip():
-                    exclude_indices = list(map(int, map(str.strip, exclude_input.split(','))))
-                    grouped[gID] = [path for i, path in enumerate(paths) if i not in exclude_indices]
-                    logger.info('Excluding sessions at indices %s from FOV group %s\n\t%s', exclude_indices, gID,
-                                '\n\t'.join(f'{path.session_path_short()}/{path.name}' for i, path in enumerate(paths) if i in exclude_indices))
 
-        # Ensure output directory exists
-        if not (outpath := self.subject_path.joinpath('ROICaT')).exists():
-            outpath.mkdir(parents=True)
+                    def draw_current_image():
+                        mean_img = mean_images[current_idx]
+                        img_artist.set_data(mean_img)
 
-        tmp_output = tempfile.TemporaryDirectory(prefix=f'roicat_{self.subject_path.name}_')
+                        path = paths[current_idx]
+                        status = 'EXCLUDED' if current_idx in excluded_indices else 'included'
+                        ax.set_title(
+                            f'FOV group {gID} | {current_idx + 1}/{len(paths)}\n'
+                            f'{path.session_path_short()} - {path.name}\n'
+                            f'Status: {status}'
+                        )
+                        idx_text.set_text(f'idx {current_idx}')
+                        fig.tight_layout()
+                        fig.canvas.draw_idle()
+
+                    def on_key(event):
+                        nonlocal current_idx
+                        if event.key in ('right', 'down'):
+                            current_idx = (current_idx + 1) % len(paths)
+                            draw_current_image()
+                        elif event.key in ('left', 'up'):
+                            current_idx = (current_idx - 1) % len(paths)
+                            draw_current_image()
+                        elif event.key in (' ', 'space'):
+                            if current_idx in excluded_indices:
+                                excluded_indices.remove(current_idx)
+                            else:
+                                excluded_indices.add(current_idx)
+                            draw_current_image()
+                        elif event.key in ('enter', 'escape', 'q'):
+                            plt.close(fig)
+
+                    fig.canvas.mpl_connect('key_press_event', on_key)
+                    logger.info(
+                        'Displaying mean images for FOV group %s. Use left/right arrows to browse, '
+                        'space to toggle exclusion, and Enter/Escape/q to continue.',
+                        gID
+                    )
+                    draw_current_image()
+                    plt.show()  # Interactive review per image.
+
+                    grouped[gID] = [path for i, path in enumerate(paths) if i not in excluded_indices]
+                    if excluded_indices:
+                        logger.info(
+                            'Excluding sessions at indices %s from FOV group %s\n\t%s',
+                            sorted(excluded_indices),
+                            gID,
+                            '\n\t'.join(
+                                f'{path.session_path_short()}/{path.name}'
+                                for i, path in enumerate(paths)
+                                if i in excluded_indices
+                            )
+                        )
+            # Save so user doesn't have to reselect if they want to rerun with different processing parameters
+            logger.info(f'Saving selected sessions to {tmp_output / "selected_sessions.pkl"}')
+            with open(tmp_output / 'selected_sessions.pkl', 'wb') as f:
+                pickle.dump(grouped, f)
+
         roi_tables = []
         all_data = []
         for gID, paths in grouped.items():
@@ -327,7 +436,9 @@ class ROICaTTask(SubjectAggregateTask):
             defaults = roicat.util.get_default_parameters(pipeline='tracking')
             # dir save
             # Save to temp dir first then copy to final destination, to avoid issues with network drive
-            defaults['results_saving']['dir_save'] = Path(tmp_output.name) / f'group_{gID:02d}'
+            # defaults['results_saving']['dir_save'] = outpath / f'group_{gID:02d}'  # TODO Comment out
+            # defaults['results_saving']['dir_save'] = Path(tmp_output.name) / f'group_{gID:02d}'
+            defaults['results_saving']['dir_save'] = tmp_output / f'group_{gID:02d}'
             defaults['results_saving']['dir_save'].mkdir(exist_ok=True)
             result, run_data, params = roicat.pipelines.pipeline_tracking(defaults, custom_data=data)
             all_data.append((result, run_data, params, paths))
@@ -368,6 +479,9 @@ class ROICaTTask(SubjectAggregateTask):
             roi_tables.append(roi_table)
 
             # Upload some of the images to Alyx for visualization purposes
+            if kwargs.get('limit'):
+                logger.info('Skipping upload of visualization images to Alyx due to limit parameter')
+                continue
             self.upload_visualization_images(
                 defaults['results_saving']['dir_save'] / 'visualization',
                 group_id=gID
@@ -377,12 +491,13 @@ class ROICaTTask(SubjectAggregateTask):
         all_roi_table = pd.concat(roi_tables, ignore_index=True)
         if not all_roi_table['roi_id'].unique().size == all_roi_table.shape[0]:
             logger.warning('Duplicate ROI IDs across sessions.')
+
+        self.aggregate_path.mkdir(parents=True, exist_ok=True)
         # Save the combined table to a parquet file
-        all_roi_table.to_parquet(outpath / '_ibl_mpciROIs.tracked.pqt', index=False)
-        # Save raw output as a pickle
-        with open(outpath / '_ibl_roicat.raw.pkl', 'wb') as f:
-            pickle.dump(all_data, f)
-        return [outpath / '_ibl_mpciROIs.tracked.pqt', outpath / '_ibl_roicat.raw.pkl']
+        all_roi_table.to_parquet(self.aggregate_path / '_ibl_mpciROIs.tracked.pqt', index=False)
+        # Zip the temp dir and save it to the output directory
+        shutil.make_archive(self.aggregate_path / '_roicat_ROIData.raw', 'zip', tmp_output)
+        return [self.aggregate_path / '_ibl_mpciROIs.tracked.pqt', self.aggregate_path / '_roicat_ROIData.raw.zip']
 
     def load_data(self, paths):
         """
@@ -469,7 +584,7 @@ class ROICaTTask(SubjectAggregateTask):
         return notes
 
 
-    def group_fovs(self, alf_paths, threshold=300.):
+    def group_fovs(self, alf_paths, threshold=300., **_):
         """Group FOVs by their location.
 
         NB: This can be simplified when we've accounted for objective angle
@@ -580,8 +695,9 @@ if __name__ == '__main__':
     subject = 'SP072'
     subject_path = ROOT / subject
 
-    task = ROICaTTask(subject_path)#, one=ONE())
+    task = ROICaTTask(subject_path, one=ONE())
     task.get_signatures()
+    task.processed = []
     # task.assert_expected_inputs()  # TODO support subject path
 
     # FOV_paths_all = list(np.unique([(Path(path) / '..').resolve() for path in paths_allMLAPDV]))  # parent
@@ -596,5 +712,10 @@ if __name__ == '__main__':
 
     # #exclude the buggy days
     # alf_paths = list([Path(path).resolve() for path in alf_paths_full if not any(d in path.__str__() for d in days_to_exclude)])
-    exclude = {'SP072/2025-09-17/001', 'SP072/2025-09-18/001', 'SP072/2025-09-19/001'}  # These MLAPDV files have odd dimensions; (512, 756, 3), (512, 752, 3)
-    task._run(sessions_to_exclude=validate_sessions_list(exclude), display=False)
+    # exclude = {'SP072/2025-08-06/001', 'SP072/2025-09-17/001', 'SP072/2025-09-18/001', 'SP072/2025-09-19/001'}  # These MLAPDV files have odd dimensions; (512, 756, 3), (512, 752, 3)
+    exclude = {'SP072/2025-08-06/001', 'SP072/2025-09-17/001', 'SP072/2025-09-18/001', 'SP072/2025-09-19/001', 'SP072/2025-09-22/001', 'SP072/2025-09-22/002', 'SP072/2025-09-22/003', 'SP072/2025-09-23/001', 'SP072/2025-09-24/001', 'SP072/2025-09-25/001', 'SP072/2025-09-26/001', 'SP072/2025-09-29/001', 'SP072/2025-09-30/002', 'SP072/2025-10-01/001', 'SP072/2025-10-02/001', 'SP072/2025-10-06/001', 'SP072/2025-10-07/001', 'SP072/2025-10-08/001', 'SP072/2025-10-09/001', 'SP072/2025-10-10/001', 'SP072/2025-10-13/002', 'SP072/2025-10-13/003', 'SP072/2025-10-14/001', 'SP072/2025-10-15/001', 'SP072/2025-10-16/002', 'SP072/2025-10-17/001'}
+    include = {'SP072/2025-08-21/001', 'SP072/2025-08-22/001', 'SP072/2025-08-26/001', 'SP072/2025-08-27/002', 'SP072/2025-08-28/001', 'SP072/2025-09-02/002', 'SP072/2025-09-03/001', 'SP072/2025-09-04/001', 'SP072/2025-09-05/001'}
+    task.outputs = task._run(sessions_to_exclude=exclude, display=False)
+    #task.outputs = task._run(sessions_to_include=include, display=True)
+    #task.outputs = task._run(display=True)
+    task.register_datasets()
