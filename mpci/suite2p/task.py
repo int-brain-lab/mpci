@@ -29,7 +29,6 @@ class MesoscopePreprocess(MesoscopeTask):
     io_charge = 100
     cpu = -1
     job_size = 'large'
-    env = 'suite2p'
 
     def __init__(self, *args, **kwargs):
         self._teardown_files = []
