@@ -566,12 +566,10 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         AssertionError
             If not exactly one reference stack is found in the source folder.
         """
-        # FIXME use the base from the data loader
-        base_folder = Path("/mnt/sdceph/users/ibl/data/quarantine/tasks")
         path_short = self.one.eid2path(self.reference_session_eid).session_path_short()
         lab = self.one.get_details(self.reference_session_path)["lab"]
         symlinked_reference_stack = (
-            base_folder
+            self.data_handler.patch_path
             / type(self).__name__
             / lab
             / "Subjects"
@@ -582,7 +580,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         )
 
         _session_folder = (
-            Path("/mnt/sdceph/users/ibl/data")
+            self.data_handler.root_path
             / lab
             / "Subjects"
             / path_short
