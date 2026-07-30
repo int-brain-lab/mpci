@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import enum
 from itertools import product
 from pathlib import Path
 from typing import Literal
@@ -26,7 +27,6 @@ import one.alf.io as alfio
 from one.alf.spec import to_alf
 from mpci.alyx.tasks import MesoscopeTask
 from ibllib.pipes.base_tasks import DynamicTask
-from mpci.chronic.registration.scanimage import Provenance
 from mpci.scanimage.io import (
     patch_imaging_meta,
     get_px_per_um,
@@ -62,6 +62,10 @@ import logging
 
 _logger = logging.getLogger(__name__)
 
+Provenance = enum.Enum(
+    "Provenance", ["ESTIMATE", "FUNCTIONAL", "LANDMARK", "HISTOLOGY"]
+)  # py3.11 make StrEnum
+
 
 class PopeyeS3DataHandler(PopeyeDataHandler):
     # don't look. There is nothing to see here.
@@ -74,6 +78,16 @@ class PopeyeS3DataHandler(PopeyeDataHandler):
         return s3_patcher.patch_dataset(
             outputs, created_by=self.one.alyx.user, versions=versions, **kwargs
         )
+
+
+def unique_glob(path: Path, glob_pattern: str):
+    result = list(path.glob(glob_pattern))
+    if len(result) == 0:
+        raise FileNotFoundError(f"no file that matches {glob_pattern} found at {path}")
+    elif len(result) > 1:
+        raise ValueError(f"multiple matches found for {glob_pattern} found at {path}:\n{result}")
+    else:
+        return result[0]
 
 
 class MesoscopeFOVAlignment(MesoscopeTask):
@@ -1628,16 +1642,21 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         return alyx_fovs
 
 
-class ROICoordinatesExtraction(DynamicTask):
+class ROICoordinatesExtraction(MesoscopeTask):
     """ """
 
     priority = 40
     job_size = "small"
 
-    def __init__(self):
-        # infer provenance from the input dataset
-        for input_file in self.signature["input_files"]:
-            ...
+    def __init__(
+        self,
+        *args,
+        provenance: Provenance = Provenance.ESTIMATE,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        # provenance defaults to estimate
+        self.provenance = provenance
 
     @property
     def signature(self):
@@ -1669,18 +1688,18 @@ class ROICoordinatesExtraction(DynamicTask):
             fov_path = self.session_path / "alf" / fov_name
 
             # Load neuron centroids in pixel space
-            stack_pos_file = list(fov_path.glob(f"mpciROIs.stackPos{sfx}*"))
-            assert len(stack_pos_file) == 1
+            stack_pos_file = unique_glob(fov_path, f"mpciROIs.stackPos{sfx}*")
             stack_pos = alfio.load_file_content(stack_pos_file)
 
             # Load MeanImage mlapdv
-            mlapdv_image_file = list(fov_path.glob(f"mpciMeanImage.mlapdv{sfx}*"))
-            assert len(mlapdv_image_file) == 1
+            mlapdv_image_file = unique_glob(fov_path, f"mpciMeanImage.mlapdv{sfx}.npy")
             mlapdv_image = alfio.load_file_content(mlapdv_image_file)
 
             # load brain location ids
-            brain_location_ids_file = list(fov_path.glob(f"mpciMeanImage.brainLocationIds{sfx}*"))
-            assert len(brain_location_ids_file) == 1
+            brain_location_ids_file = unique_glob(
+                fov_path, f"mpciMeanImage.brainLocationIds_ccf_2017{sfx}.npy"
+            )
+
             brain_location_ids_image = alfio.load_file_content(brain_location_ids_file)
 
             mlapdv, brain_ids = self.extract_mlapdv_and_labels_for_roi_centroids(
@@ -1699,7 +1718,7 @@ class ROICoordinatesExtraction(DynamicTask):
             fov_names
         )
         for fov_name in fov_names:
-            fov_path = self.session_path / "alf", fov_name
+            fov_path = self.session_path / "alf" / fov_name
             for attr, arr, sfx in (
                 ("mlapdv", all_mlapdv[fov_name], suffix),
                 ("brainLocationIds", all_brain_ids[fov_name], ("ccf", "2017", suffix)),
@@ -1719,7 +1738,7 @@ class ROICoordinatesExtraction(DynamicTask):
         roi_mlapdv = np.full(rois_centroid_indices.shape, np.nan)
         roi_brain_ids = np.full(rois_centroid_indices.shape[0], np.nan)
         # simply index into volume
-        i, j = rois_centroid_indices.T
+        i, j = rois_centroid_indices[:, :2].T
         roi_mlapdv = mlapdv_image[i, j]
         roi_brain_ids = atlas_ID_image[i, j]
         return roi_mlapdv, roi_brain_ids
