@@ -4,8 +4,7 @@ import json
 from itertools import product
 from pathlib import Path
 from typing import Literal
-from uuid import UUID
-import uuid
+from uuid import UUID, uuid4
 from collections import Counter
 from datetime import datetime
 
@@ -31,7 +30,6 @@ from mpci.scanimage.io import (
     patch_imaging_meta,
     get_px_per_um,
     get_window_center,
-    get_window_px,
 )
 
 from one.alf.path import ALFPath
@@ -192,8 +190,6 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             "output_files": [
                 ("mpciMeanImage.brainLocationIds.npy", "alf/FOV_*", True),
                 ("mpciMeanImage.mlapdv.npy", "alf/FOV_*", True),
-                ("mpciROIs.mlapdv.npy", "alf/FOV_*", True),
-                ("mpciROIs.brainLocationIds.npy", "alf/FOV_*", True),
                 ("_ibl_rawImagingData.meta.json", self.raw_imaging_collection, True),
                 ("referenceImage.meta.json", "raw_imaging_data_??/reference", True),
             ],
@@ -256,18 +252,12 @@ class MesoscopeFOVAlignment(MesoscopeTask):
     #
 
     def _run(self):
-        # self.atlas = MRITorontoAtlas(
-        #     res_um=atlas_resolution
-        # )  # TODO Check scaling appied to underlying volume
-        # Load the reference stack & (down)load the registered MLAPDV coordinates
-        # reference_image = self.load_reference_stack()
-
-        # attempt to load histology data and set provenance accordingly
+        # Provenance is determined by the ability to load the histology volume
         try:
             reference_session_reference_image_mlapdv = self.load_histology()
             self.provenance = Provenance.HISTOLOGY
-        except Exception as e:
-            _logger.warning("lalala")
+        except Exception:
+            _logger.warning("no histology volume found.")
             self.provenance = Provenance.ESTIMATE
 
         # Load main meta
@@ -294,8 +284,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                     )
                 )
             )
-        # this encapsulates the entire pipeline that currently writes self.coords # FIXME
-        self.pipeline(
+        # this encapsulates the entire alignment pipeline
+        self.fovs_coordinates = self.align_FOVs(
             use_histology=True if self.provenance is Provenance.HISTOLOGY else False,
             lateral_correct=True,
             tilt_correct=True,
@@ -315,9 +305,9 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             n_px_per_row = raw_imaging_meta["rawScanImageMeta"]["Width"]
             if self.debug:
                 # stretch downsampled values to original size
-                old_len = self.coords[fov_uuid]["mlapdv"].shape[0]
+                old_len = self.fovs_coordinates[fov_uuid]["mlapdv"].shape[0]
                 target_len = n_px_per_row**2
-                values = self.coords[fov_uuid]["mlapdv"]
+                values = self.fovs_coordinates[fov_uuid]["mlapdv"]
                 from scipy.interpolate import interp1d
 
                 fn = interp1d(
@@ -325,10 +315,10 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                     values,
                     axis=0,
                 )
-                self.coords[fov_uuid]["mlapdv"] = fn(np.linspace(0, 1, target_len))
+                self.fovs_coordinates[fov_uuid]["mlapdv"] = fn(np.linspace(0, 1, target_len))
 
             mean_image_mlapdv = np.reshape(
-                self.coords[fov_uuid]["mlapdv"], (n_px_per_row, n_px_per_row, 3)
+                self.fovs_coordinates[fov_uuid]["mlapdv"], (n_px_per_row, n_px_per_row, 3)
             )
             mean_images_mlapdv[fov_uuid] = mean_image_mlapdv
             mean_images_ids[fov_uuid] = atlas.get_labels(mean_image_mlapdv / 1e6, mode="clip")
@@ -1083,13 +1073,13 @@ class MesoscopeFOVAlignment(MesoscopeTask):
     # ##        #### ##        ######## ######## #### ##    ## ########
     #
 
-    def pipeline(
+    def align_FOVs(
         self,
         use_histology: bool = True,
         lateral_correct: bool = True,
         tilt_correct: bool = False,
         debug: bool = False,  # debug flag: just downsample
-    ):
+    ) -> dict[str, dict[str, np.ndarray]]:
         """Assign MLAPDV atlas coordinates to this session's imaging-plane pixels.
 
         Each optional correction is attempted, and disabled with a logged warning if its
@@ -1194,22 +1184,21 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         )
 
         # populating the coordinates dictionary holding all coordinates of all FOVs
-        coords = {}
+        fovs_coordinates = {}
         n_px_per_row = raw_imaging_meta["rawScanImageMeta"]["Width"]
         # this step requires Width == Height
         # cannot be asserted here because of the format of the FOVs being stitched
         # together vertically (mesoscope specific)
         pixel_indices = np.array(list(product(range(n_px_per_row), repeat=2)), dtype="float")
 
-        # FIXME TODO remove this downsampling in production (here just debugging)
         if debug:
             pixel_indices = pixel_indices[::128]
 
         for fov_uuid in fov_map.values():
-            coords[fov_uuid] = {}
-            coords[fov_uuid]["pixel"] = pixel_indices
+            fovs_coordinates[fov_uuid] = {}
+            fovs_coordinates[fov_uuid]["pixel"] = pixel_indices
             # convert pixel indices to global um
-            coords[fov_uuid]["um_global"] = coordinate_systems_2d[fov_uuid].transform(
+            fovs_coordinates[fov_uuid]["um_global"] = coordinate_systems_2d[fov_uuid].transform(
                 pixel_indices,
                 "pixel",
                 "um_global",
@@ -1231,17 +1220,17 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             )
 
             for fov_uuid in fov_map.values():
-                n = coords[fov_uuid]["pixel"].shape[0]
-                coords[fov_uuid]["dv_below_surface"] = np.ones(n) * np.absolute(
+                n = fovs_coordinates[fov_uuid]["pixel"].shape[0]
+                fovs_coordinates[fov_uuid]["dv_below_surface"] = np.ones(n) * np.absolute(
                     fov_depths[fov_uuid] - dv_avg
                 )
 
         if tilt_correct and has_brain_surface_points:
-            # this adds to the coords dictionary:
+            # this adds to the fovs_coordinates dictionary:
             # 'um_corrected' - for apparent xy shift based on tilt
             # 'dv_below_surface_corrected'  - for apparent z shift based on tilt
-            coords = projections.correct_coords_for_tilt_2d(
-                coords,
+            fovs_coordinates = projections.correct_coords_for_tilt_2d(
+                fovs_coordinates,
                 fov_depths,
                 p_surface,
                 n_surface,
@@ -1266,11 +1255,11 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             if tilt_correct:
                 # use the tilt-corrected um coordinates to transform back to reference-image px
                 px = coordinate_systems_ref.transform(
-                    coords[uuid]["um_corrected"], "um_global", "pixel"
+                    fovs_coordinates[uuid]["um_corrected"], "um_global", "pixel"
                 )
             else:
                 # otherwise, convert the FOV pixel directly to (fractional) reference-image px
-                px = coords[uuid]["pixel"]
+                px = fovs_coordinates[uuid]["pixel"]
                 coords_um_global = coordinate_systems_2d[uuid].transform(px, "pixel", "um_global")
                 px = coordinate_systems_ref.transform(coords_um_global, "um_global", "pixel")
 
@@ -1283,7 +1272,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             if use_histology:
                 mlap_interp = histo_interp_fn(px)
                 # find point on surface
-                coords[uuid]["mlapdv_on_surface"] = atlas.get_dv_for_mlap(
+                fovs_coordinates[uuid]["mlapdv_on_surface"] = atlas.get_dv_for_mlap(
                     mlap_interp  # + 1e-6
                 )  # TODO trace back what those were for - I think not necessary since we are extrapolating now
             else:
@@ -1303,37 +1292,36 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                     rotate_by=IBL_MESOSCOPE_DEFINITIONS["scanner_orientation"]["rotation"],
                     invert_dims=IBL_MESOSCOPE_DEFINITIONS["scanner_orientation"]["invert_axis"],
                 )
-                coords[uuid]["mlapdv_on_surface"] = projections.project_coords_onto_atlas_surface(
-                    coords[uuid]["um_global"],
-                    coordinate_systems_3d=coordinate_systems_3d,
-                    atlas=atlas,
-                    projection_vector=brain_normal,
+                fovs_coordinates[uuid]["mlapdv_on_surface"] = (
+                    projections.project_coords_onto_atlas_surface(
+                        fovs_coordinates[uuid]["um_global"],
+                        coordinate_systems_3d=coordinate_systems_3d,
+                        atlas=atlas,
+                        projection_vector=brain_normal,
+                    )
                 )
 
             # project down into the brain; skipped entirely if no brain surface points are
             # available, since depth below the surface is undefined without them
             if has_brain_surface_points:
                 if tilt_correct:
-                    depths = coords[uuid]["dv_below_surface_corrected"]
+                    depths = fovs_coordinates[uuid]["dv_below_surface_corrected"]
                 else:
-                    depths = coords[uuid]["dv_below_surface"]
+                    depths = fovs_coordinates[uuid]["dv_below_surface"]
 
-                coords[uuid]["mlapdv"] = (  # TODO rename
-                    projections.project_down_from_surface(
-                        coords_on_surface=coords[uuid]["mlapdv_on_surface"],
-                        atlas=atlas,
-                        coords_depths=depths,
-                    )
+                fovs_coordinates[uuid]["mlapdv"] = projections.project_down_from_surface(
+                    coords_on_surface=fovs_coordinates[uuid]["mlapdv_on_surface"],
+                    atlas=atlas,
+                    coords_depths=depths,
                 )
-        # persistence for debugging
-        self.coords = coords
+        return fovs_coordinates
 
-    def write_outputs(self, coords: dict[str, dict[str, np.ndarray]]):
+    def write_outputs(self, fovs_coordinates: dict[str, dict[str, np.ndarray]]):
         """Write mean-image MLAPDV and brain-location-ID datasets to disk, unconditionally.
 
         Parameters
         ----------
-        coords : dict of str to dict of str to numpy.ndarray
+        fovs_coordinates : dict of str to dict of str to numpy.ndarray
             Per-FOV-UUID coordinate dictionaries, as populated by `pipeline`; each must
             contain an 'mlapdv' array.
 
@@ -1347,13 +1335,14 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         fov_map = ibl.get_fov_map(raw_imaging_meta)
         n_px_per_row = raw_imaging_meta["rawScanImageMeta"]["Width"]
         # the lookup has to be done on the atlas thas was used for histology
-        # FIXME this is dependent on the use_histology flag
         atlas = MRITorontoAtlas(res_um=self.histology_atlas_resolution)
 
         # save outputs
         for fov_name, fov_uuid in fov_map.items():
             # mpciMeanImage.mlapdv
-            mpciMeanImage = np.reshape(coords[fov_uuid]["mlapdv"], (n_px_per_row, n_px_per_row, 3))
+            mpciMeanImage = np.reshape(
+                fovs_coordinates[fov_uuid]["mlapdv"], (n_px_per_row, n_px_per_row, 3)
+            )
             save_path = self.session_path / "alf" / fov_name / "mpciMeanImage.mlapdv.npy"
             np.save(
                 save_path,
@@ -1544,7 +1533,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         # Create a new stack in Alyx for all stacks containing more than one slice.
         # Map of ScanImage ROI UUID to Alyx ImageStack UUID.
         if dry:
-            stack_ids = {i: uuid.uuid4() for i in slice_counts if slice_counts[i] > 1}
+            stack_ids = {i: uuid4() for i in slice_counts if slice_counts[i] > 1}
             fov_data = {"session": self.session_path.as_posix(), "imaging_type": "mesoscope"}
             session_fovs = []
         else:
