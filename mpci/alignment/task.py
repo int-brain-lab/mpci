@@ -104,6 +104,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         interpolation_sigma=25,
         histology_atlas_resolution=25,  # atlas resolution for histology (depends on steven)
         projection_atlas_resolution=25,  # atlas resolution for the projection
+        dry: bool = True,  # for now safety first. FIXME change this eventually
         **kwargs,
     ):
         """Initialize the task with this session's and the reference session's identifiers.
@@ -152,6 +153,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         self.interpolation_sigma = interpolation_sigma
         self.histology_atlas_resolution = histology_atlas_resolution
         self.projection_atlas_resolution = projection_atlas_resolution
+        self.dry = dry
 
     def tearDown(self):
         """Unlink any symlinks created during the task, then run the default teardown."""
@@ -266,12 +268,14 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             _logger.info("Extracting histology MLAPDV datasets")
             # Update the craniotomy center
             reference_image_meta = self.load_reference_stack_metadata()
-            self.update_craniotomy_center(
-                reference_image_meta, reference_session_reference_image_mlapdv
-            )
+            if not self.dry:
+                self.update_craniotomy_center(
+                    reference_image_meta, reference_session_reference_image_mlapdv
+                )
             meta["centerMM"] = reference_image_meta["centerMM"]
-            with open(meta_files[0], "w") as fp:
-                json.dump(meta, fp)
+            if not self.dry:
+                with open(meta_files[0], "w") as fp:
+                    json.dump(meta, fp)
             # Add reference meta data to meta_files list for registration
             meta_files.append(
                 next(
@@ -338,39 +342,42 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         assert len(mean_image_mlapdv) == nFOV
         for i in range(nFOV):
             alf_path = self.session_path.joinpath("alf", f"FOV_{i:02}")
-            alf_path.mkdir(parents=True, exist_ok=True)
-            for attr, arr, sfx in (
-                ("mlapdv", mean_image_mlapdv[i], suffix),
-                (
-                    "brainLocationIds",
-                    mean_images_ids[fov_uuid],
-                    ("ccf", "2017", suffix),
-                ),
-            ):
-                mean_image_files.append(
-                    alf_path / to_alf("mpciMeanImage", attr, "npy", timescale=sfx)
-                )
-                np.save(mean_image_files[-1], arr)
+            if not self.dry:
+                alf_path.mkdir(parents=True, exist_ok=True)
+                for attr, arr, sfx in (
+                    ("mlapdv", mean_image_mlapdv[i], suffix),
+                    (
+                        "brainLocationIds",
+                        mean_images_ids[fov_uuid],
+                        ("ccf", "2017", suffix),
+                    ),
+                ):
+                    mean_image_files.append(
+                        alf_path / to_alf("mpciMeanImage", attr, "npy", timescale=sfx)
+                    )
+                    np.save(mean_image_files[-1], arr)
 
+        # TODO this beomes a seperate task
         # Extract ROI MLAPDV coordinates and brain location IDs
-        roi_mlapdv, roi_brain_ids = self.roi_mlapdv(nFOV, suffix=suffix)
+        # roi_mlapdv, roi_brain_ids = self.roi_mlapdv(nFOV, suffix=suffix)
 
-        # Write MLAPDV + brain location ID of ROIs to disk
-        roi_files = []
-        assert set(roi_mlapdv.keys()) == set(roi_brain_ids.keys()) and len(roi_mlapdv) == nFOV
-        for i in range(nFOV):
-            alf_path = self.session_path.joinpath("alf", f"FOV_{i:02}")
-            for attr, arr, sfx in (
-                ("mlapdv", roi_mlapdv[i], suffix),
-                ("brainLocationIds", roi_brain_ids[i], ("ccf", "2017", suffix)),
-            ):
-                roi_files.append(alf_path / to_alf("mpciROIs", attr, "npy", timescale=sfx))
-                np.save(roi_files[-1], arr)
+        # # Write MLAPDV + brain location ID of ROIs to disk
+        # roi_files = []
+        # assert set(roi_mlapdv.keys()) == set(roi_brain_ids.keys()) and len(roi_mlapdv) == nFOV
+        # for i in range(nFOV):
+        #     alf_path = self.session_path.joinpath("alf", f"FOV_{i:02}")
+        #     for attr, arr, sfx in (
+        #         ("mlapdv", roi_mlapdv[i], suffix),
+        #         ("brainLocationIds", roi_brain_ids[i], ("ccf", "2017", suffix)),
+        #     ):
+        #         roi_files.append(alf_path / to_alf("mpciROIs", attr, "npy", timescale=sfx))
+        #         np.save(roi_files[-1], arr)
 
         # Register FOVs in Alyx
-        self.register_fov(meta, self.provenance)
+        if not self.dry:
+            self.register_fov(meta, self.provenance)
 
-        return sorted([*meta_files, *roi_files, *mean_image_files])
+        return sorted([*meta_files, *mean_image_files])
 
     #
     # ########     ###    ########    ###
