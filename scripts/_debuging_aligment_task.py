@@ -31,12 +31,13 @@ repro_task = MesoscopeFOVAlignment(
     reference_session_path=reference_session_path,
     one=one,
     location=LOCATION,
+    debug=True,
 )
 
 repro_task.setUp()
 repro_task.verify_data_presence()
-repro_task.pipeline(use_histology=True, debug=True)
-# repro_task._run()
+# repro_task.pipeline(use_histology=True, debug=True)
+repro_task._run()
 
 # %% visualizations
 fig, axes = plt.subplots()
@@ -44,3 +45,5 @@ ds = 1
 for uuid, _coords in repro_task.coords.items():
     points = _coords["mlapdv_on_surface"]
     axes.plot(points[::ds, 0], points[::ds, 1], ".")
+
+# %%

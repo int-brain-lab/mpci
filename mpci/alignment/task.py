@@ -105,6 +105,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         histology_atlas_resolution=25,  # atlas resolution for histology (depends on steven)
         projection_atlas_resolution=25,  # atlas resolution for the projection
         dry: bool = True,  # for now safety first. FIXME change this eventually
+        debug: bool = True,
         **kwargs,
     ):
         """Initialize the task with this session's and the reference session's identifiers.
@@ -154,6 +155,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         self.histology_atlas_resolution = histology_atlas_resolution
         self.projection_atlas_resolution = projection_atlas_resolution
         self.dry = dry
+        self.debug = debug
 
     def tearDown(self):
         """Unlink any symlinks created during the task, then run the default teardown."""
@@ -163,7 +165,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
     @property
     def signature(self):
-        I = self.data_handlers.ExpectedDataset.input  # noqa
+        I = ExpectedDataset.input  # noqa
         signature = {
             "input_files": [
                 I("_ibl_rawImagingData.meta.json", self.raw_imaging_collection, True),
@@ -289,7 +291,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             use_histology=True if self.provenance is Provenance.HISTOLOGY else False,
             lateral_correct=True,
             tilt_correct=True,
-            debug=True,
+            debug=self.debug,
         )
 
         raw_imaging_meta = self.load_raw_imaging_metadata()
@@ -301,14 +303,30 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         # store the outputs
         mean_images_mlapdv = {}
         mean_images_ids = {}
-        for fov_uuid, fov_name in fov_map.items():
+        for fov_name, fov_uuid in fov_map.items():
             n_px_per_row = raw_imaging_meta["rawScanImageMeta"]["Width"]
-            mean_image_mlapdv = np.reshape(self.coords[fov_uuid], (n_px_per_row, n_px_per_row, 3))
+            if self.debug:
+                # stretch downsampled values to original size
+                old_len = self.coords[fov_uuid]["mlapdv"].shape[0]
+                target_len = n_px_per_row**2
+                values = self.coords[fov_uuid]["mlapdv"]
+                from scipy.interpolate import interp1d
+
+                fn = interp1d(
+                    np.linspace(0, 1, old_len),
+                    values,
+                    axis=0,
+                )
+                self.coords[fov_uuid]["mlapdv"] = fn(np.linspace(0, 1, target_len))
+
+            mean_image_mlapdv = np.reshape(
+                self.coords[fov_uuid]["mlapdv"], (n_px_per_row, n_px_per_row, 3)
+            )
             mean_images_mlapdv[fov_uuid] = mean_image_mlapdv
             mean_images_ids[fov_uuid] = atlas.get_labels(mean_image_mlapdv / 1e6, mode="clip")
 
-        for fov_uuid, fov_name in fov_map.items():
-            fov = meta[fov_name]
+        for fov_name, fov_uuid in fov_map.items():
+            (fov,) = [fov for fov in meta["FOV"] if fov["roiUUID"] == fov_uuid]
             if "MLAPDV" not in fov:
                 fov["MLAPDV"] = {}
                 fov["brainLocationIds"] = {}
@@ -339,13 +357,12 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         # Save the mean image datasets
         suffix = None if self.provenance is Provenance.HISTOLOGY else self.provenance.name.lower()
         mean_image_files = []
-        assert len(mean_image_mlapdv) == nFOV
-        for i in range(nFOV):
-            alf_path = self.session_path.joinpath("alf", f"FOV_{i:02}")
+        for fov_name, fov_uuid in fov_map.items():
+            alf_path = self.session_path.joinpath("alf", fov_name)
             if not self.dry:
                 alf_path.mkdir(parents=True, exist_ok=True)
                 for attr, arr, sfx in (
-                    ("mlapdv", mean_image_mlapdv[i], suffix),
+                    ("mlapdv", mean_image_mlapdv[fov_uuid], suffix),
                     (
                         "brainLocationIds",
                         mean_images_ids[fov_uuid],
@@ -1178,7 +1195,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
         # FIXME TODO remove this downsampling in production (here just debugging)
         if debug:
-            pixel_indices = pixel_indices[::1000]
+            pixel_indices = pixel_indices[::128]
 
         for fov_uuid in fov_map.values():
             coords[fov_uuid] = {}
