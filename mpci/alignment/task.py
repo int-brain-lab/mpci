@@ -763,9 +763,10 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
         if self.location == "popeye":
             lab = self.one.get_details(self.reference_session_path)["lab"]
-            base_folder = Path(f"/mnt/sdceph/users/ibl/data/histology/{lab}")
             local_file = (
-                base_folder
+                self.data_handler.root_path
+                / "histology"
+                / lab
                 / self.reference_session_path.session_path_short()
                 / "referenceImage.mlapdv.npy"
             )
