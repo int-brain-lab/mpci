@@ -1652,11 +1652,13 @@ class ROICoordinatesExtraction(MesoscopeTask):
         self,
         *args,
         provenance: Provenance = Provenance.ESTIMATE,
+        dry: bool = True,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         # provenance defaults to estimate
         self.provenance = provenance
+        self.dry = dry
 
     @property
     def signature(self):
@@ -1702,11 +1704,10 @@ class ROICoordinatesExtraction(MesoscopeTask):
 
             brain_location_ids_image = alfio.load_file_content(brain_location_ids_file)
 
-            mlapdv, brain_ids = self.extract_mlapdv_and_labels_for_roi_centroids(
-                stack_pos,
-                mlapdv_image,
-                brain_location_ids_image,
-            )
+            # extract by indexing
+            i, j = stack_pos[:, :2].T
+            mlapdv = mlapdv_image[i, j]
+            brain_ids = brain_location_ids_image[i, j]
 
             assert ~np.isnan(brain_ids).any()
             all_brain_ids[fov_name] = brain_ids.astype(int)
@@ -1724,21 +1725,7 @@ class ROICoordinatesExtraction(MesoscopeTask):
                 ("brainLocationIds", all_brain_ids[fov_name], ("ccf", "2017", suffix)),
             ):
                 roi_files.append(fov_path / to_alf("mpciROIs", attr, "npy", timescale=sfx))
-                np.save(roi_files[-1], arr)
+                if not self.dry:
+                    np.save(roi_files[-1], arr)
 
         return sorted([*roi_files])
-
-    @staticmethod
-    def extract_mlapdv_and_labels_for_roi_centroids(
-        rois_centroid_indices: np.ndarray,
-        mlapdv_image: np.ndarray,
-        atlas_ID_image: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        # alloc
-        roi_mlapdv = np.full(rois_centroid_indices.shape, np.nan)
-        roi_brain_ids = np.full(rois_centroid_indices.shape[0], np.nan)
-        # simply index into volume
-        i, j = rois_centroid_indices[:, :2].T
-        roi_mlapdv = mlapdv_image[i, j]
-        roi_brain_ids = atlas_ID_image[i, j]
-        return roi_mlapdv, roi_brain_ids
