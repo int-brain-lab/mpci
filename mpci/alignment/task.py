@@ -25,6 +25,7 @@ from ibllib.oneibl.patcher import S3Patcher
 import one.alf.io as alfio
 from one.alf.spec import to_alf
 from mpci.alyx.tasks import MesoscopeTask
+from ibllib.pipes.base_tasks import DynamicTask
 from mpci.chronic.registration.scanimage import Provenance
 from mpci.scanimage.io import (
     patch_imaging_meta,
@@ -175,7 +176,6 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         signature = {
             "input_files": [
                 I("_ibl_rawImagingData.meta.json", self.raw_imaging_collection, True),
-                I("mpciROIs.stackPos.npy", "alf/FOV*", True),  # TODO inspect where this is needed
                 I(
                     "referenceImage.stack.tif", "raw_imaging_data_??/reference", True, unique=True
                 ),  # FIXME this will fail at sessions with multiple reference stacks
@@ -185,7 +185,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                     "raw_imaging_data_??/reference",
                     False,
                     unique=True,
-                ),  # TODO this should be optional
+                ),  # TODO deal with the updating of the raw_imaging_metadata
             ],
             "output_files": [
                 ("mpciMeanImage.brainLocationIds.npy", "alf/FOV_*", True),
@@ -1626,3 +1626,100 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                     )
 
         return alyx_fovs
+
+
+class ROICoordinatesExtraction(DynamicTask):
+    """ """
+
+    priority = 40
+    job_size = "small"
+
+    def __init__(self):
+        # infer provenance from the input dataset
+        for input_file in self.signature["input_files"]:
+            ...
+
+    @property
+    def signature(self):
+        I = ExpectedDataset.input  # noqa
+        signature = {
+            "input_files": [
+                I("_ibl_rawImagingData.meta.json", self.device_collection, True),
+                I("mpciMeanImage.mlapdv*.npy", "alf/FOV_*", True),
+                I("mpciMeanImage.brainLocationIds*.npy", "alf/FOV_*", True),  # optional?
+                I("mpciROIs.stackPos.npy", "alf/FOV*", True),
+            ],
+            "output_files": [
+                ("mpciROIs.mlapdv*.npy", "alf/FOV_*", True),
+                ("mpciROIs.brainLocationIds*.npy", "alf/FOV_*", True),
+            ],
+        }
+        return signature
+
+    def _run(self):
+        # empty suffix if provenance is histology
+        suffix = None if self.provenance is Provenance.HISTOLOGY else self.provenance.name.lower()
+        sfx = f"_{suffix}" if suffix else ""
+
+        all_mlapdv = {}
+        all_brain_ids = {}
+        fov_names = sorted((self.session_path / "alf").glob("FOV_*"))
+
+        for fov_name in fov_names:
+            fov_path = self.session_path / "alf" / fov_name
+
+            # Load neuron centroids in pixel space
+            stack_pos_file = list(fov_path.glob(f"mpciROIs.stackPos{sfx}*"))
+            assert len(stack_pos_file) == 1
+            stack_pos = alfio.load_file_content(stack_pos_file)
+
+            # Load MeanImage mlapdv
+            mlapdv_image_file = list(fov_path.glob(f"mpciMeanImage.mlapdv{sfx}*"))
+            assert len(mlapdv_image_file) == 1
+            mlapdv_image = alfio.load_file_content(mlapdv_image_file)
+
+            # load brain location ids
+            brain_location_ids_file = list(fov_path.glob(f"mpciMeanImage.brainLocationIds{sfx}*"))
+            assert len(brain_location_ids_file) == 1
+            brain_location_ids_image = alfio.load_file_content(brain_location_ids_file)
+
+            mlapdv, brain_ids = self.extract_mlapdv_and_labels_for_roi_centroids(
+                stack_pos,
+                mlapdv_image,
+                brain_location_ids_image,
+            )
+
+            assert ~np.isnan(brain_ids).any()
+            all_brain_ids[fov_name] = brain_ids.astype(int)
+            all_mlapdv[fov_name] = mlapdv
+
+        # Write MLAPDV + brain location ID of ROIs to disk
+        roi_files = []
+        assert set(all_mlapdv.keys()) == set(all_brain_ids.keys()) and len(all_brain_ids) == len(
+            fov_names
+        )
+        for fov_name in fov_names:
+            fov_path = self.session_path / "alf", fov_name
+            for attr, arr, sfx in (
+                ("mlapdv", all_mlapdv[fov_name], suffix),
+                ("brainLocationIds", all_brain_ids[fov_name], ("ccf", "2017", suffix)),
+            ):
+                roi_files.append(fov_path / to_alf("mpciROIs", attr, "npy", timescale=sfx))
+                np.save(roi_files[-1], arr)
+
+        return sorted([*roi_files])
+
+    @staticmethod
+    def extract_mlapdv_and_labels_for_roi_centroids(
+        rois_centroid_indices: np.ndarray,
+        mlapdv_image: np.ndarray,
+        atlas_ID_image: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        # alloc
+        roi_mlapdv = np.full(rois_centroid_indices.shape, np.nan)
+        roi_brain_ids = np.full(rois_centroid_indices.shape[0], np.nan)
+        # simply index into volume
+        i, j = rois_centroid_indices.T
+        roi_mlapdv = mlapdv_image[i, j]
+        roi_brain_ids = atlas_ID_image[i, j]
+        return roi_mlapdv, roi_brain_ids
