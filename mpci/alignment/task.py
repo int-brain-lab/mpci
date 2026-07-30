@@ -86,7 +86,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
     Notes
     -----
-    This task is under development: `_run` is still a no-op and the output signature is not final.
+    This task is under development: the output signature is not yet final.
     """
 
     priority = 100
@@ -125,6 +125,14 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         interpolation_sigma : int, optional
             Standard deviation, in pixels, of the Gaussian filter applied to the reference
             session's histology grid before interpolation. Default is 25.
+        histology_atlas_resolution : int, optional
+            Atlas resolution, in μm, used for histology-based MLAPDV lookups. Default is 25.
+        projection_atlas_resolution : int, optional
+            Atlas resolution, in μm, used for the surface projection atlas. Default is 25.
+        dry : bool, optional
+            If True, skip all disk writes and Alyx registration. Default is True.
+        debug : bool, optional
+            If True, downsample the pixel grid for faster debugging runs. Default is True.
         **kwargs : dict
             Keyword arguments forwarded to `MesoscopeTask`.
         """
@@ -545,7 +553,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         """
         return tifffile.imread(self.get_reference_session_reference_stack_path())
 
-    def _symlink_reference_session_reference_stack(self) -> None:
+    def _symlink_reference_session_reference_stack(self) -> Path:
         """Symlink the reference session's reference stack into the popeye quarantine folder.
 
         Returns
@@ -596,7 +604,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         self.links.append(symlinked_reference_stack)
         return symlinked_reference_stack
 
-    def load_histology(self) -> tuple[np.darray, np.npdarray]:
+    def load_histology(self) -> tuple[np.ndarray, np.ndarray]:
         """Load the MLAPDV coordinates of the reference session's reference image.
 
         Returns
@@ -610,7 +618,6 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         ccf_idx = np.load(local_histo_path)
 
         # flip the ap axis to match the atlas volume orientation
-        # TODO inspect here: this is an AI generated comment and there is no axis flip happening
         ccf_idx[:, :, 1] = np.abs(ccf_idx[:, :, 1].astype("int64") - atlas.label.shape[0]).astype(
             ccf_idx.dtype
         )
@@ -925,7 +932,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         -------
         scipy.interpolate.RegularGridInterpolator
             Interpolator mapping a (row, column) pixel position to its (ml, ap) coordinate.
-            Returns NaN for positions outside the grid.
+            Extrapolates for positions outside the grid.
         """
         grid = histo_mlapdv[:, :, :-1]
 
@@ -1102,6 +1109,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         tilt_correct : bool
             If True, correct apparent x/y/z shifts caused by tilt between the imaging plane
             and the brain surface, using the reference stack's brain surface points.
+        debug : bool
+            If True, downsample the pixel grid to speed up the run for debugging.
 
         Notes
         -----
@@ -1320,7 +1329,20 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         # persistence for debugging
         self.coords = coords
 
-    def write_outputs(self, coords: dict[str, np.ndarray]):
+    def write_outputs(self, coords: dict[str, dict[str, np.ndarray]]):
+        """Write mean-image MLAPDV and brain-location-ID datasets to disk, unconditionally.
+
+        Parameters
+        ----------
+        coords : dict of str to dict of str to numpy.ndarray
+            Per-FOV-UUID coordinate dictionaries, as populated by `pipeline`; each must
+            contain an 'mlapdv' array.
+
+        Notes
+        -----
+        For debugging purposes only: writes are unconditional, without the `dry` guard used
+        elsewhere in this class.
+        """
         # just for debugging purposes - write the data locally without any questions asked
         raw_imaging_meta = self.load_raw_imaging_metadata()
         fov_map = ibl.get_fov_map(raw_imaging_meta)
@@ -1366,8 +1388,23 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         self,
         reference_image_meta: dict,
         reference_session_reference_stack_mlapdv: np.ndarray,
-    ):
-        """Update subject JSON with atlas-aligned craniotomy coordinates."""
+    ) -> np.ndarray:
+        """Update subject JSON with atlas-aligned craniotomy coordinates.
+
+        Parameters
+        ----------
+        reference_image_meta : dict
+            Contents of this session's `referenceImage.meta.json`; updated in place with the
+            resolved ML/AP center and written back to disk.
+        reference_session_reference_stack_mlapdv : numpy.ndarray
+            Array with shape (h, w, 3) holding the (ml, ap, dv) coordinates in μm of each
+            pixel of the reference session's reference image.
+
+        Returns
+        -------
+        numpy.ndarray
+            The resolved (ml, ap, dv) coordinates, in mm, of the craniotomy center.
+        """
         assert not self.one.offline
         # Get the pixel coordinates of the craniotomy center in the reference image
         px_per_um = get_px_per_um(reference_image_meta)
@@ -1427,9 +1464,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         )
         return craniotomy_resolved
 
-    def update_surgery_json(self, meta, normal_vector):
-        """
-        Update surgery JSON with surface normal vector.
+    def update_surgery_json(self, meta: dict, normal_vector: np.ndarray) -> dict | None:
+        """Update surgery JSON with surface normal vector.
 
         Adds the key 'surface_normal_unit_vector' to the most recent surgery JSON, containing the
         provided three element vector.  The recorded craniotomy center must match the coordinates
@@ -1474,9 +1510,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
     def register_fov(
         self, meta: dict, provenance: Provenance, check_integrity: bool = True
-    ) -> tuple[list, list]:
-        """
-        Create FOV on Alyx.
+    ) -> list[dict]:
+        """Create FOV on Alyx.
 
         Assumes field of view recorded perpendicular to objective.
         Assumes field of view is plane (negligible volume).
@@ -1499,7 +1534,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         Returns
         -------
         list of dict
-            A list registered of field of view entries from Alyx.
+            A list of registered field of view entries from Alyx.
 
         TODO Determine dual plane ID for JSON field
         """
