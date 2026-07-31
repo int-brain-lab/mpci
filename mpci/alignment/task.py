@@ -111,9 +111,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
     def __init__(
         self,
         *args,
-        reference_session_path: str | Path,  # TODO needs to be optional
+        reference_session_path: Path | None = None,
         one: ONE | None = None,
-        # raw_imaging_collection: str | None = None,
         reference_collection: str | None,
         reference_session_reference_collection: str | None = None,
         interpolation_sigma: float = 25,
@@ -164,12 +163,14 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         self.reference_collection = reference_collection or self.infer_reference_collection(
             self.session_path
         )
-        self.reference_session_path = ALFPath(reference_session_path)
-        self.reference_session_eid = self.one.path2eid(self.reference_session_path)
-        self.reference_session_reference_collection = (
-            reference_session_reference_collection
-            or self.infer_reference_collection(self.reference_session_path)
-        )
+        self.reference_session_path = reference_session_path
+        if reference_session_path is not None:
+            self.reference_session_path = ALFPath(reference_session_path)
+            self.reference_session_eid = self.one.path2eid(self.reference_session_path)
+            self.reference_session_reference_collection = (
+                reference_session_reference_collection
+                or self.infer_reference_collection(self.reference_session_path)
+            )
 
         # keep references to links for unlinking during tearDown
         self.links: list[Path] = []
@@ -504,7 +505,13 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         numpy.ndarray
             Image stack with shape (Z, Y, X).
         """
-        return tifffile.imread(self.get_reference_session_reference_stack_path())
+        if self.reference_session_path is not None:
+            return tifffile.imread(self.get_reference_session_reference_stack_path())
+        else:
+            raise ValueError(
+                "cannot load the reference session's reference stack: "
+                "no reference session path was given"
+            )
 
     def _symlink_reference_session_reference_stack(self) -> Path:
         """Symlink the reference session's reference stack into the popeye quarantine folder.
