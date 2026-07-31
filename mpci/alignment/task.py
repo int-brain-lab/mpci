@@ -306,9 +306,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             # Add reference meta data to meta_files list for registration
             meta_files.append(
                 next(
-                    self.session_path.glob(
-                        f"{self.raw_imaging_collection}/reference/referenceImage.meta.json"
-                    )
+                    self.session_path.glob(f"{self.reference_collection}/referenceImage.meta.json")
                 )
             )
         # this encapsulates the entire alignment pipeline
@@ -629,8 +627,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             / lab
             / "Subjects"
             / path_short
-            / self.reference_session_raw_imaging_collection
-            / "reference"
+            / self.reference_session_reference_collection
             / "referenceImage.stack.tif"
         )
 
@@ -639,15 +636,10 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             / lab
             / "Subjects"
             / path_short
-            / self.reference_session_raw_imaging_collection
-            / "reference"
+            / self.reference_session_reference_collection
         )
 
-        reference_stack_path = list(_session_folder.glob("*referenceImage.stack.*.tif"))
-        assert len(reference_stack_path) == 1, (
-            "none or multiple referenceImage stacks found during symlinking"
-        )
-
+        reference_stack_path = find_file(_session_folder, "*referenceImage.stack.*.tif")
         if symlinked_reference_stack.exists():
             symlinked_reference_stack.unlink()
         symlinked_reference_stack.parent.mkdir(parents=True, exist_ok=True)
@@ -714,16 +706,10 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         ValueError
             If more than one points file exists.
         """
-        ref_points_path = list(
-            (self.session_path / self.raw_imaging_collection / "reference").glob(
-                "referenceImage.points.json"
-            )
+        ref_points_path = find_file(
+            self.session_path / self.reference_collection, "referenceImage.points.json"
         )
-        if len(ref_points_path) == 0:
-            raise FileNotFoundError
-        if len(ref_points_path) > 1:
-            raise ValueError("multiple reference point files found")
-        return json.loads(Path(ref_points_path[0]).read_text(encoding="utf-8"))["points"]
+        return json.loads(Path(ref_points_path).read_text(encoding="utf-8"))["points"]
 
     def load_brain_surface_points(
         self,
@@ -817,7 +803,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         AssertionError
             If the file could neither be transferred via Globus nor downloaded via HTTP.
         """
-        reference_collection = self.reference_session_raw_imaging_collection + "/reference"
+        reference_collection = self.reference_session_reference_collection
 
         if self.location == "popeye":
             lab = self.one.get_details(self.reference_session_path)["lab"]
@@ -846,16 +832,11 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
         _logger.info(
             "Looking for reference MLAPDV in %s",
-            self.reference_session_path.joinpath(
-                self.reference_session_raw_imaging_collection, "reference"
-            ),
+            self.reference_session_path.joinpath(reference_collection),
         )
         # NB: The local reference folder is expected to exist after handler.setUp()
         local_file = (
-            self.reference_session_path
-            / self.reference_session_raw_imaging_collection
-            / "reference"
-            / "referenceImage.mlapdv.npy"
+            self.reference_session_path / reference_collection / "referenceImage.mlapdv.npy"
         )
 
         if not local_file.exists():
@@ -1512,8 +1493,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
         # Update the subject JSON if processing the reference session
         # i.e. the session with the histology-aligned reference stack
-        if self.reference_session and (
-            self.reference_session.session_parts == self.session_path.session_parts
+        if self.reference_session_path and (
+            self.self.reference_session_path.session_parts == self.session_path.session_parts
         ):
             _logger.info("Updating craniotomy center in subject JSON for %s", subject)
             self.one.alyx.json_field_update("subjects", subject, data=data)
