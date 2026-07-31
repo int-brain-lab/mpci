@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import enum
-from itertools import product
+from itertools import chain, product
 from pathlib import Path
 from typing import Literal
 from uuid import UUID, uuid4
@@ -16,6 +16,7 @@ from ibllib.oneibl.data_handlers import (
     ExpectedDataset,
     ServerGlobusDataHandler,
     PopeyeDataHandler,
+    dataset_from_name,
 )
 
 from scipy.interpolate import RegularGridInterpolator
@@ -110,13 +111,14 @@ class MesoscopeFOVAlignment(MesoscopeTask):
     def __init__(
         self,
         *args,
-        reference_session_path: str | Path,
+        reference_session_path: str | Path,  # TODO needs to be optional
         one: ONE | None = None,
-        raw_imaging_collection: str | None = None,
-        reference_session_raw_imaging_collection: str | None = None,
-        interpolation_sigma=25,
-        histology_atlas_resolution=25,  # atlas resolution for histology (depends on steven)
-        projection_atlas_resolution=25,  # atlas resolution for the projection
+        # raw_imaging_collection: str | None = None,
+        reference_collection: str | None,
+        reference_session_reference_collection: str | None = None,
+        interpolation_sigma: float = 25,
+        histology_atlas_resolution: Literal[10, 25, 50] = 25,
+        projection_atlas_resolution: Literal[10, 25, 50] = 25,
         dry: bool = True,  # for now safety first. FIXME change this eventually
         debug: bool = True,
         **kwargs,
@@ -159,14 +161,14 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             raise ValueError("ReprojectionTask requires an online ONE instance")
 
         self.eid = self.one.path2eid(self.session_path)
-        self.raw_imaging_collection = raw_imaging_collection or self.infer_raw_imaging_collection(
+        self.reference_collection = reference_collection or self.infer_reference_collection(
             self.session_path
         )
         self.reference_session_path = ALFPath(reference_session_path)
         self.reference_session_eid = self.one.path2eid(self.reference_session_path)
-        self.reference_session_raw_imaging_collection = (
-            reference_session_raw_imaging_collection
-            or self.infer_raw_imaging_collection(self.reference_session_path)
+        self.reference_session_reference_collection = (
+            reference_session_reference_collection
+            or self.infer_reference_collection(self.reference_session_path)
         )
 
         # keep references to links for unlinking during tearDown
@@ -189,7 +191,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         I = ExpectedDataset.input  # noqa
         signature = {
             "input_files": [
-                I("_ibl_rawImagingData.meta.json", self.raw_imaging_collection, True),
+                I("_ibl_rawImagingData.meta.json", self.device_collection, True),
                 I(
                     "referenceImage.stack.tif", "raw_imaging_data_??/reference", True, unique=True
                 ),  # FIXME this will fail at sessions with multiple reference stacks
@@ -199,61 +201,17 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                     "raw_imaging_data_??/reference",
                     False,
                     unique=True,
-                ),  # TODO deal with the updating of the raw_imaging_metadata
+                ),  # TODO deal with the updating of the raw_imaging_metadata with the reference points
             ],
             "output_files": [
                 ("mpciMeanImage.brainLocationIds.npy", "alf/FOV_*", True),
                 ("mpciMeanImage.mlapdv.npy", "alf/FOV_*", True),
-                ("_ibl_rawImagingData.meta.json", self.raw_imaging_collection, True),
+                ("_ibl_rawImagingData.meta.json", self.device_collection, True),
                 ("referenceImage.meta.json", "raw_imaging_data_??/reference", True),
             ],
         }
         # TODO This should be updated to handle changes in provenance suffix and device collection
         return signature
-
-    # @property
-    # def signature(self):
-    #     I = ExpectedDataset.input  # noqa
-    #     O = ExpectedDataset.output  # noqa
-    #     signature = {
-    #         "input_files": [
-    #             I("_ibl_rawImagingData.meta.json", self.raw_imaging_collection, True),
-    #             I("mpciROIs.stackPos.npy", "alf/FOV*", True),
-    #             # New additions  # FIXME should be self.raw_imaging_collection (may require patching exp desc files)
-    #             I(
-    #                 "referenceImage.stack.tif",
-    #                 f"{self.raw_imaging_collection}/reference",
-    #                 True,
-    #                 unique=True,
-    #             ),
-    #             I(
-    #                 "referenceImage.meta.json",
-    #                 f"{self.raw_imaging_collection}/reference",
-    #                 True,
-    #                 unique=True,
-    #             ),
-    #             I(
-    #                 "referenceImage.points.json",
-    #                 f"{self.raw_imaging_collection}/reference",
-    #                 False,
-    #                 unique=True,
-    #             ),
-    #         ],
-    #         "output_files": [
-    #             O("mpciMeanImage.brainLocationIds.npy", "alf/FOV_*", True),
-    #             ("mpciMeanImage.mlapdv.npy", "alf/FOV_*", True),
-    #             ("mpciROIs.mlapdv.npy", "alf/FOV_*", True),
-    #             ("mpciROIs.brainLocationIds.npy", "alf/FOV_*", True),
-    #             ("_ibl_rawImagingData.meta.json", self.raw_imaging_collection, True),
-    #             (
-    #                 "referenceImage.meta.json",
-    #                 f"{self.raw_imaging_collection}/reference",
-    #                 True,
-    #             ),
-    #         ],
-    #     }
-    #     # TODO This should be updated to handle changes in provenance suffix and device collection
-    #     return signature
 
     #
     # ########  ##     ## ##    ##
@@ -277,7 +235,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         # Load main meta
         _, meta_files, _ = self.input_files[0].find_files(self.session_path)
         meta = patch_imaging_meta(alfio.load_file_content(meta_files[0]) or {})
-        nFOV = len(meta.get("FOV", []))
+
         if self.provenance is Provenance.HISTOLOGY:
             _logger.info("Extracting histology MLAPDV datasets")
             # Update the craniotomy center
@@ -287,6 +245,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                     reference_image_meta, reference_session_reference_image_mlapdv
                 )
             meta["centerMM"] = reference_image_meta["centerMM"]
+            # write the file
             if not self.dry:
                 with open(meta_files[0], "w") as fp:
                     json.dump(meta, fp)
@@ -306,6 +265,9 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             debug=self.debug,
         )
 
+        # this loads the metadata from the first imaging bout, but verifies
+        # that all the scanimage related content that is needed here is
+        # consistent across the files
         raw_imaging_meta = self.load_raw_imaging_metadata()
         fov_map = ibl.get_fov_map(raw_imaging_meta)
 
@@ -386,22 +348,6 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                     )
                     np.save(mean_image_files[-1], arr)
 
-        # TODO this beomes a seperate task
-        # Extract ROI MLAPDV coordinates and brain location IDs
-        # roi_mlapdv, roi_brain_ids = self.roi_mlapdv(nFOV, suffix=suffix)
-
-        # # Write MLAPDV + brain location ID of ROIs to disk
-        # roi_files = []
-        # assert set(roi_mlapdv.keys()) == set(roi_brain_ids.keys()) and len(roi_mlapdv) == nFOV
-        # for i in range(nFOV):
-        #     alf_path = self.session_path.joinpath("alf", f"FOV_{i:02}")
-        #     for attr, arr, sfx in (
-        #         ("mlapdv", roi_mlapdv[i], suffix),
-        #         ("brainLocationIds", roi_brain_ids[i], ("ccf", "2017", suffix)),
-        #     ):
-        #         roi_files.append(alf_path / to_alf("mpciROIs", attr, "npy", timescale=sfx))
-        #         np.save(roi_files[-1], arr)
-
         # Register FOVs in Alyx
         if not self.dry:
             self.register_fov(meta, self.provenance)
@@ -419,20 +365,9 @@ class MesoscopeFOVAlignment(MesoscopeTask):
     #
 
     @staticmethod
-    def infer_raw_imaging_collection(session_path: str | Path) -> str:
-        """Find the raw imaging collection that contains a reference stack.
+    def infer_reference_collection(session_path: str | Path) -> str:
+        # TODO write new docstring
 
-        Parameters
-        ----------
-        session_path : str or pathlib.Path
-            Path of the session to search.
-
-        Returns
-        -------
-        str
-            Name of the raw imaging collection, e.g. 'raw_imaging_data_00'. If several
-            collections hold a reference folder, the last one is returned.
-        """
         session_path = Path(session_path)
         assert session_path.exists()
         collections = [
@@ -445,20 +380,64 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                 f"number of collections with reference stacks is: {len(collections)} - taking the last one"
             )
 
-        return collections[-1].parts[-1]
+        return collections[-1].parts[-1] + "/reference"
+
+    def get_raw_imaging_metadata_paths(self) -> list[Path]:
+        """Find this session's raw imaging metadata files, one per imaging bout.
+
+        Requires `setUp` to have run, as `MesoscopeTask.get_signatures` is what expands the
+        `device_collection` glob in the signature into one entry per imaging bout.
+
+        Imaging bouts without a metadata file are skipped; many sessions have such bouts.
+
+        Returns
+        -------
+        list of pathlib.Path
+            Paths to the `_ibl_rawImagingData.meta.json` files that exist, sorted by imaging
+            bout collection. Empty if no bout has one.
+        """
+        datasets = dataset_from_name("_ibl_rawImagingData.meta.json", self.input_files)
+        found, paths, missing = zip(*(d.find_files(self.session_path) for d in datasets))
+        if not all(found):
+            _logger.debug("no raw imaging metadata for %s", set(filter(None, missing)))
+        return sorted(chain.from_iterable(paths))
 
     def load_raw_imaging_metadata(self) -> dict:
         """Load the raw imaging metadata of this session.
 
+        A session may hold several imaging bouts, each with its own metadata file. The fields
+        this task depends on must agree across bouts, so any one of them can be returned.
+
         Returns
         -------
         dict
-            Contents of `_ibl_rawImagingData.meta.json`.
+            Contents of `_ibl_rawImagingData.meta.json` of the first imaging bout.
+
+        Raises
+        ------
+        FileNotFoundError
+            If no imaging bout has a metadata file.
+        ValueError
+            If a field that must be consistent differs between imaging bouts.
         """
-        metadata_filepath = (
-            self.session_path / self.raw_imaging_collection / "_ibl_rawImagingData.meta.json"
-        )
-        return json.loads(Path(metadata_filepath).read_text(encoding="utf-8"))
+        metadata_paths = self.get_raw_imaging_metadata_paths()
+        metadata_all = [json.loads(p.read_text(encoding="utf-8")) for p in metadata_paths]
+
+        # the pipeline assumes that the scanimage related information regarding
+        # FOV location and size is consistent across all imaging bouts
+        # assert this here
+        for metadata in metadata_all:
+            # all have the same roi UUIDs
+            fov_uuids = scanimage._get_fov_uuids(metadata["rawScanImageMeta"])
+            assert fov_uuids == scanimage._get_fov_uuids(metadata_all[0]["rawScanImageMeta"])
+            for fov_uuid in fov_uuids:
+                fov_meta = scanimage.get_fov_meta(metadata["rawScanImageMeta"], fov_uuid)
+                _fov_meta = scanimage.get_fov_meta(metadata_all[0]["rawScanImageMeta"], fov_uuid)
+                keys = ["sizeXY", "centerXY"]
+                for key in keys:
+                    assert fov_meta["scanfields"][key] == _fov_meta["scanfields"][key]
+
+        return metadata_all[0]
 
     def load_reference_stack_metadata(self) -> dict:
         """Load the metadata of this session's reference stack.
@@ -473,11 +452,10 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         AssertionError
             If not exactly one metadata file is found.
         """
-        reference_collection = self.session_path / self.raw_imaging_collection / "reference"
-        filepath = list(reference_collection.glob("*referenceImage.meta*"))
-
-        assert len(filepath) == 1
-        return json.loads(Path(filepath[0]).read_text(encoding="utf-8"))
+        meta_filepath = unique_glob(
+            self.session_path / self.reference_collection, "*referenceImage.meta*"
+        )
+        return json.loads(meta_filepath.read_text(encoding="utf-8"))
 
     def get_reference_stack_path(self) -> Path:
         """Return the path to the reference stack of this session.
@@ -487,8 +465,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         pathlib.Path
             Path of the `referenceImage.stack` tif.
         """
-        # TODO check whether this can be folded into the method below
-        return self._get_ref_stack_path(self.session_path, self.raw_imaging_collection)
+        return unique_glob(self.session_path / self.reference_collection, "*referenceImage.stack*")
 
     def get_reference_session_reference_stack_path(self) -> Path:
         """Return the path to the reference stack of the reference session.
@@ -504,38 +481,10 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         if self.location == "popeye":
             return self._symlink_reference_session_reference_stack()
         else:
-            return self._get_ref_stack_path(
-                self.reference_session_path,
-                self.reference_session_raw_imaging_collection,
+            return unique_glob(
+                self.reference_session_path / self.reference_session_reference_collection,
+                "*referenceImage.stack*",
             )
-
-    def _get_ref_stack_path(self, session_path: Path, raw_imaging_collection: str) -> Path:
-        """Find the reference stack file within a session's raw imaging collection.
-
-        Parameters
-        ----------
-        session_path : pathlib.Path
-            Path of the session to search.
-        raw_imaging_collection : str
-            Name of the raw imaging collection holding the reference folder.
-
-        Returns
-        -------
-        pathlib.Path
-            Path of the `referenceImage.stack` tif.
-
-        Raises
-        ------
-        AssertionError
-            If not exactly one reference stack is found.
-        """
-        path = session_path / raw_imaging_collection / "reference"
-        filepath = list(path.glob("*referenceImage.stack*"))
-
-        assert len(filepath) == 1, (
-            f"number of reference stacks is: {len(filepath)} - and has to be exactly 1"
-        )
-        return filepath[0]
 
     def load_reference_stack(self) -> np.ndarray:
         """Load the reference stack of this session.
