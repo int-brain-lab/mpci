@@ -2,44 +2,46 @@ from __future__ import annotations
 
 import json
 import enum
+import logging
 from itertools import chain, product
 from pathlib import Path
 from typing import Literal
-from uuid import UUID, uuid4
 from collections import Counter
 from datetime import datetime
+from uuid import UUID, uuid4
 
 import numpy as np
+from scipy.interpolate import RegularGridInterpolator
+from scipy.ndimage import gaussian_filter
+
 import tifffile
-from iblatlas.atlas import MRITorontoAtlas
+from skimage.transform import ProjectiveTransform
+
+from one.api import ONE
+import one.alf.io as alfio
+from one.alf.spec import to_alf
+from one.alf.path import ALFPath
+
 from ibllib.oneibl.data_handlers import (
     ExpectedDataset,
     ServerGlobusDataHandler,
     PopeyeDataHandler,
     dataset_from_name,
 )
-
-from scipy.interpolate import RegularGridInterpolator
-from scipy.ndimage import gaussian_filter
-
-
 from ibllib.oneibl.patcher import S3Patcher
-import one.alf.io as alfio
-from one.alf.spec import to_alf
+
 from mpci.alyx.tasks import MesoscopeTask
-from ibllib.pipes.base_tasks import DynamicTask
 from mpci.scanimage.io import (
     patch_imaging_meta,
     get_px_per_um,
     get_window_center,
 )
 
-from one.alf.path import ALFPath
-from one.api import ONE
-from skimage.transform import ProjectiveTransform
+
+from iblatlas.atlas import MRITorontoAtlas
+from plane2brain.atlas import ProjectionAtlas
 
 from plane2brain import ibl, projections, scanimage
-from plane2brain.atlas import ProjectionAtlas
 from plane2brain.coordinate_systems import (
     create_coordinate_system_for_image,
     setup_coordinate_systems_3d,
@@ -59,7 +61,6 @@ IBL_MESOSCOPE_DEFINITIONS = {
 # ScanImage metadata stores dimensions in XY order by default, where X is the
 # resonant (fast-scan) axis; in our reference image that axis is the second one.
 
-import logging
 
 _logger = logging.getLogger(__name__)
 
@@ -81,7 +82,29 @@ class PopeyeS3DataHandler(PopeyeDataHandler):
         )
 
 
-def unique_glob(path: Path, glob_pattern: str):
+def find_file(path: Path, glob_pattern: str) -> Path:
+    # little helper that should probably live elsewhere
+    """Find the single file in a folder that matches a glob pattern.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Folder to search, non-recursively.
+    glob_pattern : str
+        Glob pattern the file name must match.
+
+    Returns
+    -------
+    pathlib.Path
+        Path of the one matching file.
+
+    Raises
+    ------
+    FileNotFoundError
+        If nothing matches.
+    ValueError
+        If more than one file matches.
+    """
     result = list(path.glob(glob_pattern))
     if len(result) == 0:
         raise FileNotFoundError(f"no file that matches {glob_pattern} found at {path}")
@@ -89,6 +112,17 @@ def unique_glob(path: Path, glob_pattern: str):
         raise ValueError(f"multiple matches found for {glob_pattern} found at {path}:\n{result}")
     else:
         return result[0]
+
+
+#
+# ########  #######  ##     ##
+# ##       ##     ## ##     ##
+# ##       ##     ## ##     ##
+# ######   ##     ## ##     ##
+# ##       ##     ##  ##   ##
+# ##       ##     ##   ## ##
+# ##        #######     ###
+#
 
 
 class MesoscopeFOVAlignment(MesoscopeTask):
@@ -113,7 +147,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         *args,
         reference_session_path: Path | None = None,
         one: ONE | None = None,
-        reference_collection: str | None,
+        reference_collection: str | None = None,
         reference_session_reference_collection: str | None = None,
         interpolation_sigma: float = 25,
         histology_atlas_resolution: Literal[10, 25, 50] = 25,
@@ -128,20 +162,23 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         ----------
         *args : tuple
             Positional arguments forwarded to `MesoscopeTask`; the first is the session path.
-        reference_session_path : str or pathlib.Path
-            Session path of the histology-aligned reference session of the same subject.
+        reference_session_path : pathlib.Path, optional
+            Session path of the histology-aligned reference session of the same subject. If
+            not given, neither the lateral shift correction nor the histology lookup can run.
         one : one.api.ONE, optional
             An online ONE instance. A new one is created if not given.
-        raw_imaging_collection : str, optional
-            Raw imaging collection of this session. Inferred if not given.
-        reference_session_raw_imaging_collection : str, optional
-            Raw imaging collection of the reference session. Inferred if not given.
-        interpolation_sigma : int, optional
+        reference_collection : str, optional
+            Collection of this session holding the reference stack, including the `reference`
+            folder, e.g. 'raw_imaging_data_00/reference'. Inferred if not given.
+        reference_session_reference_collection : str, optional
+            The same, for the reference session. Inferred if not given, and only used when
+            `reference_session_path` is given.
+        interpolation_sigma : float, optional
             Standard deviation, in pixels, of the Gaussian filter applied to the reference
             session's histology grid before interpolation. Default is 25.
-        histology_atlas_resolution : int, optional
+        histology_atlas_resolution : {10, 25, 50}, optional
             Atlas resolution, in μm, used for histology-based MLAPDV lookups. Default is 25.
-        projection_atlas_resolution : int, optional
+        projection_atlas_resolution : {10, 25, 50}, optional
             Atlas resolution, in μm, used for the surface projection atlas. Default is 25.
         dry : bool, optional
             If True, skip all disk writes and Alyx registration. Default is True.
@@ -149,6 +186,11 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             If True, downsample the pixel grid for faster debugging runs. Default is True.
         **kwargs : dict
             Keyword arguments forwarded to `MesoscopeTask`.
+
+        Raises
+        ------
+        ValueError
+            If the resolved ONE instance is offline.
         """
         # on popeye the outputs are patched to S3, so the handler has to be picked before the
         # parent constructor resolves one from the location
@@ -188,7 +230,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         super().tearDown()
 
     @property
-    def signature(self):
+    def signature(self) -> dict:
         I = ExpectedDataset.input  # noqa
         signature = {
             "input_files": [
@@ -224,7 +266,18 @@ class MesoscopeFOVAlignment(MesoscopeTask):
     # ##     ##  #######  ##    ##
     #
 
-    def _run(self):
+    def _run(self) -> list[Path]:
+        """Align this session's FOVs to the atlas and write the mean-image datasets.
+
+        The provenance is set from what could be loaded: HISTOLOGY if the reference session's
+        histology volume is available, ESTIMATE otherwise. It determines the suffix of the
+        output datasets, and only a HISTOLOGY run updates the craniotomy center.
+
+        Returns
+        -------
+        list of pathlib.Path
+            The raw imaging metadata files and the per-FOV mean-image datasets, to register.
+        """
         # Provenance is determined by the ability to load the histology volume
         try:
             reference_session_reference_image_mlapdv = self.load_histology()
@@ -367,8 +420,27 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
     @staticmethod
     def infer_reference_collection(session_path: str | Path) -> str:
-        # TODO write new docstring
+        """Find the collection that holds a session's reference stack.
 
+        Parameters
+        ----------
+        session_path : str or pathlib.Path
+            Path of the session to search.
+
+        Returns
+        -------
+        str
+            Collection holding the reference stack, including the `reference` folder, e.g.
+            'raw_imaging_data_00/reference'. If several imaging bouts hold a reference folder,
+            the last one is returned and a warning is logged.
+
+        Raises
+        ------
+        AssertionError
+            If the session path does not exist.
+        IndexError
+            If no imaging bout holds a reference folder.
+        """
         session_path = Path(session_path)
         assert session_path.exists()
         collections = [
@@ -418,10 +490,12 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         ------
         FileNotFoundError
             If no imaging bout has a metadata file.
-        ValueError
-            If a field that must be consistent differs between imaging bouts.
+        AssertionError
+            If the FOV UUIDs, or a FOV's size or center, differ between imaging bouts.
         """
         metadata_paths = self.get_raw_imaging_metadata_paths()
+        if not metadata_paths:
+            raise FileNotFoundError(f"no raw imaging metadata found for {self.session_path}")
         metadata_all = [json.loads(p.read_text(encoding="utf-8")) for p in metadata_paths]
 
         # the pipeline assumes that the scanimage related information regarding
@@ -450,10 +524,12 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
         Raises
         ------
-        AssertionError
-            If not exactly one metadata file is found.
+        FileNotFoundError
+            If no metadata file is found.
+        ValueError
+            If more than one metadata file is found.
         """
-        meta_filepath = unique_glob(
+        meta_filepath = find_file(
             self.session_path / self.reference_collection, "*referenceImage.meta*"
         )
         return json.loads(meta_filepath.read_text(encoding="utf-8"))
@@ -465,8 +541,15 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         -------
         pathlib.Path
             Path of the `referenceImage.stack` tif.
+
+        Raises
+        ------
+        FileNotFoundError
+            If no reference stack is found.
+        ValueError
+            If more than one reference stack is found.
         """
-        return unique_glob(self.session_path / self.reference_collection, "*referenceImage.stack*")
+        return find_file(self.session_path / self.reference_collection, "*referenceImage.stack*")
 
     def get_reference_session_reference_stack_path(self) -> Path:
         """Return the path to the reference stack of the reference session.
@@ -478,11 +561,18 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         -------
         pathlib.Path
             Path of the `referenceImage.stack` tif, or of its symlink when on popeye.
+
+        Raises
+        ------
+        FileNotFoundError
+            If no reference stack is found.
+        ValueError
+            If more than one reference stack is found.
         """
         if self.location == "popeye":
             return self._symlink_reference_session_reference_stack()
         else:
-            return unique_glob(
+            return find_file(
                 self.reference_session_path / self.reference_session_reference_collection,
                 "*referenceImage.stack*",
             )
@@ -504,6 +594,11 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         -------
         numpy.ndarray
             Image stack with shape (Z, Y, X).
+
+        Raises
+        ------
+        ValueError
+            If the task was constructed without a reference session path.
         """
         if self.reference_session_path is not None:
             return tifffile.imread(self.get_reference_session_reference_stack_path())
@@ -570,6 +665,9 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         numpy.ndarray
             Array with shape (h, w, 3) holding the (ml, ap, dv) coordinates in μm of each
             pixel of the reference session's reference image.
+        numpy.ndarray
+            Array with shape (h, w, 3) holding the corresponding Allen atlas volume indices,
+            with the AP axis flipped to match the atlas volume orientation.
         """
         atlas = MRITorontoAtlas(res_um=self.histology_atlas_resolution)
         local_histo_path = self._get_atlas_registered_reference_mlap()
@@ -591,7 +689,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         Returns
         -------
         dict
-            Mapping with a 'points' key holding the brain surface points.
+            The brain surface points, i.e. the 'points' entry of the metadata.
 
         Raises
         ------
@@ -607,7 +705,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         Returns
         -------
         dict
-            Contents of `referenceImage.points.json`.
+            The brain surface points, i.e. the 'points' entry of `referenceImage.points.json`.
 
         Raises
         ------
@@ -692,7 +790,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                 )
             return brain_surface_points_file
 
-    def _get_atlas_registered_reference_mlap(self, clobber=False):
+    def _get_atlas_registered_reference_mlap(self, clobber: bool = False) -> Path:
         """Download the aligned reference stack Allen atlas indices.
 
         This is the file created by the histology pipeline, one per subject. It contains a
@@ -711,7 +809,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
         Returns
         -------
-        one.alf.path.ALFPath
+        pathlib.Path
             The local filepath of the aligned reference stack file described above.
 
         Raises
@@ -841,7 +939,9 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         Each loader raises if its input is missing, so a silent return means the session is
         ready to be processed.
 
-        just for debugging purposes, to be removed
+        Notes
+        -----
+        For debugging purposes only, to be removed.
         """
         # raw imaging metadata can be loaded
         self.load_raw_imaging_metadata()
@@ -871,7 +971,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
     @staticmethod
     def interpolate_histology(
         histo_mlapdv: np.ndarray,
-        sigma: int | None = None,
+        sigma: float | None = None,
     ) -> RegularGridInterpolator:
         """Build a linear interpolator for the ML/AP histology coordinates over pixel space.
 
@@ -883,7 +983,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         histo_mlapdv : numpy.ndarray
             Array with shape (h, w, 3) holding the (ml, ap, dv) coordinates in μm of each
             pixel of the reference session's reference image, as returned by `load_histology`.
-        sigma : int, optional
+        sigma : float, optional
             Standard deviation, in pixels, of the Gaussian filter applied to the ML/AP grid
             before building the interpolator. If None, no smoothing is applied.
 
@@ -1071,10 +1171,14 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         debug : bool
             If True, downsample the pixel grid to speed up the run for debugging.
 
-        Notes
-        -----
-        This method is still under development: it populates `coords[uuid]["mlapdv"]` per
-        FOV but does not yet return or persist the result.
+        Returns
+        -------
+        dict of str to dict of str to numpy.ndarray
+            Per-FOV-UUID coordinate dictionaries. Every FOV holds 'pixel' and 'um_global';
+            'dv_below_surface' is added when brain surface points are available,
+            'um_corrected' and 'dv_below_surface_corrected' when tilt correction runs,
+            'mlapdv_on_surface' always, and 'mlapdv' only when depth below the surface could
+            be resolved, i.e. when brain surface points are available.
         """
         # load the data
         raw_imaging_meta = self.load_raw_imaging_metadata()
@@ -1292,7 +1396,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         Parameters
         ----------
         fovs_coordinates : dict of str to dict of str to numpy.ndarray
-            Per-FOV-UUID coordinate dictionaries, as populated by `pipeline`; each must
+            Per-FOV-UUID coordinate dictionaries, as returned by `align_FOVs`; each must
             contain an 'mlapdv' array.
 
         Notes
@@ -1598,8 +1702,23 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         return alyx_fovs
 
 
+#
+# ########   #######  ####
+# ##     ## ##     ##  ##
+# ##     ## ##     ##  ##
+# ########  ##     ##  ##
+# ##   ##   ##     ##  ##
+# ##    ##  ##     ##  ##
+# ##     ##  #######  ####
+#
+
+
 class ROICoordinatesExtraction(MesoscopeTask):
-    """ """
+    """Assign MLAPDV brain coordinates and brain region labels to a session's ROIs.
+
+    Indexes the per-FOV mean-image coordinate maps written by `MesoscopeFOVAlignment` at the
+    pixel positions of the suite2p ROI centroids, so this task requires that one to have run.
+    """
 
     priority = 40
     job_size = "small"
@@ -1611,13 +1730,27 @@ class ROICoordinatesExtraction(MesoscopeTask):
         dry: bool = True,
         **kwargs,
     ):
+        """Initialize the task with the provenance of the coordinates to index.
+
+        Parameters
+        ----------
+        *args : tuple
+            Positional arguments forwarded to `MesoscopeTask`; the first is the session path.
+        provenance : Provenance
+            Provenance of the mean-image datasets to read, which sets the dataset suffix of
+            both the inputs and the outputs. Default is `Provenance.ESTIMATE`.
+        dry : bool
+            If True, skip all disk writes. Default is True.
+        **kwargs : dict
+            Keyword arguments forwarded to `MesoscopeTask`.
+        """
         super().__init__(*args, **kwargs)
         # provenance defaults to estimate
         self.provenance = provenance
         self.dry = dry
 
     @property
-    def signature(self):
+    def signature(self) -> dict:
         I = ExpectedDataset.input  # noqa
         signature = {
             "input_files": [
@@ -1633,7 +1766,15 @@ class ROICoordinatesExtraction(MesoscopeTask):
         }
         return signature
 
-    def _run(self):
+    def _run(self) -> list[Path]:
+        """Extract the MLAPDV coordinates and brain region labels of every ROI.
+
+        Returns
+        -------
+        list of pathlib.Path
+            The per-FOV ROI coordinate and brain location datasets, to register. The paths are
+            returned even when `dry` is set, in which case nothing was written.
+        """
         # empty suffix if provenance is histology
         suffix = None if self.provenance is Provenance.HISTOLOGY else self.provenance.name.lower()
         sfx = f"_{suffix}" if suffix else ""
@@ -1646,15 +1787,15 @@ class ROICoordinatesExtraction(MesoscopeTask):
             fov_path = self.session_path / "alf" / fov_name
 
             # Load neuron centroids in pixel space
-            stack_pos_file = unique_glob(fov_path, f"mpciROIs.stackPos{sfx}*")
+            stack_pos_file = find_file(fov_path, f"mpciROIs.stackPos{sfx}*")
             stack_pos = alfio.load_file_content(stack_pos_file)
 
             # Load MeanImage mlapdv
-            mlapdv_image_file = unique_glob(fov_path, f"mpciMeanImage.mlapdv{sfx}.npy")
+            mlapdv_image_file = find_file(fov_path, f"mpciMeanImage.mlapdv{sfx}.npy")
             mlapdv_image = alfio.load_file_content(mlapdv_image_file)
 
             # load brain location ids
-            brain_location_ids_file = unique_glob(
+            brain_location_ids_file = find_file(
                 fov_path, f"mpciMeanImage.brainLocationIds_ccf_2017{sfx}.npy"
             )
 
