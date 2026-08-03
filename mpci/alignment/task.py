@@ -381,23 +381,23 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             }
 
         # Save the mean image datasets
-        suffix = None if self.provenance is Provenance.HISTOLOGY else self.provenance.name.lower()
+        suffix = "" if self.provenance is Provenance.HISTOLOGY else self.provenance.name.lower()
         mean_image_files = []
         for fov_name, fov_uuid in fov_map.items():
             alf_path = self.session_path.joinpath("alf", fov_name)
-            if not self.dry:
-                alf_path.mkdir(parents=True, exist_ok=True)
-                for attr, arr, sfx in (
-                    ("mlapdv", mean_image_mlapdv[fov_uuid], suffix),
-                    (
-                        "brainLocationIds",
-                        mean_images_ids[fov_uuid],
-                        ("ccf", "2017", suffix),
-                    ),
-                ):
-                    mean_image_files.append(
-                        alf_path / to_alf("mpciMeanImage", attr, "npy", timescale=sfx)
-                    )
+            alf_path.mkdir(parents=True, exist_ok=True)
+            for attr, arr, sfx in (
+                ("mlapdv", mean_images_mlapdv[fov_uuid], suffix),
+                (
+                    "brainLocationIds",
+                    mean_images_ids[fov_uuid],
+                    ("ccf", "2017", suffix),
+                ),
+            ):
+                mean_image_files.append(
+                    alf_path / to_alf("mpciMeanImage", attr, "npy", timescale=sfx)
+                )
+                if not self.dry:
                     np.save(mean_image_files[-1], arr)
 
         # Register FOVs in Alyx
