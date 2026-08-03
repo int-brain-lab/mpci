@@ -914,30 +914,66 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         ), "reference session does not match to this session: wrong subject"
         return reference_session_eid
 
-    def verify_data_presence(self):
+    def verify_data_presence(self) -> dict[str, bool]:
         """Check that all inputs the task needs can be loaded.
+        Returns a dictrionary of booleans"""
+        data_presence = {}
+        # raw imaging metadata can be loaded (scanimage segments
+        # are identical)
+        try:
+            self.load_raw_imaging_metadata()
+            data_presence["has_raw_imaging_metadata"] = True
+        except:
+            data_presence["has_raw_imaging_metadata"] = False
 
-        Each loader raises if its input is missing, so a silent return means the session is
-        ready to be processed.
-
-        Notes
-        -----
-        For debugging purposes only, to be removed.
-        """
-        # raw imaging metadata can be loaded
-        self.load_raw_imaging_metadata()
-
-        # this session has a reference stack
-        self.load_reference_stack()
-
-        # this session has brain surface points
-        self.load_brain_surface_points()
+        # reference stack can be loaded
+        try:
+            reference_stack = self.load_reference_stack()
+            data_presence["has_reference_stack"] = True
+        except:
+            data_presence["has_reference_stack"] = False
 
         # the reference session has a reference stack
-        self.load_reference_session_reference_stack()
+        try:
+            reference_session_reference_stack = self.load_reference_session_reference_stack()
+            data_presence["has_reference_session_reference_stack"] = True
+        except:
+            data_presence["has_reference_session_reference_stack"] = False
+
+        # has compatible reference session reference stack
+        if (
+            data_presence["has_reference_stack"]
+            and data_presence["has_reference_session_reference_stack"]
+        ):
+            if reference_stack.shape == reference_session_reference_stack.shape:
+                data_presence["reference_stack_is_compatible"] = True
+            else:
+                data_presence["reference_stack_is_compatible"] = False
+        else:
+            data_presence["reference_stack_is_compatible"] = False
+
+        # this session has brain surface points file
+        try:
+            self._load_brain_surface_points_from_file()
+            data_presence["has_brain_surface_points_file"] = True
+        except:
+            data_presence["has_brain_surface_points_file"] = False
+
+        # has brain surface points in metadata
+        try:
+            self._load_brain_surface_points_from_metadata()
+            data_presence["has_brain_surface_points_meta"] = True
+        except:
+            data_presence["has_brain_surface_points_meta"] = False
 
         # the reference session has histology
-        self.load_histology()
+        try:
+            self.load_histology()
+            data_presence["has_histology"] = True
+        except:
+            data_presence["has_histology"] = False
+
+        return data_presence
 
     #
     # ########  ########   #######   ######  ########  ######   ######  #### ##    ##  ######

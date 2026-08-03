@@ -26,7 +26,7 @@ match LOCATION:
         reference_session_path = BASE_FOLDER_LOCAL_SERVER / reference_session_path
 
 
-repro_task = MesoscopeFOVAlignment(
+task = MesoscopeFOVAlignment(
     session_path,
     reference_session_path=reference_session_path,
     one=one,
@@ -34,16 +34,16 @@ repro_task = MesoscopeFOVAlignment(
     debug=True,
 )
 
-repro_task.setUp()
-repro_task.verify_data_presence()
-# repro_task.pipeline(use_histology=True, debug=True)
-repro_task._run()
+task.setUp()
+print(task.verify_data_presence())
+# task.pipeline(use_histology=True, debug=True)
+# task._run()
 
 # %% visualizations
-fig, axes = plt.subplots()
-ds = 1
-for uuid, _coords in repro_task.coords.items():
-    points = _coords["mlapdv_on_surface"]
-    axes.plot(points[::ds, 0], points[::ds, 1], ".")
+# fig, axes = plt.subplots()
+# ds = 1
+# for uuid, _coords in task.fovs_coordinates.items():
+#     points = _coords["mlapdv_on_surface"]
+#     axes.plot(points[::ds, 0], points[::ds, 1], ".")
 
 # %%
