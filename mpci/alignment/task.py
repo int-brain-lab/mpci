@@ -54,6 +54,7 @@ from plane2brain.registration import (
     register_stacks,
 )
 
+TEST = True
 IBL_MESOSCOPE_DEFINITIONS = {
     "scanner_orientation": {"rotation": 0.0, "invert_axis": [True, True, False]},
     "scanimage_dimensions": ("Y", "X"),
@@ -152,7 +153,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         interpolation_sigma: float = 25,
         histology_atlas_resolution: Literal[10, 25, 50] = 25,
         projection_atlas_resolution: Literal[10, 25, 50] = 25,
-        dry: bool = True,  # for now safety first. FIXME change this eventually
+        write_outputs: bool = True,  # for now safety first. FIXME change this eventually
+        register_data: bool = True,
         debug: bool = True,
         **kwargs,
     ):
@@ -220,7 +222,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         self.interpolation_sigma = interpolation_sigma
         self.histology_atlas_resolution = histology_atlas_resolution
         self.projection_atlas_resolution = projection_atlas_resolution
-        self.dry = dry
+        self.write_outputs = write_outputs
+        self.register_data = register_data
         self.debug = debug
 
     def tearDown(self):
@@ -280,7 +283,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         """
         # Provenance is determined by the ability to load the histology volume
         try:
-            reference_session_reference_image_mlapdv = self.load_histology()
+            reference_session_reference_image_mlapdv, _ = self.load_histology()
             self.provenance = Provenance.HISTOLOGY
         except Exception:
             _logger.warning("no histology volume found.")
@@ -294,13 +297,13 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             _logger.info("Extracting histology MLAPDV datasets")
             # Update the craniotomy center
             reference_image_meta = self.load_reference_stack_metadata()
-            if not self.dry:
+            if self.register_datasets:
                 self.update_craniotomy_center(
                     reference_image_meta, reference_session_reference_image_mlapdv
                 )
             meta["centerMM"] = reference_image_meta["centerMM"]
             # write the file
-            if not self.dry:
+            if self.write_outputs:
                 with open(meta_files[0], "w") as fp:
                     json.dump(meta, fp)
             # Add reference meta data to meta_files list for registration
@@ -397,12 +400,15 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                 mean_image_files.append(
                     alf_path / to_alf("mpciMeanImage", attr, "npy", timescale=sfx)
                 )
-                if not self.dry:
+                if self.write_outputs:
                     np.save(mean_image_files[-1], arr)
 
         # Register FOVs in Alyx
-        if not self.dry:
-            self.register_fov(meta, self.provenance)
+        if self.register_data:
+            # remove registered FOVs on alyx
+            # WIP
+            # self.delete_registered_fovs()
+            self.register_fovs(meta, self.provenance)
 
         return sorted([*meta_files, *mean_image_files])
 
@@ -1202,6 +1208,9 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         ref_img_stack = self.load_reference_stack()
         ref_img_meta = self.load_reference_stack_metadata()
 
+        # create fov map
+        fov_map = self.create_fov_map(self, raw_imaging_meta)
+
         # attempting to load optional datasets and adjusting the pipeline accordingly
         if use_histology:
             try:
@@ -1240,8 +1249,6 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                     f"attempted to correct for session to session lateral shifts, but failed with {e.__class__.__name__}"
                 )
                 lateral_correct = False
-
-        fov_map = ibl.get_fov_map(raw_imaging_meta)
 
         # coordinate systems
         coordinate_systems_2d = scanimage.create_coordinate_systems_from_scanimage_meta(
@@ -1512,12 +1519,11 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         reference_image_meta["centerMM"]["ML_resolved"] = craniotomy_resolved[0]
         reference_image_meta["centerMM"]["AP_resolved"] = craniotomy_resolved[1]
         meta_path = next(
-            self.session_path.glob(
-                f"{self.raw_imaging_collection}/reference/referenceImage.meta.json"
-            )
+            self.session_path.glob(f"{self.reference_collection}/referenceImage.meta.json")
         )
-        with open(meta_path, "w") as f:
-            json.dump(reference_image_meta, f)
+        if self.write_outputs:
+            with open(meta_path, "w") as f:
+                json.dump(reference_image_meta, f)
 
         subject = self.session_path.subject
         subject_json = self.one.alyx.rest("subjects", "read", id=subject)["json"]
@@ -1529,11 +1535,12 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
         # Update the subject JSON if processing the reference session
         # i.e. the session with the histology-aligned reference stack
-        if self.reference_session_path and (
-            self.self.reference_session_path.session_parts == self.session_path.session_parts
-        ):
-            _logger.info("Updating craniotomy center in subject JSON for %s", subject)
-            self.one.alyx.json_field_update("subjects", subject, data=data)
+        if self.register_data:
+            if self.reference_session_path and (
+                self.reference_session_path.session_parts == self.session_path.session_parts
+            ):
+                _logger.info("Updating craniotomy center in subject JSON for %s", subject)
+                self.one.alyx.json_field_update("subjects", subject, data=data)
 
         _logger.info(
             "Craniotomy target: (%.2f, %.2f), actual: (%.2f, %.2f), difference: (%.2f, %.2f)",
@@ -1584,10 +1591,33 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             _logger.error("Failed to update surgery JSON: no matching craniotomy found")
             return surgery
         data = {key: {**surgery["json"][key], "surface_normal_unit_vector": tuple(normal_vector)}}
-        surgery["json"] = self.one.alyx.json_field_update("subjects", subject, data=data)
+        if self.register_data:
+            surgery["json"] = self.one.alyx.json_field_update("subjects", subject, data=data)
         return surgery
 
-    def register_fov(
+    # def create_fov_map(self, raw_imaging_meta: dict) -> dict:
+    #     # fov_map is a dict of {fov_name:scanimage_uuid}
+    #     # might need some better naming
+    #     ...
+
+    # def register_fovs(self, raw_imaging_meta):
+    #     for fov in raw_imaging_meta['FOV']:
+    #         for['roiUUID']
+    #     ...
+
+    def delete_registered_fovs(self):
+        # wipe data present on alyx
+        present_fovs = self.one.alyx.rest(
+            "fields-of-view",
+            "list",
+            session=self.eid,
+            imaging_type="mesoscope",
+            django=[f"provenance__{self.provenance}"],  # TODO figure out how this has to look like
+        )
+        for fov in present_fovs:
+            self.one.alyx.rest("fields-of-view", "delete", fov["id"])  # TODO verify
+
+    def register_fovs(
         self, meta: dict, provenance: Provenance, check_integrity: bool = True
     ) -> list[dict]:
         """Create FOV on Alyx.
@@ -1615,15 +1645,13 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         list of dict
             A list of registered field of view entries from Alyx.
 
-        TODO Determine dual plane ID for JSON field
         """
-        dry = self.one is None or self.one.offline
         alyx_fovs = []
         # Count the number of slices per stack ID: only register stacks that contain more than one slice.
         slice_counts = Counter(f["roiUUID"] for f in meta.get("FOV", []))
         # Create a new stack in Alyx for all stacks containing more than one slice.
         # Map of ScanImage ROI UUID to Alyx ImageStack UUID.
-        if dry:
+        if not self.register_data:
             stack_ids = {i: uuid4() for i in slice_counts if slice_counts[i] > 1}
             fov_data = {"session": self.session_path.as_posix(), "imaging_type": "mesoscope"}
             session_fovs = []
@@ -1633,7 +1661,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                 for i in slice_counts
                 if slice_counts[i] > 1
             }
-            fov_data = {"session": str(self.path2eid()), "imaging_type": "mesoscope"}
+            fov_data = {"session": self.eid, "imaging_type": "mesoscope"}
             session_fovs = self.one.alyx.rest(
                 "fields-of-view",
                 "list",
@@ -1645,7 +1673,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             assert set(fov.keys()) >= {"MLAPDV", "nXnYnZ", "roiUUID"}
             # Field of view
             fov_data.update({"name": f"FOV_{i:02}", "stack": stack_ids.get(fov["roiUUID"])})
-            if dry:
+            if not self.register_data:
                 print(fov_data)
                 fov_data["location"] = []
                 alyx_fovs.append(fov_data)
@@ -1683,7 +1711,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
             data["brain_region"] = np.unique(mean_image_ids).astype(int).tolist()
 
-            if dry:
+            if not self.register_data:
                 print(data)
                 fov_data["location"].append(data)
             else:
@@ -1703,7 +1731,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                     loc = self.one.alyx.rest("fov-location", "create", data=data)
                 alyx_fovs[-1]["location"].append(loc)
 
-        if check_integrity and not dry:
+        if check_integrity and not self.register_data:
             # Update FOV JSON field for FOVs that do not exist in meta data
             if any(
                 extraneous := set(f["id"] for f in session_fovs)
