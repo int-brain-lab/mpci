@@ -324,7 +324,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         # that all the scanimage related content that is needed here is
         # consistent across the files
         raw_imaging_meta = self.load_raw_imaging_metadata()
-        fov_map = ibl.get_fov_map(raw_imaging_meta)
+        fov_map = self.get_fov_map(raw_imaging_meta)
 
         # the atlas for the lookup
         atlas = MRITorontoAtlas(res_um=self.histology_atlas_resolution)
@@ -405,9 +405,6 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
         # Register FOVs in Alyx
         if self.register_data:
-            # remove registered FOVs on alyx
-            # WIP
-            # self.delete_registered_fovs()
             self.register_fovs(meta, self.provenance)
 
         return sorted([*meta_files, *mean_image_files])
@@ -1207,9 +1204,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         raw_imaging_meta = self.load_raw_imaging_metadata()
         ref_img_stack = self.load_reference_stack()
         ref_img_meta = self.load_reference_stack_metadata()
-
-        # create fov map
-        fov_map = self.create_fov_map(self, raw_imaging_meta)
+        fov_map = self.get_fov_map(self, raw_imaging_meta)
 
         # attempting to load optional datasets and adjusting the pipeline accordingly
         if use_histology:
@@ -1373,6 +1368,16 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                 fovs_coordinates[uuid]["mlapdv_on_surface"] = atlas.get_dv_for_mlap(
                     mlap_interp  # + 1e-6
                 )  # TODO trace back what those were for - I think not necessary since we are extrapolating now
+
+                # register the brain normal
+                reference_image_meta = self.load_reference_stack_metadata()
+                _, brain_normal = atlas.get_plane_at_point_mlap(
+                    reference_image_meta["centerMM"]["ML_resolved"],
+                    reference_image_meta["centerMM"]["AP_resolved"],
+                )
+                if self.register_data:
+                    self.update_surgery_json(self, raw_imaging_meta, brain_normal)
+
             else:
                 # if no histology is present - do the vanilla projection along the brain normal
                 # this assumes the optical axis and the brain normal are in alignment
@@ -1383,6 +1388,9 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                 )[0]
                 # and it's brain normal
                 _, brain_normal = atlas.get_plane_at_point_mlap(*center_mlapdv[:-1])
+                # register the brain normal on alyx
+                if self.register_data:
+                    self.update_surgery_json(self, raw_imaging_meta, brain_normal)
                 # setup the projection
                 coordinate_systems_3d = setup_coordinate_systems_3d(
                     center_mlapdv,
@@ -1430,7 +1438,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         """
         # just for debugging purposes - write the data locally without any questions asked
         raw_imaging_meta = self.load_raw_imaging_metadata()
-        fov_map = ibl.get_fov_map(raw_imaging_meta)
+        fov_map = self.get_fov_map(raw_imaging_meta)
         n_px_per_row = raw_imaging_meta["rawScanImageMeta"]["Width"]
         # the lookup has to be done on the atlas thas was used for histology
         atlas = MRITorontoAtlas(res_um=self.histology_atlas_resolution)
@@ -1595,15 +1603,9 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             surgery["json"] = self.one.alyx.json_field_update("subjects", subject, data=data)
         return surgery
 
-    # def create_fov_map(self, raw_imaging_meta: dict) -> dict:
-    #     # fov_map is a dict of {fov_name:scanimage_uuid}
-    #     # might need some better naming
-    #     ...
-
-    # def register_fovs(self, raw_imaging_meta):
-    #     for fov in raw_imaging_meta['FOV']:
-    #         for['roiUUID']
-    #     ...
+    def get_fov_map(self, raw_imaging_meta: dict) -> dict:
+        # fov_map is a dict of {fov_name:scanimage_uuid}
+        return {f"FOV_{i:02}": fov["roiUUID"] for i, fov in enumerate(raw_imaging_meta["FOV"])}
 
     def delete_registered_fovs(self):
         # wipe data present on alyx
