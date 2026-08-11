@@ -149,7 +149,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         reference_session_path: Path | None = None,
         one: ONE | None = None,
         reference_collection: str | None = None,
-        reference_session_reference_collection: str | None = None,
+        ref_session_reference_collection: str | None = None,
         interpolation_sigma: float = 25,
         histology_atlas_resolution: Literal[10, 25, 50] = 25,
         projection_atlas_resolution: Literal[10, 25, 50] = 25,
@@ -164,7 +164,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         ----------
         *args : tuple
             Positional arguments forwarded to `MesoscopeTask`; the first is the session path.
-        reference_session_path : pathlib.Path, optional
+        ref_session_path : pathlib.Path, optional
             Session path of the histology-aligned reference session of the same subject. If
             not given, neither the lateral shift correction nor the histology lookup can run.
         one : one.api.ONE, optional
@@ -172,9 +172,9 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         reference_collection : str, optional
             Collection of this session holding the reference stack, including the `reference`
             folder, e.g. 'raw_imaging_data_00/reference'. Inferred if not given.
-        reference_session_reference_collection : str, optional
+        ref_session_reference_collection : str, optional
             The same, for the reference session. Inferred if not given, and only used when
-            `reference_session_path` is given.
+            `ref_session_path` is given.
         interpolation_sigma : float, optional
             Standard deviation, in pixels, of the Gaussian filter applied to the reference
             session's histology grid before interpolation. Default is 25.
@@ -207,13 +207,13 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         self.reference_collection = reference_collection or self.infer_reference_collection(
             self.session_path
         )
-        self.reference_session_path = reference_session_path
+        self.ref_session_path = reference_session_path
         if reference_session_path is not None:
-            self.reference_session_path = ALFPath(reference_session_path)
-            self.reference_session_eid = self.one.path2eid(self.reference_session_path)
-            self.reference_session_reference_collection = (
-                reference_session_reference_collection
-                or self.infer_reference_collection(self.reference_session_path)
+            self.ref_session_path = ALFPath(reference_session_path)
+            self.ref_session_eid = self.one.path2eid(self.ref_session_path)
+            self.ref_session_reference_collection = (
+                ref_session_reference_collection
+                or self.infer_reference_collection(self.ref_session_path)
             )
 
         # keep references to links for unlinking during tearDown
@@ -283,7 +283,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         """
         # Provenance is determined by the ability to load the histology volume
         try:
-            reference_session_reference_image_mlapdv, _ = self.load_histology()
+            ref_session_ref_image_mlapdv, _ = self.load_histology()
             self.provenance = Provenance.HISTOLOGY
         except Exception:
             _logger.warning("no histology volume found.")
@@ -296,12 +296,10 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         if self.provenance is Provenance.HISTOLOGY:
             _logger.info("Extracting histology MLAPDV datasets")
             # Update the craniotomy center
-            reference_image_meta = self.load_reference_stack_metadata()
+            ref_image_meta = self.load_reference_stack_metadata()
             if self.register_datasets:
-                self.update_craniotomy_center(
-                    reference_image_meta, reference_session_reference_image_mlapdv
-                )
-            meta["centerMM"] = reference_image_meta["centerMM"]
+                self.update_craniotomy_center(ref_image_meta, ref_session_ref_image_mlapdv)
+            meta["centerMM"] = ref_image_meta["centerMM"]
             # write the file
             if self.write_outputs:
                 with open(meta_files[0], "w") as fp:
@@ -535,7 +533,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         )
         return json.loads(meta_filepath.read_text(encoding="utf-8"))
 
-    def get_reference_stack_path(self) -> Path:
+    def get_ref_stack_path(self) -> Path:
         """Return the path to the reference stack of this session.
 
         Returns
@@ -552,7 +550,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         """
         return find_file(self.session_path / self.reference_collection, "*referenceImage.stack*")
 
-    def get_reference_session_reference_stack_path(self) -> Path:
+    def get_reference_session_ref_stack_path(self) -> Path:
         """Return the path to the reference stack of the reference session.
 
         On popeye the stack is not directly readable and is symlinked into the task
@@ -574,7 +572,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             return self._symlink_reference_session_reference_stack()
         else:
             return find_file(
-                self.reference_session_path / self.reference_session_reference_collection,
+                self.ref_session_path / self.ref_session_reference_collection,
                 "*referenceImage.stack*",
             )
 
@@ -586,7 +584,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         numpy.ndarray
             Image stack with shape (Z, Y, X).
         """
-        return tifffile.imread(self.get_reference_stack_path())
+        return tifffile.imread(self.get_ref_stack_path())
 
     def load_reference_session_reference_stack(self) -> np.ndarray:
         """Load the reference stack of the reference session.
@@ -601,8 +599,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         ValueError
             If the task was constructed without a reference session path.
         """
-        if self.reference_session_path is not None:
-            return tifffile.imread(self.get_reference_session_reference_stack_path())
+        if self.ref_session_path is not None:
+            return tifffile.imread(self.get_reference_session_ref_stack_path())
         else:
             raise ValueError(
                 "cannot load the reference session's reference stack: "
@@ -622,15 +620,15 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         AssertionError
             If not exactly one reference stack is found in the source folder.
         """
-        path_short = self.one.eid2path(self.reference_session_eid).session_path_short()
-        lab = self.one.get_details(self.reference_session_path)["lab"]
-        symlinked_reference_stack = (
+        path_short = self.one.eid2path(self.ref_session_eid).session_path_short()
+        lab = self.one.get_details(self.ref_session_path)["lab"]
+        symlinked_ref_stack = (
             self.data_handler.patch_path
             / type(self).__name__
             / lab
             / "Subjects"
             / path_short
-            / self.reference_session_reference_collection
+            / self.ref_session_reference_collection
             / "referenceImage.stack.tif"
         )
 
@@ -639,18 +637,18 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             / lab
             / "Subjects"
             / path_short
-            / self.reference_session_reference_collection
+            / self.ref_session_reference_collection
         )
 
-        reference_stack_path = find_file(_session_folder, "*referenceImage.stack.*.tif")
-        if symlinked_reference_stack.exists():
-            symlinked_reference_stack.unlink()
-        symlinked_reference_stack.parent.mkdir(parents=True, exist_ok=True)
-        symlinked_reference_stack.symlink_to(reference_stack_path[0])
+        ref_stack_path = find_file(_session_folder, "*referenceImage.stack.*.tif")
+        if symlinked_ref_stack.exists():
+            symlinked_ref_stack.unlink()
+        symlinked_ref_stack.parent.mkdir(parents=True, exist_ok=True)
+        symlinked_ref_stack.symlink_to(ref_stack_path[0])
 
         # keep links for teardown
-        self.links.append(symlinked_reference_stack)
-        return symlinked_reference_stack
+        self.links.append(symlinked_ref_stack)
+        return symlinked_ref_stack
 
     def load_histology(self) -> tuple[np.ndarray, np.ndarray]:
         """Load the MLAPDV coordinates of the reference session's reference image.
@@ -806,15 +804,15 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         AssertionError
             If the file could neither be transferred via Globus nor downloaded via HTTP.
         """
-        reference_collection = self.reference_session_reference_collection
+        reference_collection = self.ref_session_reference_collection
 
         if self.location == "popeye":
-            lab = self.one.get_details(self.reference_session_path)["lab"]
+            lab = self.one.get_details(self.ref_session_path)["lab"]
             local_file = (
                 self.data_handler.root_path
                 / "histology"
                 / lab
-                / self.reference_session_path.session_path_short()
+                / self.ref_session_path.session_path_short()
                 / "referenceImage.mlapdv.npy"
             )
             return local_file
@@ -826,21 +824,17 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             "output_files": [],
         }
         if self.location == "server" and self.force:
-            handler = ServerGlobusDataHandler(self.reference_session_path, signature, one=self.one)
+            handler = ServerGlobusDataHandler(self.ref_session_path, signature, one=self.one)
         else:
-            handler = self.data_handler.__class__(
-                self.reference_session_path, signature, one=self.one
-            )
+            handler = self.data_handler.__class__(self.ref_session_path, signature, one=self.one)
         handler.setUp()
 
         _logger.info(
             "Looking for reference MLAPDV in %s",
-            self.reference_session_path.joinpath(reference_collection),
+            self.ref_session_path.joinpath(reference_collection),
         )
         # NB: The local reference folder is expected to exist after handler.setUp()
-        local_file = (
-            self.reference_session_path / reference_collection / "referenceImage.mlapdv.npy"
-        )
+        local_file = self.ref_session_path / reference_collection / "referenceImage.mlapdv.npy"
 
         if not local_file.exists():
             _logger.warning("getting histology via data handler failed!")
@@ -849,14 +843,12 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             _logger.info("attempting to download histology file from flatiron")
             assert self.one, "ONE required"
             local_file.parent.mkdir(parents=True, exist_ok=True)
-            lab = self.one.get_details(self.reference_session_path)["lab"]
-            remote_file = (
-                f"{lab}/{self.reference_session_path.session_path_short()}/{local_file.name}"
-            )
+            lab = self.one.get_details(self.ref_session_path)["lab"]
+            remote_file = f"{lab}/{self.ref_session_path.session_path_short()}/{local_file.name}"
             try:
                 # the histology folder is not part of the standard endpoints, so mount it as its own
                 handler = ServerGlobusDataHandler(
-                    self.reference_session_path,
+                    self.ref_session_path,
                     {"input_files": [], "output_files": []},
                     one=self.one,
                 )
@@ -931,14 +923,14 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
         # reference stack can be loaded
         try:
-            reference_stack = self.load_reference_stack()
+            ref_stack = self.load_reference_stack()
             data_presence["has_reference_stack"] = True
         except:
             data_presence["has_reference_stack"] = False
 
         # the reference session has a reference stack
         try:
-            reference_session_reference_stack = self.load_reference_session_reference_stack()
+            ref_session_ref_stack = self.load_reference_session_reference_stack()
             data_presence["has_reference_session_reference_stack"] = True
         except:
             data_presence["has_reference_session_reference_stack"] = False
@@ -948,7 +940,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             data_presence["has_reference_stack"]
             and data_presence["has_reference_session_reference_stack"]
         ):
-            if reference_stack.shape == reference_session_reference_stack.shape:
+            if ref_stack.shape == ref_session_ref_stack.shape:
                 data_presence["reference_stack_is_compatible"] = True
             else:
                 data_presence["reference_stack_is_compatible"] = False
@@ -1332,8 +1324,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         if lateral_correct:
             # get the transform for session to session correction
             ref_transform = self.register_reference_stacks(
-                self.get_reference_stack_path(),
-                self.get_reference_session_reference_stack_path(),
+                self.get_ref_stack_path(),
+                self.get_reference_session_ref_stack_path(),
             )
 
         if use_histology:
@@ -1370,10 +1362,10 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                 )  # TODO trace back what those were for - I think not necessary since we are extrapolating now
 
                 # register the brain normal
-                reference_image_meta = self.load_reference_stack_metadata()
+                ref_image_meta = self.load_reference_stack_metadata()
                 _, brain_normal = atlas.get_plane_at_point_mlap(
-                    reference_image_meta["centerMM"]["ML_resolved"],
-                    reference_image_meta["centerMM"]["AP_resolved"],
+                    ref_image_meta["centerMM"]["ML_resolved"],
+                    ref_image_meta["centerMM"]["AP_resolved"],
                 )
                 if self.register_data:
                     self.update_surgery_json(raw_imaging_meta, brain_normal)
@@ -1480,17 +1472,17 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
     def update_craniotomy_center(
         self,
-        reference_image_meta: dict,
-        reference_session_reference_stack_mlapdv: np.ndarray,
+        ref_image_meta: dict,
+        ref_session_ref_stack_mlapdv: np.ndarray,
     ) -> np.ndarray:
         """Update subject JSON with atlas-aligned craniotomy coordinates.
 
         Parameters
         ----------
-        reference_image_meta : dict
+        ref_image_meta : dict
             Contents of this session's `referenceImage.meta.json`; updated in place with the
             resolved ML/AP center and written back to disk.
-        reference_session_reference_stack_mlapdv : numpy.ndarray
+        ref_session_ref_stack_mlapdv : numpy.ndarray
             Array with shape (h, w, 3) holding the (ml, ap, dv) coordinates in μm of each
             pixel of the reference session's reference image.
 
@@ -1501,12 +1493,12 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         """
         assert not self.one.offline
         # Get the pixel coordinates of the craniotomy center in the reference image
-        px_per_um = get_px_per_um(reference_image_meta)
+        px_per_um = get_px_per_um(ref_image_meta)
         um_per_px = 1 / px_per_um
 
-        ref_stack_n_px = np.array(reference_session_reference_stack_mlapdv.shape[:2])  # in (y, x)
+        ref_stack_n_px = np.array(ref_session_ref_stack_mlapdv.shape[:2])  # in (y, x)
         craniotomy_center_offset = np.flip(
-            get_window_center(reference_image_meta) * 1e3
+            get_window_center(ref_image_meta) * 1e3
         )  # (y, x) center offset mm -> μm
 
         image_center_px = ref_stack_n_px / 2
@@ -1519,19 +1511,18 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         # This doesn't work in python 3.10, numpy 2.24
         # craniotomy_resolved = referenceImage['mlapdv'][craniotomy_pixel] / 1e3  # py 3.11 # ML AP DV, μm -> mm
         craniotomy_resolved = (
-            reference_session_reference_stack_mlapdv[craniotomy_pixel[0], craniotomy_pixel[1]]
-            / 1e3
+            ref_session_ref_stack_mlapdv[craniotomy_pixel[0], craniotomy_pixel[1]] / 1e3
         )
 
         # Update metadata
-        reference_image_meta["centerMM"]["ML_resolved"] = craniotomy_resolved[0]
-        reference_image_meta["centerMM"]["AP_resolved"] = craniotomy_resolved[1]
+        ref_image_meta["centerMM"]["ML_resolved"] = craniotomy_resolved[0]
+        ref_image_meta["centerMM"]["AP_resolved"] = craniotomy_resolved[1]
         meta_path = next(
             self.session_path.glob(f"{self.reference_collection}/referenceImage.meta.json")
         )
         if self.write_outputs:
             with open(meta_path, "w") as f:
-                json.dump(reference_image_meta, f)
+                json.dump(ref_image_meta, f)
 
         subject = self.session_path.subject
         subject_json = self.one.alyx.rest("subjects", "read", id=subject)["json"]
@@ -1544,8 +1535,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         # Update the subject JSON if processing the reference session
         # i.e. the session with the histology-aligned reference stack
         if self.register_data:
-            if self.reference_session_path and (
-                self.reference_session_path.session_parts == self.session_path.session_parts
+            if self.ref_session_path and (
+                self.ref_session_path.session_parts == self.session_path.session_parts
             ):
                 _logger.info("Updating craniotomy center in subject JSON for %s", subject)
                 self.one.alyx.json_field_update("subjects", subject, data=data)
