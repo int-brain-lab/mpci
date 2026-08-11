@@ -1204,7 +1204,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         raw_imaging_meta = self.load_raw_imaging_metadata()
         ref_img_stack = self.load_reference_stack()
         ref_img_meta = self.load_reference_stack_metadata()
-        fov_map = self.get_fov_map(self, raw_imaging_meta)
+        fov_map = self.get_fov_map(raw_imaging_meta)
 
         # attempting to load optional datasets and adjusting the pipeline accordingly
         if use_histology:
@@ -1376,7 +1376,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                     reference_image_meta["centerMM"]["AP_resolved"],
                 )
                 if self.register_data:
-                    self.update_surgery_json(self, raw_imaging_meta, brain_normal)
+                    self.update_surgery_json(raw_imaging_meta, brain_normal)
 
             else:
                 # if no histology is present - do the vanilla projection along the brain normal
