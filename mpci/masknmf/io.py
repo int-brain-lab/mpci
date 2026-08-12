@@ -9,7 +9,7 @@ every raw temporal frame contributes one sample to every plane simultaneously.
 
 Usage example::
 
-    from masknmf.arrays.scanimage_loader import (
+    from mpci.masknmf.io import (
         ScanImageTiffSeriesLoader,
         read_fov_line_indices,
         collect_tiff_paths,
@@ -27,7 +27,7 @@ Usage example::
 """
 from pathlib import Path
 import json
-from typing import Union
+from typing import Tuple, Union
 
 import numpy as np
 import tifffile
@@ -107,7 +107,10 @@ class ScanImageTiffSeriesLoader(LazyFrameLoader):
     Each raw tiff frame is a composite image that contains **all** planes
     simultaneously at different row ranges.  This class exposes a single plane
     as a ``(T, H, W)`` array-like by slicing the appropriate rows from each
-    frame on demand.
+    frame on demand.  ``H``/``W`` indices given to ``__getitem__`` are resolved
+    to absolute row/column ranges and pushed into the underlying memmap read
+    (when ``memmap=True``), rather than reading the full plane band and width
+    before subselecting in memory.
 
     Parameters
     ----------
@@ -121,9 +124,15 @@ class ScanImageTiffSeriesLoader(LazyFrameLoader):
 
         Must be a contiguous ascending range (the class slices
         ``frame[lines[0]:lines[-1]+1, :]``).
+    memmap:
+        Memory-map each file for fast, partial-region reads (default). Falls
+        back to ``tifffile.imread`` per-file if a file can't be memory-mapped
+        (raw ScanImage tiffs aren't always contiguous/uncompressed); in that
+        case the full plane band and width are always read from disk and any
+        ``H``/``W`` cropping is applied afterward in memory.
     """
 
-    def __init__(self, file_paths: list[Path], line_indices: list[int], memmap: bool = False):
+    def __init__(self, file_paths: list[Path], line_indices: list[int], memmap: bool = True):
         self._file_paths = list(file_paths)
         self._lines = np.asarray(line_indices, dtype=np.int64)
         self._row_start = int(self._lines[0])
@@ -191,10 +200,63 @@ class ScanImageTiffSeriesLoader(LazyFrameLoader):
         return self._lines
 
     # ------------------------------------------------------------------
-    # Core read logic
+    # Intelligent (T, H, W) indexing
     # ------------------------------------------------------------------
 
-    def _compute_at_indices(self, indices: Union[int, slice, list]) -> np.ndarray:
+    def _resolve_spatial_indexer(self, indexer, size: int):
+        """Normalize an H or W indexer (from ``__getitem__``) to an int, slice, or ndarray.
+
+        Negative ints/entries are resolved to positive positions here (rather than left for
+        numpy to handle) since row indices get shifted by an absolute offset afterward.
+        """
+        if indexer is None:
+            return slice(0, size, 1)
+        if isinstance(indexer, (int, np.integer)):
+            idx = int(indexer)
+            return idx + size if idx < 0 else idx
+        if isinstance(indexer, (slice, range)):
+            return slice(*indexer.indices(size))
+        if isinstance(indexer, (list, np.ndarray)):
+            arr = np.asarray(indexer)
+            return np.where(arr < 0, arr + size, arr)
+        raise IndexError(f"Invalid spatial index: {indexer!r}")
+
+    def _shift_row_indexer(self, row_indexer):
+        """Shift a plane-local row indexer (0..height) to an absolute row in the raw frame."""
+        if isinstance(row_indexer, int):
+            return row_indexer + self._row_start
+        if isinstance(row_indexer, slice):
+            # A resolved reverse-order slice's stop may be -1 ("before index 0"); shifting
+            # that literally would land on a real, wrong absolute row, so keep it as None.
+            stop = None if row_indexer.stop == -1 else row_indexer.stop + self._row_start
+            return slice(row_indexer.start + self._row_start, stop, row_indexer.step)
+        return row_indexer + self._row_start  # ndarray
+
+    def __getitem__(
+        self,
+        item: Union[int, list, np.ndarray, slice, range, Tuple[Union[int, np.ndarray, slice, range]]],
+    ):
+        frame_indexer, item = self._parse_indices(item)
+        row_item = item[1] if isinstance(item, tuple) and len(item) > 1 else None
+        col_item = item[2] if isinstance(item, tuple) and len(item) > 2 else None
+
+        row_indexer = self._shift_row_indexer(self._resolve_spatial_indexer(row_item, self._height))
+        col_indexer = self._resolve_spatial_indexer(col_item, self._width)
+
+        frames = self._compute_at_indices(frame_indexer, row_indexer, col_indexer)
+        return frames.astype(self.dtype, copy=False)
+
+    def _compute_at_indices(
+        self,
+        indices: Union[int, slice, list],
+        row_indexer: Union[int, slice, np.ndarray, None] = None,
+        col_indexer: Union[int, slice, np.ndarray, None] = None,
+    ) -> np.ndarray:
+        if row_indexer is None:
+            row_indexer = slice(self._row_start, self._row_end, 1)
+        if col_indexer is None:
+            col_indexer = slice(0, self._width, 1)
+
         if isinstance(indices, int):
             indices = [indices]
         elif isinstance(indices, slice):
@@ -203,6 +265,14 @@ class ScanImageTiffSeriesLoader(LazyFrameLoader):
             indices = list(indices)
 
         rows = self._frame_map[indices, :]
+
+        # Advanced (array) indexing on more than one axis pairs elements instead of
+        # taking the outer product. The frame axis is always advanced here (`local_idx`
+        # below), so a fancy row/col index is read in full then applied as its own pass.
+        row_is_fancy = isinstance(row_indexer, np.ndarray)
+        col_is_fancy = isinstance(col_indexer, np.ndarray)
+        read_row = slice(None) if row_is_fancy else row_indexer
+        read_col = slice(None) if col_is_fancy else col_indexer
 
         chunks: list[np.ndarray] = []
         insertion_order = np.zeros(len(rows), dtype=np.int64)
@@ -215,13 +285,21 @@ class ScanImageTiffSeriesLoader(LazyFrameLoader):
 
             mm = self._memmaps[file_id] if self._memmap else None
             if mm is not None:
-                # Fancy-index the memmap; returns a copied array (not a view).
-                raw = mm[local_idx, self._row_start:self._row_end, :]
+                # Fancy-index the memmap; returns a copied array (not a view), reading only
+                # the requested frames/rows/columns rather than the full plane band and width.
+                raw = mm[local_idx, read_row, read_col]
             else:
+                # Raw TIFF rows can't be partially decoded, so the full plane band and width
+                # are always read from disk here; row/col cropping is applied afterward.
                 raw = tifffile.imread(self._file_paths[file_id], key=local_idx.tolist())
                 if raw.ndim == 2:
                     raw = raw[None]
-                raw = raw[:, self._row_start:self._row_end, :]
+                raw = raw[:, read_row, read_col]
+
+            if row_is_fancy:
+                raw = raw[:, row_indexer, :] if raw.ndim == 3 else raw[:, row_indexer]
+            if col_is_fancy:
+                raw = raw[..., col_indexer]
 
             chunks.append(raw.astype(self._dtype, copy=False))
             insertion_order[pos:pos + len(out_positions)] = out_positions
