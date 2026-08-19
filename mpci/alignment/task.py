@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import enum
 import logging
+from collections.abc import Callable
 from itertools import chain, product
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from collections import Counter
 from datetime import datetime
 from uuid import UUID, uuid4
@@ -54,20 +55,21 @@ from plane2brain.registration import (
     register_stacks,
 )
 
-TEST = True
+# ScanImage metadata stores dimensions in XY order by default, where X is the
+# resonant (fast-scan) axis; in our reference image that axis is the second one.
 IBL_MESOSCOPE_DEFINITIONS = {
     "scanner_orientation": {"rotation": 0.0, "invert_axis": [True, True, False]},
     "scanimage_dimensions": ("Y", "X"),
 }
-# ScanImage metadata stores dimensions in XY order by default, where X is the
-# resonant (fast-scan) axis; in our reference image that axis is the second one.
 
+# the exceptions the loaders raise when their input is absent or unusable: nothing found on
+# disk, an ambiguous glob or no reference session given, a field missing from a metadata file,
+# and inconsistent metadata or a failed transfer
+MISSING_DATA_ERRORS = (FileNotFoundError, ValueError, KeyError, AssertionError)
 
 _logger = logging.getLogger(__name__)
 
-Provenance = enum.Enum(
-    "Provenance", ["ESTIMATE", "FUNCTIONAL", "LANDMARK", "HISTOLOGY"]
-)  # py3.11 make StrEnum
+Provenance = enum.Enum("Provenance", ["ESTIMATE", "FUNCTIONAL", "LANDMARK", "HISTOLOGY"])
 
 
 class PopeyeS3DataHandler(PopeyeDataHandler):
@@ -153,8 +155,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         interpolation_sigma: float = 25,
         histology_atlas_resolution: Literal[10, 25, 50] = 25,
         projection_atlas_resolution: Literal[10, 25, 50] = 25,
-        write_outputs: bool = True,  # for now safety first. FIXME change this eventually
-        register_data: bool = True,
+        write_outputs: bool = False,  # for now safety first. FIXME change this eventually
+        register_data: bool = False,  # for now safety first. FIXME change this eventually
         debug: bool = True,
         **kwargs,
     ):
@@ -164,7 +166,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         ----------
         *args : tuple
             Positional arguments forwarded to `MesoscopeTask`; the first is the session path.
-        ref_session_path : pathlib.Path, optional
+        reference_session_path : pathlib.Path, optional
             Session path of the histology-aligned reference session of the same subject. If
             not given, neither the lateral shift correction nor the histology lookup can run.
         one : one.api.ONE, optional
@@ -174,7 +176,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             folder, e.g. 'raw_imaging_data_00/reference'. Inferred if not given.
         ref_session_reference_collection : str, optional
             The same, for the reference session. Inferred if not given, and only used when
-            `ref_session_path` is given.
+            `reference_session_path` is given.
         interpolation_sigma : float, optional
             Standard deviation, in pixels, of the Gaussian filter applied to the reference
             session's histology grid before interpolation. Default is 25.
@@ -182,8 +184,11 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             Atlas resolution, in μm, used for histology-based MLAPDV lookups. Default is 25.
         projection_atlas_resolution : {10, 25, 50}, optional
             Atlas resolution, in μm, used for the surface projection atlas. Default is 25.
-        dry : bool, optional
-            If True, skip all disk writes and Alyx registration. Default is True.
+        write_outputs : bool, optional
+            If True, write the output datasets to disk. Default is False.
+        register_data : bool, optional
+            If True, register the FOVs on Alyx and update the subject and surgery JSON
+            fields. Default is False.
         debug : bool, optional
             If True, downsample the pixel grid for faster debugging runs. Default is True.
         **kwargs : dict
@@ -201,7 +206,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         super().__init__(*args, one=one or ONE(), **kwargs)
 
         if self.one.offline:
-            raise ValueError("ReprojectionTask requires an online ONE instance")
+            raise ValueError("MesocopeFOVAlignment task requires an online ONE instance")
 
         self.eid = self.one.path2eid(self.session_path)
         self.reference_collection = reference_collection or self.infer_reference_collection(
@@ -276,6 +281,9 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         histology volume is available, ESTIMATE otherwise. It determines the suffix of the
         output datasets, and only a HISTOLOGY run updates the craniotomy center.
 
+        Writing to disk requires `write_outputs` and registering to Alyx requires
+        `register_data`; the returned paths are the same either way.
+
         Returns
         -------
         list of pathlib.Path
@@ -297,7 +305,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             _logger.info("Extracting histology MLAPDV datasets")
             # Update the craniotomy center
             ref_image_meta = self.load_reference_stack_metadata()
-            if self.register_datasets:
+            if self.register_data:
                 self.update_craniotomy_center(ref_image_meta, ref_session_ref_image_mlapdv)
             meta["centerMM"] = ref_image_meta["centerMM"]
             # write the file
@@ -449,7 +457,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         ]
         if len(collections) > 1:
             _logger.warning(
-                f"number of collections with reference stacks is: {len(collections)} - taking the last one"
+                f"number of collections with reference stacks is: \
+                    {len(collections)} - taking the last one"
             )
 
         return collections[-1].parts[-1] + "/reference"
@@ -617,8 +626,10 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
         Raises
         ------
-        AssertionError
-            If not exactly one reference stack is found in the source folder.
+        FileNotFoundError
+            If no reference stack is found in the source folder.
+        ValueError
+            If more than one reference stack is found there.
         """
         path_short = self.one.eid2path(self.ref_session_eid).session_path_short()
         lab = self.one.get_details(self.ref_session_path)["lab"]
@@ -640,11 +651,11 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             / self.ref_session_reference_collection
         )
 
-        ref_stack_path = find_file(_session_folder, "*referenceImage.stack.*.tif")
+        ref_stack_path = find_file(_session_folder, "*referenceImage.stack*")
         if symlinked_ref_stack.exists():
             symlinked_ref_stack.unlink()
         symlinked_ref_stack.parent.mkdir(parents=True, exist_ok=True)
-        symlinked_ref_stack.symlink_to(ref_stack_path[0])
+        symlinked_ref_stack.symlink_to(ref_stack_path)
 
         # keep links for teardown
         self.links.append(symlinked_ref_stack)
@@ -885,89 +896,56 @@ class MesoscopeFOVAlignment(MesoscopeTask):
     #    ###    ##     ## ######## #### ########  ##     ##    ##    ####  #######  ##    ##
     #
 
-    def validate_reference_session(self, reference_session_eid: str | UUID) -> UUID:
-        """Check that the reference session belongs to the same subject as this session.
+    def _try_load(self, loader: Callable[[], Any]) -> tuple[bool, Any]:
+        """Attempt a loader, reporting whether its input could be loaded.
 
         Parameters
         ----------
-        reference_session_eid : str or uuid.UUID
-            Experiment ID of the candidate reference session.
+        loader : callable
+            A loader method of this task, taking no arguments.
 
         Returns
         -------
-        uuid.UUID
-            The validated experiment ID, unchanged.
-
-        Raises
-        ------
-        AssertionError
-            If the reference session was recorded from a different subject.
+        bool
+            True if the loader returned without raising.
+        object
+            What the loader returned, or None if it raised.
         """
-        assert (
-            self.one.eid2ref(reference_session_eid)["subject"]
-            == self.one.eid2ref(self.eid)["subject"]
-        ), "reference session does not match to this session: wrong subject"
-        return reference_session_eid
+        try:
+            return True, loader()
+        except MISSING_DATA_ERRORS as e:
+            _logger.warning(f"{loader.__name__} failed with: {type(e).__name__}: {e}")
+            return False, None
 
     def verify_data_presence(self) -> dict[str, bool]:
-        """Check that all inputs the task needs can be loaded.
-        Returns a dictrionary of booleans"""
-        data_presence = {}
-        # raw imaging metadata can be loaded (scanimage segments
-        # are identical)
-        try:
-            self.load_raw_imaging_metadata()
-            data_presence["has_raw_imaging_metadata"] = True
-        except:
-            data_presence["has_raw_imaging_metadata"] = False
+        """Check which of the inputs the task needs can be loaded.
 
-        # reference stack can be loaded
-        try:
-            ref_stack = self.load_reference_stack()
-            data_presence["has_reference_stack"] = True
-        except:
-            data_presence["has_reference_stack"] = False
+        Returns
+        -------
+        dict of str to bool
+            One flag per input, plus 'reference_stack_is_compatible' for whether the two
+            reference stacks agree in shape, as the lateral shift correction requires.
+        """
+        loaders = {
+            "has_raw_imaging_metadata": self.load_raw_imaging_metadata,
+            "has_reference_stack": self.load_reference_stack,
+            "has_reference_session_reference_stack": self.load_reference_session_reference_stack,
+            "has_brain_surface_points_file": self._load_brain_surface_points_from_file,
+            "has_brain_surface_points_meta": self._load_brain_surface_points_from_metadata,
+            "has_histology": self.load_histology,
+        }
+        data_presence: dict[str, bool] = {}
+        loaded: dict[str, Any] = {}
+        for key, loader in loaders.items():
+            data_presence[key], loaded[key] = self._try_load(loader)
 
-        # the reference session has a reference stack
-        try:
-            ref_session_ref_stack = self.load_reference_session_reference_stack()
-            data_presence["has_reference_session_reference_stack"] = True
-        except:
-            data_presence["has_reference_session_reference_stack"] = False
-
-        # has compatible reference session reference stack
-        if (
+        # both stacks have to be of the same shape to be registered onto one another
+        data_presence["reference_stack_is_compatible"] = (
             data_presence["has_reference_stack"]
             and data_presence["has_reference_session_reference_stack"]
-        ):
-            if ref_stack.shape == ref_session_ref_stack.shape:
-                data_presence["reference_stack_is_compatible"] = True
-            else:
-                data_presence["reference_stack_is_compatible"] = False
-        else:
-            data_presence["reference_stack_is_compatible"] = False
-
-        # this session has brain surface points file
-        try:
-            self._load_brain_surface_points_from_file()
-            data_presence["has_brain_surface_points_file"] = True
-        except:
-            data_presence["has_brain_surface_points_file"] = False
-
-        # has brain surface points in metadata
-        try:
-            self._load_brain_surface_points_from_metadata()
-            data_presence["has_brain_surface_points_meta"] = True
-        except:
-            data_presence["has_brain_surface_points_meta"] = False
-
-        # the reference session has histology
-        try:
-            self.load_histology()
-            data_presence["has_histology"] = True
-        except:
-            data_presence["has_histology"] = False
-
+            and loaded["has_reference_stack"].shape
+            == loaded["has_reference_session_reference_stack"].shape
+        )
         return data_presence
 
     #
@@ -1169,11 +1147,16 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         histology, `tilt_correct` needs the brain surface points, and `lateral_correct` needs
         the reference session's reference stack to be present and of matching shape.
 
+        When `register_data` is set, the surface normal at the craniotomy center is written to
+        the surgery JSON on Alyx as a side effect.
+
         Parameters
         ----------
         use_histology : bool
             If True, look up atlas ML/AP coordinates via the reference session's histology.
-            Required for depth (DV) assignment; if disabled, cell coordinates are not resolved.
+            If False, project onto the atlas surface along the brain normal instead, which
+            assumes the optical axis and the brain normal to be aligned. Either way, depth
+            below the surface is resolved separately, from the brain surface points.
         lateral_correct : bool
             If True, correct for the session-to-session lateral shift by registering this
             session's reference stack onto the reference session's.
@@ -1382,7 +1365,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                 _, brain_normal = atlas.get_plane_at_point_mlap(*center_mlapdv[:-1])
                 # register the brain normal on alyx
                 if self.register_data:
-                    self.update_surgery_json(self, raw_imaging_meta, brain_normal)
+                    self.update_surgery_json(raw_imaging_meta, brain_normal)
                 # setup the projection
                 coordinate_systems_3d = setup_coordinate_systems_3d(
                     center_mlapdv,
@@ -1414,51 +1397,51 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                 )
         return fovs_coordinates
 
-    def write_outputs(self, fovs_coordinates: dict[str, dict[str, np.ndarray]]):
-        """Write mean-image MLAPDV and brain-location-ID datasets to disk, unconditionally.
+    # def write_outputs(self, fovs_coordinates: dict[str, dict[str, np.ndarray]]):
+    #     """Write mean-image MLAPDV and brain-location-ID datasets to disk, unconditionally.
 
-        Parameters
-        ----------
-        fovs_coordinates : dict of str to dict of str to numpy.ndarray
-            Per-FOV-UUID coordinate dictionaries, as returned by `align_FOVs`; each must
-            contain an 'mlapdv' array.
+    #     Parameters
+    #     ----------
+    #     fovs_coordinates : dict of str to dict of str to numpy.ndarray
+    #         Per-FOV-UUID coordinate dictionaries, as returned by `align_FOVs`; each must
+    #         contain an 'mlapdv' array.
 
-        Notes
-        -----
-        For debugging purposes only: writes are unconditional, without the `dry` guard used
-        elsewhere in this class.
-        """
-        # just for debugging purposes - write the data locally without any questions asked
-        raw_imaging_meta = self.load_raw_imaging_metadata()
-        fov_map = self.get_fov_map(raw_imaging_meta)
-        n_px_per_row = raw_imaging_meta["rawScanImageMeta"]["Width"]
-        # the lookup has to be done on the atlas thas was used for histology
-        atlas = MRITorontoAtlas(res_um=self.histology_atlas_resolution)
+    #     Notes
+    #     -----
+    #     For debugging purposes only: writes are unconditional, without the `dry` guard used
+    #     elsewhere in this class.
+    #     """
+    #     # just for debugging purposes - write the data locally without any questions asked
+    #     raw_imaging_meta = self.load_raw_imaging_metadata()
+    #     fov_map = self.get_fov_map(raw_imaging_meta)
+    #     n_px_per_row = raw_imaging_meta["rawScanImageMeta"]["Width"]
+    #     # the lookup has to be done on the atlas thas was used for histology
+    #     atlas = MRITorontoAtlas(res_um=self.histology_atlas_resolution)
 
-        # save outputs
-        for fov_name, fov_uuid in fov_map.items():
-            # mpciMeanImage.mlapdv
-            mpciMeanImage = np.reshape(
-                fovs_coordinates[fov_uuid]["mlapdv"], (n_px_per_row, n_px_per_row, 3)
-            )
-            save_path = self.session_path / "alf" / fov_name / "mpciMeanImage.mlapdv.npy"
-            np.save(
-                save_path,
-                mpciMeanImage,
-            )
+    #     # save outputs
+    #     for fov_name, fov_uuid in fov_map.items():
+    #         # mpciMeanImage.mlapdv
+    #         mpciMeanImage = np.reshape(
+    #             fovs_coordinates[fov_uuid]["mlapdv"], (n_px_per_row, n_px_per_row, 3)
+    #         )
+    #         save_path = self.session_path / "alf" / fov_name / "mpciMeanImage.mlapdv.npy"
+    #         np.save(
+    #             save_path,
+    #             mpciMeanImage,
+    #         )
 
-            # mpciMeanImage.brainLocationIds_ccf_2017s_ccf_2017.npy
-            brainLocationIds = atlas.get_labels(mpciMeanImage / 1e6, mode="clip")
-            save_path = (
-                self.session_path
-                / "alf"
-                / fov_name
-                / "mpciMeanImage.brainLocationIds_ccf_2017.npy"
-            )
-            np.save(
-                save_path,
-                brainLocationIds,
-            )
+    #         # mpciMeanImage.brainLocationIds_ccf_2017s_ccf_2017.npy
+    #         brainLocationIds = atlas.get_labels(mpciMeanImage / 1e6, mode="clip")
+    #         save_path = (
+    #             self.session_path
+    #             / "alf"
+    #             / fov_name
+    #             / "mpciMeanImage.brainLocationIds_ccf_2017.npy"
+    #         )
+    #         np.save(
+    #             save_path,
+    #             brainLocationIds,
+    #         )
 
     #
     #    ###    ##       ##    ## ##     ##
@@ -1481,7 +1464,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         ----------
         ref_image_meta : dict
             Contents of this session's `referenceImage.meta.json`; updated in place with the
-            resolved ML/AP center and written back to disk.
+            resolved ML/AP center, and written back to disk when `write_outputs` is set.
         ref_session_ref_stack_mlapdv : numpy.ndarray
             Array with shape (h, w, 3) holding the (ml, ap, dv) coordinates in μm of each
             pixel of the reference session's reference image.
@@ -1490,6 +1473,11 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         -------
         numpy.ndarray
             The resolved (ml, ap, dv) coordinates, in mm, of the craniotomy center.
+
+        Notes
+        -----
+        The subject JSON is only updated when `register_data` is set and this session is the
+        reference session, i.e. the one whose reference stack was aligned to histology.
         """
         assert not self.one.offline
         # Get the pixel coordinates of the craniotomy center in the reference image
@@ -1595,11 +1583,26 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         return surgery
 
     def get_fov_map(self, raw_imaging_meta: dict) -> dict:
-        # fov_map is a dict of {fov_name:scanimage_uuid}
+        """Map this session's FOV names onto their ScanImage ROI UUIDs.
+
+        Parameters
+        ----------
+        raw_imaging_meta : dict
+            Contents of `_ibl_rawImagingData.meta.json`.
+
+        Returns
+        -------
+        dict
+            Map of FOV name, e.g. 'FOV_00', to the ScanImage ROI UUID of that FOV, named
+            after the order in which the FOVs appear in the metadata.
+        """
         return {f"FOV_{i:02}": fov["roiUUID"] for i, fov in enumerate(raw_imaging_meta["FOV"])}
 
     def delete_registered_fovs(self):
-        # wipe data present on alyx
+        """Delete this session's FOVs of the current provenance from Alyx.
+
+        Requires `self.provenance` to have been set, as `_run` does.
+        """
         present_fovs = self.one.alyx.rest(
             "fields-of-view",
             "list",
@@ -1618,6 +1621,9 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         Assumes field of view recorded perpendicular to objective.
         Assumes field of view is plane (negligible volume).
 
+        When `register_data` is not set nothing is sent to Alyx: the payloads are printed and
+        returned instead, with locally generated image stack UUIDs.
+
         Required Alyx fixtures:
             - experiments.ImagingType(name='mesoscope')
             - experiments.CoordinateSystem(name='IBL-Allen')
@@ -1631,7 +1637,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         check_integrity : bool
             Whether to check that the number of FOVs in Alyx matches the number in the meta data.
             A previous issue with multidepth recordings caused more FOVs to be registered than expected.
-            This check marks extraneous FOVs in Alyx with a data integrity error timestamp in the JSON field.
+            This check marks extraneous FOVs in Alyx with a data integrity error timestamp
+            in the JSON field. Only runs when `register_data` is set.
 
         Returns
         -------
@@ -1667,7 +1674,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             # Field of view
             fov_data.update({"name": f"FOV_{i:02}", "stack": stack_ids.get(fov["roiUUID"])})
             if not self.register_data:
-                print(fov_data)
+                _logger.debug(fov_data)
                 fov_data["location"] = []
                 alyx_fovs.append(fov_data)
             else:
@@ -1705,7 +1712,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             data["brain_region"] = np.unique(mean_image_ids).astype(int).tolist()
 
             if not self.register_data:
-                print(data)
+                _logger.debug(data)
                 fov_data["location"].append(data)
             else:
                 # Whether to patch or create a new location
@@ -1724,7 +1731,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                     loc = self.one.alyx.rest("fov-location", "create", data=data)
                 alyx_fovs[-1]["location"].append(loc)
 
-        if check_integrity and not self.register_data:
+        if check_integrity and self.register_data:
             # Update FOV JSON field for FOVs that do not exist in meta data
             if any(
                 extraneous := set(f["id"] for f in session_fovs)
@@ -1819,13 +1826,13 @@ class ROICoordinatesExtraction(MesoscopeTask):
 
         all_mlapdv = {}
         all_brain_ids = {}
-        fov_names = sorted((self.session_path / "alf").glob("FOV_*"))
+        fov_names = [path.name for path in sorted((self.session_path / "alf").glob("FOV_*"))]
 
         for fov_name in fov_names:
             fov_path = self.session_path / "alf" / fov_name
 
             # Load neuron centroids in pixel space
-            stack_pos_file = find_file(fov_path, f"mpciROIs.stackPos{sfx}*")
+            stack_pos_file = find_file(fov_path, "mpciROIs.stackPos*")
             stack_pos = alfio.load_file_content(stack_pos_file)
 
             # Load MeanImage mlapdv
