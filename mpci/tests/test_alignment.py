@@ -22,12 +22,7 @@ from one.alf.path import ALFPath
 from one.api import ONE
 from skimage.transform import EuclideanTransform
 
-from mpci.alignment.task import (
-    MesoscopeFOVAlignment,
-    Provenance,
-    ROICoordinatesExtraction,
-    find_file,
-)
+from mpci.alignment.task import MesoscopeFOVAlignment, Provenance, find_file
 
 from mpci.tests import TEST_DB, IntegrationTestCase
 
@@ -376,6 +371,9 @@ class TestDataLoading(AlignmentTestCase):
         expected = ref_meta["points"]
         self.assertEqual(expected, task.load_brain_surface_points(prefer="metadata"))
         self.assertEqual(expected, task.load_brain_surface_points(prefer="file"))
+        points_file = self.session_path / task.reference_collection / "referenceImage.points.json"
+        points_file.unlink()
+        task.load_brain_surface_points(prefer="file")
 
     def test_symlink_reference_session_reference_stack(self):
         """Test that the reference session's stack is symlinked into the patch folder."""
@@ -450,6 +448,122 @@ class TestDataLoading(AlignmentTestCase):
         fov_map = task.get_fov_map(meta)
         expected = {f"FOV_{i:02}": fov_uuid for i, fov_uuid in enumerate(FOV_UUIDS)}
         self.assertEqual(expected, fov_map)
+
+
+class TestAtlasRegisteredReferenceMlap(AlignmentTestCase):
+    """Tests for the retrieval of the reference session's atlas indices.
+
+    The tasks are built with `force`, so the retrieval runs through `ServerGlobusDataHandler`
+    rather than through `self.data_handler.__class__`. That keeps the handler patchable by
+    name, so no stand-in handler class is needed.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.histology_file = (
+            self.ref_session_path
+            / "raw_imaging_data_00"
+            / "reference"
+            / "referenceImage.mlapdv.npy"
+        )
+
+    def write_histology_file(self, *args, **kwargs) -> Path:
+        """Write the atlas indices where the retrieval expects to find them.
+
+        Accepts and ignores any arguments, so that it can stand in for a transfer.
+
+        Returns
+        -------
+        pathlib.Path
+            Path of the file written.
+        """
+        np.save(self.histology_file, np.zeros((*REF_STACK_SHAPE[1:], 3), dtype="uint16"))
+        return self.histology_file
+
+    def test_file_provided_by_the_data_handler(self):
+        """Test that a file the data handler put in place is returned as is."""
+        task = self.make_task(force=True)
+        self.write_histology_file()
+
+        with mock.patch("mpci.alignment.task.ServerGlobusDataHandler") as handler_class:
+            local_file = task._get_atlas_registered_reference_mlap()
+
+        self.assertEqual(self.histology_file, local_file)
+        # the handler is set up on the reference session, asking for the atlas indices
+        session_path, signature = handler_class.call_args[0]
+        self.assertEqual(self.ref_session_path, session_path)
+        self.assertEqual(
+            ["referenceImage.mlapdv.npy"],
+            [dataset.identifiers[-1] for dataset in signature["input_files"]],
+        )
+        handler_class.return_value.setUp.assert_called_once_with()
+        # neither fallback is needed
+        handler_class.return_value.globus.mv.assert_not_called()
+        task.one.alyx.download_file.assert_not_called()
+
+    def test_falls_back_to_globus(self):
+        """Test that a missing file is fetched by mounting the histology folder over Globus."""
+        task = self.make_task(force=True)
+        task.one.get_details.return_value = {"lab": "cortexlab"}
+
+        with mock.patch("mpci.alignment.task.ServerGlobusDataHandler") as handler_class:
+            globus = handler_class.return_value.globus
+            globus.endpoints = {"flatiron_cortexlab": {"id": "endpoint-uuid"}}
+            # the transfer is what puts the file in place
+            globus.mv.side_effect = self.write_histology_file
+            with self.assertLogs("mpci.alignment.task", "WARNING"):
+                local_file = task._get_atlas_registered_reference_mlap()
+
+        self.assertEqual(self.histology_file, local_file)
+        globus.add_endpoint.assert_called_once_with(
+            "endpoint-uuid", label="flatiron_histology", root_path="/histology/"
+        )
+        source, destination, remote, _ = globus.mv.call_args[0]
+        self.assertEqual(("flatiron_histology", "local"), (source, destination))
+        self.assertEqual(["cortexlab/SP000/2023-01-01/001/referenceImage.mlapdv.npy"], remote)
+        task.one.alyx.download_file.assert_not_called()
+
+    def test_falls_back_to_http(self):
+        """Test that a failing Globus transfer is followed by an HTTP download."""
+        task = self.make_task(force=True)
+        task.one.get_details.return_value = {"lab": "cortexlab"}
+        task.one.alyx.download_file.side_effect = self.write_histology_file
+
+        with mock.patch("mpci.alignment.task.ServerGlobusDataHandler") as handler_class:
+            # without a flatiron endpoint the transfer cannot even be set up
+            handler_class.return_value.globus.endpoints = {}
+            with self.assertLogs("mpci.alignment.task", "ERROR"):
+                local_file = task._get_atlas_registered_reference_mlap()
+
+        self.assertEqual(self.histology_file, local_file)
+        (remote_file,) = task.one.alyx.download_file.call_args[0]
+        self.assertIn(
+            "/histology/cortexlab/SP000/2023-01-01/001/referenceImage.mlapdv.npy", remote_file
+        )
+        self.assertEqual(
+            self.histology_file.parent, task.one.alyx.download_file.call_args[1]["target_dir"]
+        )
+
+    def test_popeye_reads_in_place(self):
+        """Test that on popeye the histology folder is addressed directly, without a transfer."""
+        task = self.make_task(location="popeye")
+        root_path = Path("/mnt/ceph")
+        task.data_handler = mock.MagicMock(root_path=root_path)
+        task.one.get_details.return_value = {"lab": "cortexlab"}
+
+        with mock.patch("mpci.alignment.task.ServerGlobusDataHandler") as handler_class:
+            local_file = task._get_atlas_registered_reference_mlap()
+
+        expected = (
+            root_path
+            / "histology"
+            / "cortexlab"
+            / "SP000/2023-01-01/001"
+            / "referenceImage.mlapdv.npy"
+        )
+        self.assertEqual(expected, local_file)
+        handler_class.assert_not_called()
+        task.one.alyx.download_file.assert_not_called()
 
 
 class TestValidation(AlignmentTestCase):
@@ -658,10 +772,9 @@ class TestProcessing(AlignmentTestCase):
         self.assertEqual(1 + 2 * N_FOV, len(outputs))
         for i in range(N_FOV):
             fov_path = self.session_path / "alf" / f"FOV_{i:02}"
-            with self.subTest(fov=fov_path.name):
-                self.assertTrue((fov_path / "mpciMeanImage.mlapdv_estimate.npy").exists())
-                expected = fov_path / "mpciMeanImage.brainLocationIds_ccf_2017_estimate.npy"
-                self.assertTrue(expected.exists())
+            self.assertTrue((fov_path / "mpciMeanImage.mlapdv_estimate.npy").exists())
+            expected = fov_path / "mpciMeanImage.brainLocationIds_ccf_2017_estimate.npy"
+            self.assertTrue(expected.exists())
 
     def test_run_histology(self):
         """Test the full task for an histology"""
@@ -688,10 +801,9 @@ class TestProcessing(AlignmentTestCase):
 
         for i in range(N_FOV):
             fov_path = self.session_path / "alf" / f"FOV_{i:02}"
-            with self.subTest(fov=fov_path.name):
-                self.assertTrue((fov_path / "mpciMeanImage.mlapdv.npy").exists())
-                expected = fov_path / "mpciMeanImage.brainLocationIds_ccf_2017.npy"
-                self.assertTrue(expected.exists())
+            self.assertTrue((fov_path / "mpciMeanImage.mlapdv.npy").exists())
+            expected = fov_path / "mpciMeanImage.brainLocationIds_ccf_2017.npy"
+            self.assertTrue(expected.exists())
 
 
 class TestAlyx(AlignmentTestCase):
@@ -918,170 +1030,6 @@ class TestAlyx(AlignmentTestCase):
         self.assertEqual([2317.2, 2862.7, 2317.3, 2862.7], location["x"])
         self.assertEqual([-1599.8, -1625.2, -2181.4, -2206.9], location["y"])
         self.assertEqual([-535.5, -748.7, -466.3, -679.4], location["z"])
-
-
-class ROIExtractionTestCase(unittest.TestCase):
-    """Base case providing a session holding the per-FOV inputs of the ROI extraction.
-
-    The mean image maps are linear in the pixel indices, so the coordinates expected for a ROI
-    can be computed from its pixel position alone.
-    """
-
-    n_px = 8
-    n_fov = 2
-
-    def setUp(self) -> None:
-        tempdir = tempfile.TemporaryDirectory()
-        self.addCleanup(tempdir.cleanup)
-        self.session_path = Path(
-            tempdir.name, "cortexlab", "Subjects", "SP000", "2023-03-03", "002"
-        )
-        (self.session_path / "raw_imaging_data_00").mkdir(parents=True)
-        shutil.copy(
-            RAW_IMAGING_META_FILE,
-            self.session_path / "raw_imaging_data_00" / "_ibl_rawImagingData.meta.json",
-        )
-
-        rows, columns = np.meshgrid(
-            np.arange(self.n_px, dtype=float), np.arange(self.n_px, dtype=float), indexing="ij"
-        )
-        # ml counts along the rows and ap along the columns, so that a coordinate identifies
-        # the pixel it was read from
-        self.mean_image_mlapdv = np.dstack([rows * 100.0, columns * -100.0, rows + columns])
-        self.mean_image_ids = (rows * 10 + columns).astype(int)
-        # one ROI per pixel of the diagonal, plus its plane index as the third column
-        diagonal = np.arange(self.n_px)
-        self.stack_pos = np.vstack([diagonal, diagonal[::-1], np.zeros_like(diagonal)]).T
-
-    def write_fov_inputs(self, suffix: str = "") -> None:
-        """Write the mean image maps and the ROI positions of every FOV.
-
-        Parameters
-        ----------
-        suffix : str
-            Provenance suffix of the mean image datasets, e.g. '_estimate'. The ROI positions
-            come from suite2p and carry no provenance, so they are never suffixed.
-        """
-        for i in range(self.n_fov):
-            fov_path = self.session_path / "alf" / f"FOV_{i:02}"
-            fov_path.mkdir(parents=True)
-            np.save(fov_path / f"mpciMeanImage.mlapdv{suffix}.npy", self.mean_image_mlapdv)
-            np.save(
-                fov_path / f"mpciMeanImage.brainLocationIds_ccf_2017{suffix}.npy",
-                self.mean_image_ids,
-            )
-            np.save(fov_path / "mpciROIs.stackPos.npy", self.stack_pos)
-
-    def make_task(self, **kwargs) -> ROICoordinatesExtraction:
-        """Instantiate the ROI extraction task on the session.
-
-        Parameters
-        ----------
-        **kwargs : dict
-            Keyword arguments overriding the defaults passed to `ROICoordinatesExtraction`.
-
-        Returns
-        -------
-        ROICoordinatesExtraction
-            A task writing its outputs, unless `dry` is overridden.
-        """
-        kwargs = {
-            "one": mock_one(),
-            "device_collection": "raw_imaging_data_00",
-            "dry": False,
-            **kwargs,
-        }
-        return ROICoordinatesExtraction(self.session_path, **kwargs)
-
-    def expected_mlapdv(self) -> np.ndarray:
-        """Return the coordinates the ROI positions should be resolved to.
-
-        Returns
-        -------
-        numpy.ndarray
-            Array of shape (n_roi, 3), read out of the mean image map by ROI pixel position.
-        """
-        rows, columns = self.stack_pos[:, :2].T
-        return self.mean_image_mlapdv[rows, columns]
-
-
-class TestROICoordinatesExtraction(ROIExtractionTestCase):
-    """Tests for the ROICoordinatesExtraction task."""
-
-    def test_init(self):
-        """Test that the task defaults to estimate provenance and to writing nothing."""
-        task = ROICoordinatesExtraction(
-            self.session_path, one=mock_one(), device_collection="raw_imaging_data_00"
-        )
-        self.assertIs(Provenance.ESTIMATE, task.provenance)
-        self.assertTrue(task.dry)
-        self.assertIs(
-            Provenance.HISTOLOGY, self.make_task(provenance=Provenance.HISTOLOGY).provenance
-        )
-
-    def test_signature(self):
-        """Test that the signature names the expected input and output datasets."""
-        task = self.make_task()
-        expected_inputs = {
-            "_ibl_rawImagingData.meta.json",
-            "mpciMeanImage.mlapdv*.npy",
-            "mpciMeanImage.brainLocationIds*.npy",
-            "mpciROIs.stackPos.npy",
-        }
-        actual = set(dataset.identifiers[-1] for dataset in task.signature["input_files"])
-        self.assertEqual(expected_inputs, actual)
-        expected_outputs = {"mpciROIs.mlapdv*.npy", "mpciROIs.brainLocationIds*.npy"}
-        actual = set(name for name, _, _ in task.signature["output_files"])
-        self.assertEqual(expected_outputs, actual)
-
-    def test_run(self):
-        """Test that every ROI is resolved by indexing the mean image maps of its FOV."""
-        self.write_fov_inputs()  # histology datasets carry no suffix
-        task = self.make_task(provenance=Provenance.HISTOLOGY)
-        outputs = task._run()
-
-        # one coordinate and one brain location dataset per FOV
-        self.assertEqual(2 * self.n_fov, len(outputs))
-        self.assertEqual(sorted(outputs), outputs)
-        for i in range(self.n_fov):
-            fov_path = self.session_path / "alf" / f"FOV_{i:02}"
-            with self.subTest(fov=fov_path.name):
-                mlapdv = np.load(fov_path / "mpciROIs.mlapdv.npy")
-                np.testing.assert_array_equal(self.expected_mlapdv(), mlapdv)
-
-                ids = np.load(fov_path / "mpciROIs.brainLocationIds_ccf_2017.npy")
-                rows, columns = self.stack_pos[:, :2].T
-                np.testing.assert_array_equal(self.mean_image_ids[rows, columns], ids)
-                # the brain locations are written as integers
-                self.assertTrue(np.issubdtype(ids.dtype, np.integer))
-
-    def test_run_dry(self):
-        """Test that a dry run returns the output paths without writing them."""
-        self.write_fov_inputs()
-        task = self.make_task(provenance=Provenance.HISTOLOGY, dry=True)
-        outputs = task._run()
-
-        self.assertEqual(2 * self.n_fov, len(outputs))
-        self.assertFalse([path for path in outputs if path.exists()])
-
-    def test_run_estimate_provenance(self):
-        """Test an estimate run, whose mean image datasets carry the provenance as a suffix.
-
-        The ROI positions stay unsuffixed, as they come from suite2p and have no provenance.
-        """
-        self.write_fov_inputs(suffix="_estimate")
-        task = self.make_task(provenance=Provenance.ESTIMATE)
-        outputs = task._run()
-
-        self.assertEqual(2 * self.n_fov, len(outputs))
-        for i in range(self.n_fov):
-            fov_path = self.session_path / "alf" / f"FOV_{i:02}"
-            with self.subTest(fov=fov_path.name):
-                mlapdv = np.load(fov_path / "mpciROIs.mlapdv_estimate.npy")
-                np.testing.assert_array_equal(self.expected_mlapdv(), mlapdv)
-                self.assertTrue(
-                    (fov_path / "mpciROIs.brainLocationIds_ccf_2017_estimate.npy").exists()
-                )
 
 
 if __name__ == "__main__":
