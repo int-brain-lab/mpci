@@ -19,6 +19,7 @@ from unittest import mock
 import numpy as np
 import tifffile
 from one.alf.path import ALFPath
+from one.api import ONE
 from skimage.transform import EuclideanTransform
 
 from mpci.alignment.task import (
@@ -27,6 +28,8 @@ from mpci.alignment.task import (
     ROICoordinatesExtraction,
     find_file,
 )
+
+from mpci.tests import TEST_DB, IntegrationTestCase
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "alignment"
 RAW_IMAGING_META_FILE = FIXTURE_PATH / "_ibl_rawImagingData.meta.json"
@@ -151,6 +154,10 @@ MLAPDV_CORNERS = {
 #         pass
 
 
+def test_one() -> ONE:
+    return ONE(**TEST_DB)
+
+
 def mock_one() -> mock.MagicMock:
     """Build a mocked online ONE instance.
 
@@ -180,9 +187,7 @@ class AlignmentTestCase(unittest.TestCase):
             write_session_fixture(path, with_points_file=True)
         self.session_path.joinpath("alf").mkdir()
 
-        self.one = mock_one()
-
-    def make_task(self, **kwargs) -> MesoscopeFOVAlignment:
+    def make_task(self, one=None, **kwargs) -> MesoscopeFOVAlignment:
         """Instantiate the task on the synthetic session, with signatures expanded.
 
         Parameters
@@ -196,6 +201,7 @@ class AlignmentTestCase(unittest.TestCase):
             A task with `write_outputs` and `register_data` off, `debug` off, and its
             `input_files`/`output_files` resolved.
         """
+        self.one = mock_one() if one is None else one
         kwargs = {
             "reference_session_path": self.ref_session_path,
             "one": self.one,
@@ -203,8 +209,7 @@ class AlignmentTestCase(unittest.TestCase):
             "write_outputs": False,
             "register_data": False,
             "debug": True,
-            **kwargs,
-        }
+        } | kwargs
         task = MesoscopeFOVAlignment(self.session_path, **kwargs)
         task.get_signatures()
         return task
@@ -252,6 +257,12 @@ class TestSetup(AlignmentTestCase):
         }
         actual = set(name for name, _, _ in task.signature["output_files"])
         self.assertEqual(expected_outputs, actual)
+
+    def test_fail_when_offline(self):
+        one = mock_one()
+        one.offline = True
+        with self.assertRaises(ValueError):
+            MesoscopeFOVAlignment(self.session_path, one=one)
 
 
 class TestDataLoading(AlignmentTestCase):
@@ -432,6 +443,14 @@ class TestDataLoading(AlignmentTestCase):
             find_file(reference_path, glob_pattern)
         self.assertIn(glob_pattern, str(context.exception))
 
+    def test_get_fov_map(self):
+        """Test that FOV names are mapped onto their ScanImage ROI UUIDs."""
+        task = self.make_task()
+        meta = task.load_raw_imaging_metadata()
+        fov_map = task.get_fov_map(meta)
+        expected = {f"FOV_{i:02}": fov_uuid for i, fov_uuid in enumerate(FOV_UUIDS)}
+        self.assertEqual(expected, fov_map)
+
 
 class TestValidation(AlignmentTestCase):
     """Tests for the input validation methods."""
@@ -454,6 +473,7 @@ class TestValidation(AlignmentTestCase):
             "reference_stack_is_compatible": True,
             "has_brain_surface_points_file": False,
             "has_brain_surface_points_meta": True,
+            "has_brain_surface_points": True,
             "has_histology": False,
         }
         self.assertEqual(expected, data_presence)
@@ -548,19 +568,74 @@ class TestProcessing(AlignmentTestCase):
             "mlapdv",
         }
         for fov_uuid in FOV_UUIDS:
-            with self.subTest(fov_uuid=fov_uuid):
-                coordinates = fovs_coordinates[fov_uuid]
-                self.assertTrue(expected_keys <= set(coordinates))
-                self.assertEqual((n_pixels, 2), coordinates["pixel"].shape)
-                self.assertEqual((n_pixels, 2), coordinates["um_global"].shape)
-                self.assertEqual((n_pixels, 3), coordinates["mlapdv"].shape)
-                self.assertFalse(np.isnan(coordinates["mlapdv"]).any())
+            # with self.subTest(fov_uuid=fov_uuid):
+            coordinates = fovs_coordinates[fov_uuid]
+            self.assertTrue(expected_keys <= set(coordinates))
+            self.assertEqual((n_pixels, 2), coordinates["pixel"].shape)
+            self.assertEqual((n_pixels, 2), coordinates["um_global"].shape)
+            self.assertEqual((n_pixels, 3), coordinates["mlapdv"].shape)
+            self.assertFalse(np.isnan(coordinates["mlapdv"]).any())
         # register_data is off, so nothing is written back to Alyx
         surgery_mock.assert_not_called()
 
-    def test_run(self):
+    def test_align_FOVs_fallback(self):
+        """Test that every FOV gets a full set of coordinates, with all corrections enabled
+        but not being able to load the corresponding datasets -> fallback to geometry based
+        alignment
+
+        Runs in debug mode, which downsamples the pixel grid of the real fixture geometry from
+        512**2 to a tractable number of positions.
+        """
+
+        task = self.make_task()
+        n_pixels = len(np.arange(N_PX_PER_FOV**2)[::DEBUG_DOWNSAMPLE])
+
+        atlas = mock.MagicMock()
+        # the surface lookup keeps the ML/AP columns and appends a DV column
+        atlas.get_dv_for_mlap.side_effect = lambda mlap: np.c_[mlap, np.full(len(mlap), -200.0)]
+        atlas.get_plane_at_point_mlap.return_value = (None, np.array([0.0, 0.0, 1.0]))
+
+        mock_data_presence = {
+            "has_raw_imaging_metadata": True,
+            "has_reference_stack": False,
+            "has_reference_session_reference_stack": False,
+            "has_brain_surface_points_file": False,
+            "reference_stack_is_compatible": False,
+            "has_brain_surface_points_meta": False,
+            "has_brain_surface_points": False,
+            "has_histology": False,
+        }
+
+        with (
+            mock.patch.object(task, "verify_data_presence", return_value=mock_data_presence),
+            mock.patch("mpci.alignment.task.ProjectionAtlas", return_value=atlas),
+            mock.patch.object(task, "update_surgery_json") as surgery_mock,
+            mock.patch(
+                "mpci.alignment.task.projections.project_coords_onto_atlas_surface",
+                # the projection turns (ml, ap) into (ml, ap, dv) on the atlas surface
+                side_effect=lambda coords, **kwargs: np.c_[coords, np.full(len(coords), -200.0)],
+            ),
+        ):
+            fovs_coordinates = task.align_FOVs(
+                use_histology=True, lateral_correct=True, tilt_correct=True, debug=True
+            )
+
+        self.assertEqual(set(FOV_UUIDS), set(fovs_coordinates))
+        for fov_uuid in FOV_UUIDS:
+            # with self.subTest(fov_uuid=fov_uuid):
+            coordinates = fovs_coordinates[fov_uuid]
+            # the surface projection is all that can be resolved without surface points
+            self.assertEqual({"pixel", "um_global", "mlapdv_on_surface"}, set(coordinates))
+            self.assertEqual((n_pixels, 2), coordinates["pixel"].shape)
+            self.assertEqual((n_pixels, 2), coordinates["um_global"].shape)
+            self.assertEqual((n_pixels, 3), coordinates["mlapdv_on_surface"].shape)
+            self.assertFalse(np.isnan(coordinates["mlapdv_on_surface"]).any())
+        # register_data is off, so nothing is written back to Alyx
+        surgery_mock.assert_not_called()
+
+    def test_run_estimate(self):
         """Test the full task for an ESTIMATE run, i.e. without histology available."""
-        task = self.make_task(write_outputs=True)
+        task = self.make_task(write_outputs=True, register_data=True)
         n_pixels = N_PX_PER_FOV**2
         fovs_coordinates = {
             fov_uuid: {"mlapdv": np.tile(np.arange(n_pixels)[:, None], (1, 3)).astype(float)}
@@ -588,21 +663,43 @@ class TestProcessing(AlignmentTestCase):
                 expected = fov_path / "mpciMeanImage.brainLocationIds_ccf_2017_estimate.npy"
                 self.assertTrue(expected.exists())
 
+    def test_run_histology(self):
+        """Test the full task for an histology"""
+        task = self.make_task(write_outputs=True, register_data=False)
+        n_pixels = N_PX_PER_FOV**2
+        fovs_coordinates = {
+            fov_uuid: {"mlapdv": np.tile(np.arange(n_pixels)[:, None], (1, 3)).astype(float)}
+            for fov_uuid in FOV_UUIDS
+        }
+
+        atlas = mock.MagicMock()
+        atlas.get_labels.return_value = np.ones((N_PX_PER_FOV, N_PX_PER_FOV), dtype=int)
+        # subject_json = {"json": {"craniotomy_00": {"center": [2.5, -2.3]}}}
+        with (
+            # mock.patch.object(task.one.alyx, "rest", return_value=subject_json),
+            mock.patch.object(task, "load_histology", return_value=(histology_mlapdv(), None)),
+            mock.patch.object(task, "align_FOVs", return_value=fovs_coordinates) as align_mock,
+            mock.patch("mpci.alignment.task.MRITorontoAtlas", return_value=atlas),
+        ):
+            _ = task._run()
+
+        self.assertIs(Provenance.HISTOLOGY, task.provenance)
+        align_mock.assert_called_once()
+
+        for i in range(N_FOV):
+            fov_path = self.session_path / "alf" / f"FOV_{i:02}"
+            with self.subTest(fov=fov_path.name):
+                self.assertTrue((fov_path / "mpciMeanImage.mlapdv.npy").exists())
+                expected = fov_path / "mpciMeanImage.brainLocationIds_ccf_2017.npy"
+                self.assertTrue(expected.exists())
+
 
 class TestAlyx(AlignmentTestCase):
     """Tests for the methods writing to Alyx."""
 
-    def test_get_fov_map(self):
-        """Test that FOV names are mapped onto their ScanImage ROI UUIDs."""
-        task = self.make_task()
-        meta = task.load_raw_imaging_metadata()
-        fov_map = task.get_fov_map(meta)
-        expected = {f"FOV_{i:02}": fov_uuid for i, fov_uuid in enumerate(FOV_UUIDS)}
-        self.assertEqual(expected, fov_map)
-
     def test_update_craniotomy_center(self):
         """Test that the resolved craniotomy center is derived and returned."""
-        task = self.make_task(register_data=True, write_outputs=True)
+        task = self.make_task(register_data=False, write_outputs=True)
         ref_image_meta = task.load_reference_stack_metadata()
         ref_stack_mlapdv = histology_mlapdv() * 1e3  # μm -> the method divides by 1e3
 
@@ -620,6 +717,26 @@ class TestAlyx(AlignmentTestCase):
 
         # register_data is off, so the subject JSON is left untouched
         update_mock.assert_not_called()
+
+    def test_update_craniotomy_center_reference_session(self):
+        """Test updating the reference session JSON."""
+        task = self.make_task(
+            register_data=True, write_outputs=True, reference_session_path=self.session_path
+        )
+        ref_image_meta = task.load_reference_stack_metadata()
+        ref_stack_mlapdv = histology_mlapdv() * 1e3  # μm -> the method divides by 1e3
+
+        subject_json = {"json": {"craniotomy_00": {"center": [2.5, -2.3]}}}
+        with (
+            mock.patch.object(task.one.alyx, "rest", return_value=subject_json),
+            mock.patch.object(task.one.alyx, "json_field_update") as update_mock,
+        ):
+            craniotomy_resolved = task.update_craniotomy_center(ref_image_meta, ref_stack_mlapdv)
+
+        self.assertEqual(3, craniotomy_resolved.size)
+        # the metadata is updated in place with the resolved center
+        self.assertEqual(craniotomy_resolved[0], ref_image_meta["centerMM"]["ML_resolved"])
+        self.assertEqual(craniotomy_resolved[1], ref_image_meta["centerMM"]["AP_resolved"])
 
     def test_update_surgery_json(self):
         """Test that the surface normal is added to the craniotomy the metadata center matches.
