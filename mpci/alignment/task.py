@@ -946,6 +946,12 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             and loaded["has_reference_stack"].shape
             == loaded["has_reference_session_reference_stack"].shape
         )
+
+        # brain surface points
+        data_presence["has_brain_surface_points"] = (
+            data_presence["has_brain_surface_points_file"]
+            or data_presence["has_brain_surface_points_meta"]
+        )
         return data_presence
 
     #
@@ -1137,7 +1143,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         self,
         use_histology: bool = True,
         lateral_correct: bool = True,
-        tilt_correct: bool = False,
+        tilt_correct: bool = True,
         debug: bool = False,  # debug flag: just downsample
     ) -> dict[str, dict[str, np.ndarray]]:
         """Assign MLAPDV atlas coordinates to this session's imaging-plane pixels.
@@ -1180,43 +1186,35 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         ref_img_stack = self.load_reference_stack()
         ref_img_meta = self.load_reference_stack_metadata()
         fov_map = self.get_fov_map(raw_imaging_meta)
+        data_presence = self.verify_data_presence()
 
         # attempting to load optional datasets and adjusting the pipeline accordingly
-        if use_histology:
-            try:
-                ref_img_histo_mlapdv, ref_img_histo_idx = self.load_histology()
-            except Exception as e:
-                _logger.warning(
-                    f"attempted to use histology, but failed with {e.__class__.__name__}"
-                )
-                use_histology = False
+        if use_histology and not data_presence["has_histology"]:
+            _logger.warning("configured to use histology, but no histology could be loaded.")
+            use_histology = False
 
-        try:
-            brain_surface_points = self.load_brain_surface_points(prefer="metadata")
-            has_brain_surface_points = True
-        except Exception as e:
+        if tilt_correct and not data_presence["has_brain_surface_points"]:
             _logger.warning(
-                f"attempted to load brain surface points, but failed with {e.__class__.__name__}"
+                "configured to for tilt correction, but no brain surface could be loaded."
             )
-            has_brain_surface_points = False
-            if tilt_correct:
-                _logger.warning(
-                    "configured to use brain surface for tilt correction, fallback to no tilt correction"
-                )
-                tilt_correct = False
+            tilt_correct = False
 
         if lateral_correct:
-            try:
-                ref_sess_ref_stack = self.load_reference_session_reference_stack()
-                if ref_sess_ref_stack.shape != ref_img_stack.shape:
-                    _logger.warning(
-                        f"the reference stack of the reference session can be loaded, but is of incompatible shape: {ref_sess_ref_stack.shape} and the session: {ref_img_stack.shape}"
-                    )
-                    lateral_correct = False
-
-            except Exception as e:
+            if not data_presence["has_reference_stack"]:
                 _logger.warning(
-                    f"attempted to correct for session to session lateral shifts, but failed with {e.__class__.__name__}"
+                    "configured to do lateral correction, but found no reference stack"
+                )
+                lateral_correct = False
+            if not data_presence["has_reference_session_reference_stack"]:
+                _logger.warning(
+                    "configured to do lateral correction, but reference session has no \
+                        reference stack"
+                )
+                lateral_correct = False
+            if not data_presence["reference_stack_is_compatible"]:
+                _logger.warning(
+                    "configured to do lateral correction, but the referrence session \
+                        reference stack is of incompatible shape"
                 )
                 lateral_correct = False
 
@@ -1272,7 +1270,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                 "um_global",
             )
 
-        if has_brain_surface_points:
+        if data_presence["has_brain_surface_points"]:
+            brain_surface_points = self.load_brain_surface_points(prefer="metadata")
             # this normal is expressed in the coordinate system of the reference stack
             p_surface, n_surface, dv_avg = projections.get_brain_surface_normal(
                 brain_surface_points,
@@ -1293,7 +1292,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                     fov_depths[fov_uuid] - dv_avg
                 )
 
-        if tilt_correct and has_brain_surface_points:
+        if tilt_correct and data_presence["has_brain_surface_points"]:
             # this adds to the fovs_coordinates dictionary:
             # 'um_corrected' - for apparent xy shift based on tilt
             # 'dv_below_surface_corrected'  - for apparent z shift based on tilt
@@ -1312,6 +1311,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             )
 
         if use_histology:
+            ref_img_histo_mlapdv, _ = self.load_histology()
             histo_interp_fn = self.interpolate_histology(
                 ref_img_histo_mlapdv, sigma=self.interpolation_sigma
             )
@@ -1384,7 +1384,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
             # project down into the brain; skipped entirely if no brain surface points are
             # available, since depth below the surface is undefined without them
-            if has_brain_surface_points:
+            if data_presence["has_brain_surface_points"]:
                 if tilt_correct:
                     depths = fovs_coordinates[uuid]["dv_below_surface_corrected"]
                 else:
