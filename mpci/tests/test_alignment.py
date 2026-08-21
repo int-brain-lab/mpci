@@ -126,33 +126,6 @@ MLAPDV_CORNERS = {
 }
 
 
-# class StubDataHandler:
-#     """A stand-in for an ibllib data handler that does not transfer anything.
-
-#     `_get_atlas_registered_reference_mlap` builds a further handler from
-#     `self.data_handler.__class__`, so a real class with a matching constructor is needed: a
-#     `MagicMock` would read those arguments as `spec` and `wraps` and end up without a `setUp`.
-#     Methods that only read `root_path` or `patch_path` do not need this.
-#     """
-
-#     def __init__(self, session_path: Path, signature: dict, one=None):
-#         """Store the arguments a real data handler would be constructed with."""
-#         self.session_path = session_path
-#         self.signature = signature
-#         self.one = one
-#         # the root holds the lab folders, i.e. it is the parent of '<lab>/Subjects/...'
-#         self.root_path = Path(session_path).parents[4]
-#         self.patch_path = self.root_path / "patch"
-
-#     def setUp(self) -> None:
-#         """Do nothing, standing in for the data transfer of a real handler."""
-#         pass
-
-
-def test_one() -> ONE:
-    return ONE(**TEST_DB)
-
-
 def mock_one() -> mock.MagicMock:
     """Build a mocked online ONE instance.
 
