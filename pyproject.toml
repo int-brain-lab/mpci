@@ -12,7 +12,7 @@ authors = [
 requires-python = ">=3.10"
 license = {text = "MIT"}
 dependencies = [
-    #"plane2brain @ git+https://github.com/int-brain-lab/plane2brain.git",
+    "plane2brain @ git+https://github.com/int-brain-lab/plane2brain.git",
     "ibllib @ git+https://github.com/int-brain-lab/ibllib.git@ci",
     "numpy",
     "pandas",
