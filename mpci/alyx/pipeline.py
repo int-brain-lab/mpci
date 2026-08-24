@@ -8,7 +8,7 @@ from ibllib.pipes.dynamic_pipeline import _get_sync_config
 
 from mpci.alyx.tasks import MesoscopeRegisterSnapshots
 from mpci.suite2p.task import MesoscopePreprocess
-from mpci.chronic.registration.task import MesoscopeFOV
+from mpci.alignment.task import MesoscopeFOVAlignment, ROICoordinatesExtraction
 from mpci.sync.task import MesoscopeSync
 from mpci.scanimage.task import MesoscopeCompress
 
@@ -49,8 +49,10 @@ def _(acquisition_description: dict, session_path=None, one=None, **kwargs):
         session_path=session_path, one=one, **kwargs, **mscope_kwargs)
     tasks['MesoscopePreprocess'] = type('MesoscopePreprocess', (MesoscopePreprocess,), {})(
         session_path=session_path, one=one, **kwargs, **mscope_kwargs)
-    tasks['MesoscopeFOV'] = type('MesoscopeFOV', (MesoscopeFOV,), {})(
+    tasks['MesoscopeFOVAlignment'] = type('MesoscopeFOVAlignment', (MesoscopeFOVAlignment,), {})(
         session_path=session_path, one=one, **kwargs, **mscope_kwargs, parents=[tasks['MesoscopePreprocess']])
+    tasks['ROICoordinatesExtraction'] = type('ROICoordinatesExtraction', (ROICoordinatesExtraction,), {})(
+        session_path=session_path, one=one, **kwargs, **mscope_kwargs, parents=[tasks['MesoscopeFOVAlignment']])
     tasks['MesoscopeSync'] = type('MesoscopeSync', (MesoscopeSync,), {})(
         session_path=session_path, one=one, **kwargs, **mscope_kwargs, **(sync_kwargs or {}))
     tasks['MesoscopeCompress'] = type('MesoscopeCompress', (MesoscopeCompress,), {})(
