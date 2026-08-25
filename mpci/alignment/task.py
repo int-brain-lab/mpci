@@ -429,6 +429,9 @@ class MesoscopeFOVAlignment(MesoscopeTask):
     def infer_reference_collection(session_path: str | Path) -> str:
         """Find the collection that holds a session's reference stack.
 
+        Only imaging bouts named `raw_imaging_data_??`, i.e. carrying a two digit suffix, are
+        considered.
+
         Parameters
         ----------
         session_path : str or pathlib.Path
@@ -445,23 +448,29 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         ------
         AssertionError
             If the session path does not exist.
-        IndexError
-            If no imaging bout holds a reference folder.
+        FileNotFoundError
+            If the session holds no imaging bout, or if none of its imaging bouts holds a
+            reference folder.
         """
         session_path = Path(session_path)
-        assert session_path.exists()
-        collections = [
-            c
-            for c in session_path.glob("raw_imaging_data_*")
-            if c.is_dir() and (c / "reference").exists()
-        ]
-        if len(collections) > 1:
+        raw_imaging_collections = list(session_path.glob("raw_imaging_data_??"))
+        if len(raw_imaging_collections) == 0:
+            raise FileNotFoundError("no raw imaging collections found")
+        collections_with_ref = list(
+            col
+            for col in raw_imaging_collections
+            if (col / "reference").exists() and (col / "reference").is_dir()
+        )
+        if len(collections_with_ref) == 0:
+            raise FileNotFoundError(
+                "no reference collection found for any of the raw imaging collections"
+            )
+        if len(collections_with_ref) >= 1:
             _logger.warning(
                 f"number of collections with reference stacks is: \
-                    {len(collections)} - taking the last one"
+                    {len(collections_with_ref)} - taking the last one"
             )
-
-        return collections[-1].parts[-1] + "/reference"
+        return collections_with_ref[-1].parts[-1] + "/reference"
 
     def get_raw_imaging_metadata_paths(self) -> list[Path]:
         """Find this session's raw imaging metadata files, one per imaging bout.

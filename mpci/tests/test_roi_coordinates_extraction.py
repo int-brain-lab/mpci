@@ -180,5 +180,43 @@ class TestROICoordinatesExtraction(ROIExtractionTestCase):
                 )
 
 
+# Integration test, kept here with the rest of the ROI extraction tests. To revive it,
+# import the session fixtures it relies on:
+#     from mpci.tests.test_alignment_integration import TestMesoscopeFOVAlignment
+# NB: inheriting that class also re-runs all of its own tests under this name; inherit
+# IntegrationTestCase and repeat the little setUp it needs instead.
+# class TestROICoordinatesExtractionIntegration(TestMesoscopeFOVAlignment):
+#     """Test that the ROI extraction composes with the alignment task."""
+
+#     def test_run_after_alignment(self):
+#         """Test that the ROI task reads the datasets the alignment task just wrote.
+
+#         The two tasks agree on the provenance suffixes only by convention, so running them
+#         back to back is the only way to catch a mismatch.
+#         """
+#         alignment = self.make_task()
+#         self.assertEqual(0, alignment.run(), alignment.log)
+
+#         stack_pos_files = sorted(
+#             self.session_path.joinpath("alf").rglob("mpciROIs.stackPos.npy")
+#         )
+#         if not stack_pos_files:
+#             self.skipTest("no suite2p ROI positions in this session")
+
+#         task = ROICoordinatesExtraction(
+#             self.session_path, one=self.one, provenance=alignment.provenance, dry=False
+#         )
+#         self.assertEqual(0, task.run(), task.log)
+
+#         suffix = "" if alignment.provenance is Provenance.HISTOLOGY else "_estimate"
+#         for fov_path in sorted(path.parent for path in stack_pos_files):
+#             with self.subTest(fov=fov_path.name):
+#                 rois = alfio.load_object(fov_path, "mpciROIs")
+#                 n_roi = len(rois["stackPos"])
+#                 self.assertEqual((n_roi, 3), rois[f"mlapdv{suffix}"].shape)
+#                 self.assertEqual(n_roi, len(rois[f"brainLocationIds_ccf_2017{suffix}"]))
+#                 self.assertFalse(np.isnan(rois[f"mlapdv{suffix}"]).any())
+
+
 if __name__ == "__main__":
     unittest.main()
