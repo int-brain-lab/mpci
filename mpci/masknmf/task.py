@@ -3,6 +3,7 @@
 Two tasks are defined: the first ensures the motion corrected bin files are extracted,
 the second runs masknmf on the extracted files.
 """
+
 import os
 from typing import *
 import logging
@@ -15,15 +16,13 @@ from mpci.suite2p.task import MesoscopePreprocess
 from mpci.alyx.tasks import MesoscopeTask
 import sparse
 
-logger = logging.getLogger('ibllib.' + __name__)
+logger = logging.getLogger("ibllib." + __name__)
 
 
 class MotionBinDataset:
     """Load a suite2p data.bin imaging registration file."""
 
-    def __init__(self,
-                 data_path: Union[str, Path],
-                 metadata_path: Union[str, Path]):
+    def __init__(self, data_path: Union[str, Path], metadata_path: Union[str, Path]):
         """
         Load a suite2p data.bin imaging registration file.
 
@@ -36,7 +35,7 @@ class MotionBinDataset:
         self.ops_path = Path(metadata_path)
         self._dtype = np.int16
         self._shape = self._compute_shape()
-        self.data = np.memmap(self.bin_path, mode='r', dtype=self.dtype, shape=self.shape)
+        self.data = np.memmap(self.bin_path, mode="r", dtype=self.dtype, shape=self.shape)
 
     @property
     def dtype(self) -> np.dtype:
@@ -62,7 +61,7 @@ class MotionBinDataset:
     def _compute_shape(self):
         """
         Loads the suite2p ops file to retrieve the dimensions of the data.bin file. This is now lazily loaded from a
-        zip file
+        zip file.
 
         Returns
         -------
@@ -71,14 +70,16 @@ class MotionBinDataset:
         """
         _, ext_path = os.path.splitext(self.ops_path)
         if ext_path == ".zip":
-            s2p_ops = np.load(self.ops_path, allow_pickle = True)['ops'].item()
+            s2p_ops = np.load(self.ops_path, allow_pickle=True)["ops"].item()
         elif ext_path == ".npy":
-            s2p_ops = np.load(self.ops_path, allow_pickle = True).item()
+            s2p_ops = np.load(self.ops_path, allow_pickle=True).item()
         else:
             raise ValueError("The file name should either be zip or npy")
-        return s2p_ops['nframes'], s2p_ops['Ly'], s2p_ops['Lx']
+        return s2p_ops["nframes"], s2p_ops["Ly"], s2p_ops["Lx"]
 
-    def __getitem__(self, item: Union[int, list, np.ndarray, Tuple[Union[int, np.ndarray, slice, range]]]):
+    def __getitem__(
+        self, item: Union[int, list, np.ndarray, Tuple[Union[int, np.ndarray, slice, range]]]
+    ):
         return self.data[item].copy()
 
 
@@ -90,37 +91,41 @@ class Suite2pMotionCorrection(MesoscopePreprocess):
         signature = super().signature
         # signature['input_files'].append(('_suite2p_ROIData.raw.zip', 'alf/FOV*', False))
         # Discard all outputs but the motion corrected bin files
-        signature['output_files'] = [
-            ('imaging.frames_motionRegistered.bin', 'suite2p/plane*', True),
-            ('ops.npy', 'suite2p/plane*', True)]
+        signature["output_files"] = [
+            ("imaging.frames_motionRegistered.bin", "suite2p/plane*", True),
+            ("ops.npy", "suite2p/plane*", True),
+        ]
         return signature
 
     def _run(self, roidetect=False, rename_files=True, **kwargs):
         # Run the parent method to extract the motion corrected bin files
-        out = super()._run(roidetect=False, rename_files=rename_files, **kwargs)
+        super()._run(roidetect=False, rename_files=rename_files, **kwargs)
 
     def _rename_outputs(self, suite2p_dir, frameQC_names, frameQC, rename_dict=None):
         for plane_dir in self._get_plane_paths(suite2p_dir):
             # TODO Can extract ops from zip if needed
-            assert plane_dir.joinpath('ops.npy').exists(), f'Expected ops.npy file in {plane_dir} not found.'
+            assert plane_dir.joinpath("ops.npy").exists(), (
+                f"Expected ops.npy file in {plane_dir} not found."
+            )
 
-            renamed = plane_dir.joinpath('imaging.frames_motionRegistered.bin')
+            renamed = plane_dir.joinpath("imaging.frames_motionRegistered.bin")
             if renamed.exists():
                 continue
             # Rename the registered bin file
-            if (bin_file := plane_dir.joinpath('data.bin')).exists():
+            if (bin_file := plane_dir.joinpath("data.bin")).exists():
                 bin_file.rename(renamed)
 
 
 class MasknmfPreprocess(MesoscopeTask):
     """This pipeline does the following right now:
-        1. Run motion correction + save out registered bin files using suite2p
-        2. Compress + Denoise these .bin files
-        3. Run signal detection on these bin files"""
+    1. Run motion correction + save out registered bin files using suite2p
+    2. Compress + Denoise these .bin files
+    3. Run signal detection on these bin files.
+    """
 
     def __init__(self, session_path, device_collection=None, **kwargs):
         if device_collection is None:
-            device_collection = 'suite2p/plane*'
+            device_collection = "suite2p/plane*"
         super().__init__(session_path, device_collection=device_collection, **kwargs)
 
     @property
@@ -129,29 +134,54 @@ class MasknmfPreprocess(MesoscopeTask):
         I, O = ExpectedDataset.input, ExpectedDataset.output
         try:
             n = int(self.device_collection.split("plane")[-1])
-            alf_collection = f'alf/FOV_{n:02d}'
+            alf_collection = f"alf/FOV_{n:02d}"
         except ValueError:
-            alf_collection = 'alf/FOV_??'
-        signature['input_files'] = [
-            I('imaging.frames_motionRegistered.bin', self.device_collection, True, unique=False),
-            I('ops.npy', self.device_collection, False, unique=False), #| I('_suite2p_ROIData.raw.zip', alf_collection, True),
-            I('mpci.times.npy', alf_collection, True, unique=False),]
+            alf_collection = "alf/FOV_??"
+        signature["input_files"] = [
+            I("imaging.frames_motionRegistered.bin", self.device_collection, True, unique=False),
+            I(
+                "ops.npy", self.device_collection, False, unique=False
+            ),  #| I('_suite2p_ROIData.raw.zip', alf_collection, True),
+            I("mpci.times.npy", alf_collection, True, unique=False),
+        ]
         # TODO Move these to alf/FOV_XX/masknmf when stable
-        signature['output_files'] = [
-            O('demixing.hdf5', f'{self.device_collection}/masknmf_output', True, unique=False),
-            O('mpciROIs.masks.sparse_npz', f'{self.device_collection}/masknmf_output', True, unique=False),
-            O('mpciROIs.stackPos.npy', f'{self.device_collection}/masknmf_output', True, unique=False),
-            O('mpci.ROIActivityF.npy', f'{self.device_collection}/masknmf_output', True, unique=False),
-            O('mpci.ROIActivityDeconvolved.npy', f'{self.device_collection}/masknmf_output', True, unique=False),
-            ]
+        signature["output_files"] = [
+            O("demixing.hdf5", f"{self.device_collection}/masknmf_output", True, unique=False),
+            O(
+                "mpciROIs.masks.sparse_npz",
+                f"{self.device_collection}/masknmf_output",
+                True,
+                unique=False,
+            ),
+            O(
+                "mpciROIs.stackPos.npy",
+                f"{self.device_collection}/masknmf_output",
+                True,
+                unique=False,
+            ),
+            O(
+                "mpci.ROIActivityF.npy",
+                f"{self.device_collection}/masknmf_output",
+                True,
+                unique=False,
+            ),
+            O(
+                "mpci.ROIActivityDeconvolved.npy",
+                f"{self.device_collection}/masknmf_output",
+                True,
+                unique=False,
+            ),
+        ]
         return signature
-    
+
     def deconv_all_traces(self, trace_matrix):
         """
         Runs OASIS deconvolution on calcium imaging traces
         Args:
-            trace_matrix (np.ndarray): Shape (num_frames, num_signals)
-        Returns:
+            trace_matrix (np.ndarray): Shape (num_frames, num_signals).
+
+        Returns
+        -------
             deconv_output (np.ndarray): Shape (num_frames, num_signals)
         """
         from oasis.functions import deconvolve
@@ -169,13 +199,17 @@ class MasknmfPreprocess(MesoscopeTask):
         Takes as input the masknmf .hdf5 file and outputs. Uses oasis to deconvolve the traces, and outputs key numpy arrays
         for downstream analysis
         Args:
-            demixing_results (masknmf.DemixingResults)
-        Returns:
+            demixing_results (masknmf.DemixingResults).
+
+        Returns
+        -------
             fluorescence_traces (np.ndarray). Shape (num_frames, num_signals). The extracted fluorescence traces from masknmf.
             deconvolved_traces (np.ndarray). Shape (num_frames, num_signals). The result of running oasis deconvolution on fluorescence_traces
             spatial_footprints (sparse.GCXS). Shape (num_signals, fov height, fov width)
         """
-        fluorescence_traces = np.ascontiguousarray(demixing_results.ac_array.export_c(), dtype=np.float64)
+        fluorescence_traces = np.ascontiguousarray(
+            demixing_results.ac_array.export_c(), dtype=np.float64
+        )
         deconv_traces = self.deconv_all_traces(fluorescence_traces)
         spatial_sparse = demixing_results.ac_array.a
         frames, height, width = demixing_results.shape
@@ -193,67 +227,79 @@ class MasknmfPreprocess(MesoscopeTask):
         # Stack indices as (ndim, nnz)
         final_ind = np.vstack([col_indices, height_indices, width_indices])
         spatial_footprints = sparse.COO(final_ind, values, shape=(num_neurons, height, width))
-        spatial_footprints = spatial_footprints.asformat('gcxs')
-        return fluorescence_traces.astype(np.float32), deconv_traces.astype(np.float32), spatial_footprints
+        spatial_footprints = spatial_footprints.asformat("gcxs")
+        return (
+            fluorescence_traces.astype(np.float32),
+            deconv_traces.astype(np.float32),
+            spatial_footprints,
+        )
 
     def _run(self, roidetect=False, rename_files=True, **kwargs):
 
         out = []
         _, bin_files, _ = self.input_files[0].find_files(self.session_path)
-        
-        for bin_file in bin_files:            
-            metadata_file = bin_file.with_name('ops.npy')
+
+        for bin_file in bin_files:
+            metadata_file = bin_file.with_name("ops.npy")
             moco_data = MotionBinDataset(bin_file, metadata_file)
-            (out_path := bin_file.parent.joinpath('masknmf_output')).mkdir(exist_ok=True)
-            out_demix_path = out_path / 'demixing.hdf5'
-            out_roi_masks = out_path / 'mpciROIs.masks.sparse_npz'
-            out_stack_pos = out_path / 'mpciROIs.stackPos.npy'
-            out_fluorescence_traces = out_path / 'mpci.ROIActivityF.npy'
-            out_deconvolved_traces = out_path / 'mpci.ROIActivityDeconvolved.npy'
-            
+            (out_path := bin_file.parent.joinpath("masknmf_output")).mkdir(exist_ok=True)
+            out_demix_path = out_path / "demixing.hdf5"
+            out_roi_masks = out_path / "mpciROIs.masks.sparse_npz"
+            out_stack_pos = out_path / "mpciROIs.stackPos.npy"
+            out_fluorescence_traces = out_path / "mpci.ROIActivityF.npy"
+            out_deconvolved_traces = out_path / "mpci.ROIActivityDeconvolved.npy"
+
             # FIXME this is a hack
-            out_motion_corrected = out_demix_path.with_stem('moco_rewrite_masknmf')
+            out_motion_corrected = out_demix_path.with_stem("moco_rewrite_masknmf")
             if out_motion_corrected.exists():
-                logger.info(f'Removing existing motion correction file at {out_motion_corrected}')
+                logger.info(f"Removing existing motion correction file at {out_motion_corrected}")
                 out_motion_corrected.unlink()
-            out_compressed = out_demix_path.with_stem('compressed')
+            out_compressed = out_demix_path.with_stem("compressed")
             if out_compressed.exists():
-                logger.info(f'Removing existing compressed file at {out_compressed}')
+                logger.info(f"Removing existing compressed file at {out_compressed}")
                 out_compressed.unlink()
             if out_demix_path.exists():
-                logger.info(f'Removing existing demixing file at {out_demix_path}')
+                logger.info(f"Removing existing demixing file at {out_demix_path}")
                 out_demix_path.unlink()
 
             pipeline = masknmf.TwoPhotonCalciumPipeline(
-                motion_correct_config="skip", 
+                motion_correct_config="skip",
                 compress_config=masknmf.CompressDenoiseConfig(block_sizes=(32, 32)),
-                frame_batch_size=300, 
-                load_into_ram = True,
+                frame_batch_size=300,
+                load_into_ram=True,
                 outpath_motion_correction=out_motion_corrected,  # This will eventually be removed,
                 outpath_compression=out_compressed,
-                outpath_demixing=out_demix_path)
+                outpath_demixing=out_demix_path,
+            )
             # Get the frame rate for the FOV
-            i = int(bin_file.parent.name.split('plane')[1])
-            ts = np.load(self.session_path.joinpath(f'alf/FOV_{i:02d}/mpci.times.npy'))
+            i = int(bin_file.parent.name.split("plane")[1])
+            ts = np.load(self.session_path.joinpath(f"alf/FOV_{i:02d}/mpci.times.npy"))
             Fs = 1 / np.mean(np.diff(ts))
-            logger.info(f'Running masknmf on {bin_file} with frame rate {Fs:.2f} Hz')
-            demixing_results = pipeline.run(moco_data, 
-                                            Fs, 
-                                            exclude_border_radius=8,
-                                            remove_intermediates=True)
+            logger.info(f"Running masknmf on {bin_file} with frame rate {Fs:.2f} Hz")
+            demixing_results = pipeline.run(
+                moco_data, Fs, exclude_border_radius=8, remove_intermediates=True
+            )
 
-            logger.info(f'Saving results for FOV_{i:02}')
+            logger.info(f"Saving results for FOV_{i:02}")
             F, Deconv_F, masks = self._format_to_mpci(demixing_results)
             np.save(out_fluorescence_traces, F)
             np.save(out_deconvolved_traces, Deconv_F)
-            with open(out_roi_masks, 'wb') as fp:
+            with open(out_roi_masks, "wb") as fp:
                 sparse.save_npz(fp, masks)
-            xy_centers = demixing_results.ac_array.centers.cpu().numpy()  # shape (num_rois, 2) tensor
+            xy_centers = (
+                demixing_results.ac_array.centers.cpu().numpy()
+            )  # shape (num_rois, 2) tensor
             np.save(out_stack_pos, np.c_[xy_centers, np.zeros(len(xy_centers))])
-            out.extend([out_demix_path, out_fluorescence_traces, out_deconvolved_traces, out_roi_masks, out_stack_pos])
+            out.extend(
+                [
+                    out_demix_path,
+                    out_fluorescence_traces,
+                    out_deconvolved_traces,
+                    out_roi_masks,
+                    out_stack_pos,
+                ]
+            )
         return out
-
-
 
 
 #

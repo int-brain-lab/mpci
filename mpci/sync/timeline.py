@@ -16,8 +16,8 @@ _logger = logging.getLogger(__name__)
 class MesoscopeSyncTimeline(BaseExtractor):
     """Extraction of mesoscope imaging times."""
 
-    var_names = ('mpci_times', 'mpciStack_timeshift')
-    save_names = ('mpci.times.npy', 'mpciStack.timeshift.npy')
+    var_names = ("mpci_times", "mpciStack_timeshift")
+    save_names = ("mpci.times.npy", "mpciStack.timeshift.npy")
 
     """one.alf.io.AlfBunch: The raw imaging meta data and frame times"""
     rawImagingData = None
@@ -35,11 +35,18 @@ class MesoscopeSyncTimeline(BaseExtractor):
         """
         super().__init__(session_path)
         self.n_FOVs = n_FOVs
-        fov = list(map(lambda n: f'FOV_{n:02}', range(self.n_FOVs)))
-        self.var_names = [f'{x}_{y.lower()}' for x in self.var_names for y in fov]
-        self.save_names = [f'{y}/{x}' for x in self.save_names for y in fov]
+        fov = list(map(lambda n: f"FOV_{n:02}", range(self.n_FOVs)))
+        self.var_names = [f"{x}_{y.lower()}" for x in self.var_names for y in fov]
+        self.save_names = [f"{y}/{x}" for x in self.save_names for y in fov]
 
-    def _extract(self, sync=None, chmap=None, device_collection='raw_imaging_data', events=None, use_volume_counter=False):
+    def _extract(
+        self,
+        sync=None,
+        chmap=None,
+        device_collection="raw_imaging_data",
+        events=None,
+        use_volume_counter=False,
+    ):
         """
         Extract the frame timestamps for each individual field of view (FOV) and the time offsets
         for each line scan.
@@ -81,41 +88,51 @@ class MesoscopeSyncTimeline(BaseExtractor):
         list of numpy.array
             A list of timestamps for each FOV and the time offsets for each line scan.
         """
-        volume_times = sync['times'][sync['channels'] == chmap['volume_counter']]
-        frame_times = sync['times'][sync['channels'] == chmap['neural_frames']]
+        volume_times = sync["times"][sync["channels"] == chmap["volume_counter"]]
+        frame_times = sync["times"][sync["channels"] == chmap["neural_frames"]]
         # imaging_start_time = datetime.datetime(*map(round, self.rawImagingData.meta['acquisitionStartTime']))
         if isinstance(device_collection, str):
             device_collection = [device_collection]
         if events is not None:
-            events = events[events.name == 'mpepUDP']
+            events = events[events.name == "mpepUDP"]
         edges = self.get_bout_edges(frame_times, device_collection, events)
         fov_times = []
         line_shifts = []
         for (tmin, tmax), collection in zip(edges, sorted(device_collection)):
-            imaging_data = alfio.load_object(self.session_path / collection, 'rawImagingData')
-            imaging_data['meta'] = patch_imaging_meta(imaging_data['meta'])
+            imaging_data = alfio.load_object(self.session_path / collection, "rawImagingData")
+            imaging_data["meta"] = patch_imaging_meta(imaging_data["meta"])
             # Calculate line shifts
-            _, fov_time_shifts, line_time_shifts = self.get_timeshifts(imaging_data['meta'])
-            assert len(fov_time_shifts) == self.n_FOVs, f'unexpected number of FOVs for {collection}'
+            _, fov_time_shifts, line_time_shifts = self.get_timeshifts(imaging_data["meta"])
+            assert len(fov_time_shifts) == self.n_FOVs, (
+                f"unexpected number of FOVs for {collection}"
+            )
             vts = volume_times[np.logical_and(volume_times >= tmin, volume_times <= tmax)]
             ts = frame_times[np.logical_and(frame_times >= tmin, frame_times <= tmax)]
-            assert ts.size >= imaging_data['times_scanImage'].size, \
-                (f'fewer DAQ timestamps for {collection} than expected: '
-                 f'DAQ/frames = {ts.size}/{imaging_data["times_scanImage"].size}')
-            if ts.size > imaging_data['times_scanImage'].size:
+            assert ts.size >= imaging_data["times_scanImage"].size, (
+                f"fewer DAQ timestamps for {collection} than expected: "
+                f"DAQ/frames = {ts.size}/{imaging_data['times_scanImage'].size}"
+            )
+            if ts.size > imaging_data["times_scanImage"].size:
                 _logger.warning(
-                    'More DAQ frame times detected for %s than were found in the raw image data.\n'
-                    'N DAQ frame times:\t%i\nN raw image data times:\t%i.\n'
-                    'This may occur if the bout detection fails (e.g. UDPs recorded late), '
-                    'when image data is corrupt, or when frames are not written to file.',
-                    collection, ts.size, imaging_data['times_scanImage'].size)
-                _logger.info('Dropping last %i frame times for %s', ts.size - imaging_data['times_scanImage'].size, collection)
-                vts = vts[vts < ts[imaging_data['times_scanImage'].size]]
-                ts = ts[:imaging_data['times_scanImage'].size]
+                    "More DAQ frame times detected for %s than were found in the raw image data.\n"
+                    "N DAQ frame times:\t%i\nN raw image data times:\t%i.\n"
+                    "This may occur if the bout detection fails (e.g. UDPs recorded late), "
+                    "when image data is corrupt, or when frames are not written to file.",
+                    collection,
+                    ts.size,
+                    imaging_data["times_scanImage"].size,
+                )
+                _logger.info(
+                    "Dropping last %i frame times for %s",
+                    ts.size - imaging_data["times_scanImage"].size,
+                    collection,
+                )
+                vts = vts[vts < ts[imaging_data["times_scanImage"].size]]
+                ts = ts[: imaging_data["times_scanImage"].size]
 
             # A 'slice_id' is a ScanImage 'ROI', comprising a collection of 'scanfields' a.k.a. slices at different depths
             # The total number of 'scanfields' == len(imaging_data['meta']['FOV'])
-            slice_ids = np.array([x['slice_id'] for x in imaging_data['meta']['FOV']])
+            slice_ids = np.array([x["slice_id"] for x in imaging_data["meta"]["FOV"]])
             unique_areas, slice_counts = np.unique(slice_ids, return_counts=True)
             n_unique_areas = len(unique_areas)
 
@@ -128,28 +145,43 @@ class MesoscopeSyncTimeline(BaseExtractor):
                     # of extracting imaging times, but the below assertion is kept as it's not tested and
                     # not implemented for a different number of scanlines per FOV
                     _logger.warning(
-                        'different number of slices per area (i.e. scanfields per ROI) (%s).',
-                        ' vs '.join(map(str, slice_counts)))
+                        "different number of slices per area (i.e. scanfields per ROI) (%s).",
+                        " vs ".join(map(str, slice_counts)),
+                    )
                 # This gets the imaging times for each FOV, respecting the order of the scanfields in multidepth imaging
-                fov_times.append(list(chain.from_iterable(
-                    [ts[i::n_unique_areas][:vts.size] + offset for offset in fov_time_shifts[:n_depths]]
-                    for i, n_depths in enumerate(slice_counts)
-                )))
+                fov_times.append(
+                    list(
+                        chain.from_iterable(
+                            [
+                                ts[i::n_unique_areas][: vts.size] + offset
+                                for offset in fov_time_shifts[:n_depths]
+                            ]
+                            for i, n_depths in enumerate(slice_counts)
+                        )
+                    )
+                )
 
             if not line_shifts:
                 line_shifts = line_time_shifts
             else:  # The line shifts should be the same across all imaging bouts
-                [np.testing.assert_array_equal(x, y) for x, y in zip(line_time_shifts, line_shifts)]
+                [
+                    np.testing.assert_array_equal(x, y)
+                    for x, y in zip(line_time_shifts, line_shifts)
+                ]
 
         # Concatenate imaging timestamps across all bouts for each field of view
         fov_times = list(map(np.concatenate, zip(*fov_times)))
-        n_fov_times, = set(map(len, fov_times))
+        (n_fov_times,) = set(map(len, fov_times))
         if n_fov_times != volume_times.size:
             # This may happen if an experimenter deletes a raw_imaging_data folder
-            _logger.debug('FOV timestamps length does not match neural frame count; imaging bout(s) likely missing')
+            _logger.debug(
+                "FOV timestamps length does not match neural frame count; imaging bout(s) likely missing"
+            )
         return fov_times + line_shifts
 
-    def get_bout_edges(self, frame_times, collections=None, events=None, min_gap=1., display=False):
+    def get_bout_edges(
+        self, frame_times, collections=None, events=None, min_gap=1.0, display=False
+    ):
         """
         Return an array of edge times for each imaging bout corresponding to a raw_imaging_data
         collection.
@@ -180,19 +212,19 @@ class MesoscopeSyncTimeline(BaseExtractor):
         else:
             # Split using Exp/BlockStart and Exp/BlockEnd times
             _, subject, date, _ = session_path_parts(self.session_path)
-            pattern = rf'(Exp|Block)%s\s{subject}\s{date.replace("-", "")}\s\d+'
+            pattern = rf"(Exp|Block)%s\s{subject}\s{date.replace('-', '')}\s\d+"
 
             # Get start times
-            UDP_start = events[events['info'].str.match(pattern % 'Start')]
-            if len(UDP_start) > 1 and UDP_start.loc[0, 'info'].startswith('Exp'):
+            UDP_start = events[events["info"].str.match(pattern % "Start")]
+            if len(UDP_start) > 1 and UDP_start.loc[0, "info"].startswith("Exp"):
                 # Use ExpStart instead of first bout start
                 UDP_start = UDP_start.copy().drop(1)
             # Use ExpStart/End instead of first/last BlockStart/End
             starts = frame_times[[np.where(frame_times >= t)[0][0] for t in UDP_start.time]]
 
             # Get end times
-            UDP_end = events[events['info'].str.match(pattern % 'End')]
-            if len(UDP_end) > 1 and UDP_end['info'].values[-1].startswith('Exp'):
+            UDP_end = events[events["info"].str.match(pattern % "End")]
+            if len(UDP_end) > 1 and UDP_end["info"].values[-1].startswith("Exp"):
                 # Use last BlockEnd instead of ExpEnd
                 UDP_end = UDP_end.copy().drop(UDP_end.index[-1])
             if not UDP_end.empty:
@@ -209,28 +241,50 @@ class MesoscopeSyncTimeline(BaseExtractor):
             if edges.shape[0] > len(collections):
                 # Remove any bouts that correspond to a skipped collection
                 # e.g. if {raw_imaging_data_00, raw_imaging_data_02}, remove middle bout
-                include = sorted(int(c.rsplit('_', 1)[-1]) for c in collections)
+                include = sorted(int(c.rsplit("_", 1)[-1]) for c in collections)
                 edges = edges[include, :]
             elif edges.shape[0] < len(collections):
-                raise ValueError('More raw imaging folders than detected bouts')
+                raise ValueError("More raw imaging folders than detected bouts")
 
         if display:
             _, ax = plt.subplots(1)
-            ax.step(frame_times, np.arange(frame_times.size), label='frame times', color='k', )
-            vertical_lines(edges[:, 0], ax=ax, ymin=0, ymax=frame_times.size, label='bout start', color='b')
-            vertical_lines(edges[:, 1], ax=ax, ymin=0, ymax=frame_times.size, label='bout end', color='orange')
+            ax.step(
+                frame_times,
+                np.arange(frame_times.size),
+                label="frame times",
+                color="k",
+            )
+            vertical_lines(
+                edges[:, 0], ax=ax, ymin=0, ymax=frame_times.size, label="bout start", color="b"
+            )
+            vertical_lines(
+                edges[:, 1], ax=ax, ymin=0, ymax=frame_times.size, label="bout end", color="orange"
+            )
             if edges.shape[0] != len(starts):
-                vertical_lines(np.setdiff1d(starts, edges[:, 0]), ax=ax, ymin=0, ymax=frame_times.size,
-                               label='missing bout start', linestyle=':', color='b')
-                vertical_lines(np.setdiff1d(ends, edges[:, 1]), ax=ax, ymin=0, ymax=frame_times.size,
-                               label='missing bout end', linestyle=':', color='orange')
-            ax.set_xlabel('Time / s'), ax.set_ylabel('Frame #'), ax.legend(loc='lower right')
+                vertical_lines(
+                    np.setdiff1d(starts, edges[:, 0]),
+                    ax=ax,
+                    ymin=0,
+                    ymax=frame_times.size,
+                    label="missing bout start",
+                    linestyle=":",
+                    color="b",
+                )
+                vertical_lines(
+                    np.setdiff1d(ends, edges[:, 1]),
+                    ax=ax,
+                    ymin=0,
+                    ymax=frame_times.size,
+                    label="missing bout end",
+                    linestyle=":",
+                    color="orange",
+                )
+            ax.set_xlabel("Time / s"), ax.set_ylabel("Frame #"), ax.legend(loc="lower right")
         return edges
 
     @staticmethod
     def get_timeshifts(raw_imaging_meta):
-        """
-        Calculate the time shifts for each field of view (FOV) and the relative offsets for each
+        """Calculate the time shifts for each field of view (FOV) and the relative offsets for each
         scan line.
 
         For a 2 area (i.e. 'ROI'), 2 depth recording (so 4 FOVs):
@@ -265,30 +319,39 @@ class MesoscopeSyncTimeline(BaseExtractor):
             A list of arrays, one per FOV, containing the time offsets for each scan line, relative
             to each FOV offset.
         """
-        FOVs = raw_imaging_meta['FOV']
+
+        FOVs = raw_imaging_meta["FOV"]
 
         # Double-check meta extracted properly
         # assert meta.FOV.Zs is ascending but use slice_id field. This may not be necessary but is expected.
-        slice_ids = np.array([fov['slice_id'] for fov in FOVs])
-        assert np.all(np.diff([x['Zs'] for x in FOVs]) >= 0), 'FOV depths not in ascending order'
-        assert np.all(np.diff(slice_ids) >= 0), 'slice IDs not ordered'
+        slice_ids = np.array([fov["slice_id"] for fov in FOVs])
+        assert np.all(np.diff([x["Zs"] for x in FOVs]) >= 0), "FOV depths not in ascending order"
+        assert np.all(np.diff(slice_ids) >= 0), "slice IDs not ordered"
         # Number of scan lines per FOV, i.e. number of Y pixels / image height
-        n_lines = np.array([x['nXnYnZ'][1] for x in FOVs])
+        n_lines = np.array([x["nXnYnZ"][1] for x in FOVs])
 
         # We get indices from MATLAB extracted metadata so below two lines are no longer needed
         # n_valid_lines = np.sum(n_lines)  # Number of lines imaged excluding flybacks
         # n_lines_per_gap = int((raw_meta['Height'] - n_valid_lines) / (len(FOVs) - 1))  # N lines during flyback
-        line_period = raw_imaging_meta['scanImageParams']['hRoiManager']['linePeriod']
-        frame_time_shifts = slice_ids / raw_imaging_meta['scanImageParams']['hRoiManager']['scanFrameRate']
+        line_period = raw_imaging_meta["scanImageParams"]["hRoiManager"]["linePeriod"]
+        frame_time_shifts = (
+            slice_ids / raw_imaging_meta["scanImageParams"]["hRoiManager"]["scanFrameRate"]
+        )
 
         # Line indices are now extracted by the MATLAB function mesoscopeMetadataExtraction.m
         # They are indexed from 1 so we subtract 1 to convert to zero-indexed
-        line_indices = [np.array(fov['lineIdx']) - 1 for fov in FOVs]  # Convert to zero-indexed from MATLAB 1-indexed
-        assert all(lns.size == n for lns, n in zip(line_indices, n_lines)), 'unexpected number of scan lines'
+        line_indices = [
+            np.array(fov["lineIdx"]) - 1 for fov in FOVs
+        ]  # Convert to zero-indexed from MATLAB 1-indexed
+        assert all(lns.size == n for lns, n in zip(line_indices, n_lines)), (
+            "unexpected number of scan lines"
+        )
         # The start indices of each FOV in the raw images
         fov_start_idx = np.array([lns[0] for lns in line_indices])
-        roi_time_shifts = fov_start_idx * line_period   # The time offset for each FOV
+        roi_time_shifts = fov_start_idx * line_period  # The time offset for each FOV
         fov_time_shifts = roi_time_shifts + frame_time_shifts
-        line_time_shifts = [(lns - ln0) * line_period for lns, ln0 in zip(line_indices, fov_start_idx)]
+        line_time_shifts = [
+            (lns - ln0) * line_period for lns, ln0 in zip(line_indices, fov_start_idx)
+        ]
 
         return line_indices, fov_time_shifts, line_time_shifts

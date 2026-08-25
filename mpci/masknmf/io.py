@@ -25,6 +25,7 @@ Usage example::
     loader       = ScanImageTiffSeriesLoader(file_paths, line_indices)
     frames       = loader[0:100]   # shape (100, 512, 512), lazy
 """
+
 from pathlib import Path
 import json
 from typing import Union
@@ -57,12 +58,10 @@ def read_fov_line_indices(meta_json_path: str, plane: int) -> list[int]:
     """
     with open(meta_json_path) as f:
         meta = patch_imaging_meta(json.load(f))
-    fov_list = meta['FOV']
+    fov_list = meta["FOV"]
     if plane >= len(fov_list):
-        raise ValueError(
-            f"plane {plane} out of range — meta JSON has {len(fov_list)} FOVs"
-        )
-    return [idx - 1 for idx in fov_list[plane]['lineIdx']]
+        raise ValueError(f"plane {plane} out of range — meta JSON has {len(fov_list)} FOVs")
+    return [idx - 1 for idx in fov_list[plane]["lineIdx"]]
 
 
 def collect_tiff_paths(folders: list[Path]) -> list[Path]:
@@ -85,7 +84,7 @@ def collect_tiff_paths(folders: list[Path]) -> list[Path]:
     """
     paths: list[Path] = []
     for folder in sorted(folders):
-        tifs = sorted(folder.glob('*.tif'))
+        tifs = sorted(folder.glob("*.tif"))
         paths.extend(tifs)
     return paths
 
@@ -99,6 +98,7 @@ def _raw_frame_count(filepath: str) -> int:
 # ---------------------------------------------------------------------------
 # Main loader
 # ---------------------------------------------------------------------------
+
 
 class ScanImageTiffSeriesLoader(LazyFrameLoader):
     """
@@ -145,9 +145,9 @@ class ScanImageTiffSeriesLoader(LazyFrameLoader):
         self._frame_map = np.empty((self._n_frames, 3), dtype=np.int64)
         g = 0
         for file_id, n in enumerate(raw_counts):
-            self._frame_map[g:g + n, 0] = np.arange(g, g + n)
-            self._frame_map[g:g + n, 1] = np.arange(n)
-            self._frame_map[g:g + n, 2] = file_id
+            self._frame_map[g : g + n, 0] = np.arange(g, g + n)
+            self._frame_map[g : g + n, 1] = np.arange(n)
+            self._frame_map[g : g + n, 2] = file_id
             g += n
 
         # Attempt to memory-map each file as (n_frames, raw_height, raw_width).
@@ -216,15 +216,15 @@ class ScanImageTiffSeriesLoader(LazyFrameLoader):
             mm = self._memmaps[file_id] if self._memmap else None
             if mm is not None:
                 # Fancy-index the memmap; returns a copied array (not a view).
-                raw = mm[local_idx, self._row_start:self._row_end, :]
+                raw = mm[local_idx, self._row_start : self._row_end, :]
             else:
                 raw = tifffile.imread(self._file_paths[file_id], key=local_idx.tolist())
                 if raw.ndim == 2:
                     raw = raw[None]
-                raw = raw[:, self._row_start:self._row_end, :]
+                raw = raw[:, self._row_start : self._row_end, :]
 
             chunks.append(raw.astype(self._dtype, copy=False))
-            insertion_order[pos:pos + len(out_positions)] = out_positions
+            insertion_order[pos : pos + len(out_positions)] = out_positions
             pos += len(out_positions)
 
         stacked = np.concatenate(chunks, axis=0)
@@ -232,50 +232,52 @@ class ScanImageTiffSeriesLoader(LazyFrameLoader):
         return stacked[perm]
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     import numpy as np
     import time
 
-    session_path = Path('/mnt/whiterussian/Subjects/SP072/2025-10-01/001')
-    folders = sorted(session_path.glob('raw_imaging_data_??'))
-    
-    META = folders[0] / '_ibl_rawImagingData.meta.json'
+    session_path = Path("/mnt/whiterussian/Subjects/SP072/2025-10-01/001")
+    folders = sorted(session_path.glob("raw_imaging_data_??"))
 
-    print('Collecting tiff paths...')
+    META = folders[0] / "_ibl_rawImagingData.meta.json"
+
+    print("Collecting tiff paths...")
     fps = collect_tiff_paths(folders)
-    print('  %d files' % len(fps))
+    print("  %d files" % len(fps))
 
     print()
-    print('Plane 0:')
+    print("Plane 0:")
     lines0 = read_fov_line_indices(META, 0)
-    print('  rows %d..%d  (%d lines)' % (lines0[0], lines0[-1], len(lines0)))
+    print("  rows %d..%d  (%d lines)" % (lines0[0], lines0[-1], len(lines0)))
     t0 = time.time()
     ld0 = ScanImageTiffSeriesLoader(fps, lines0)
-    print('  init: %.2fs  shape=%s  dtype=%s' % (time.time()-t0, ld0.shape, ld0.dtype))
+    print("  init: %.2fs  shape=%s  dtype=%s" % (time.time() - t0, ld0.shape, ld0.dtype))
 
     t0 = time.time()
     f0 = ld0[0:5]
-    print('  [0:5] shape=%s  took %.2fs' % (str(f0.shape), time.time()-t0))
-    print('  frame0 mean=%.1f  min=%d  max=%d' % (f0[0].mean(), f0[0].min(), f0[0].max()))
+    print("  [0:5] shape=%s  took %.2fs" % (str(f0.shape), time.time() - t0))
+    print("  frame0 mean=%.1f  min=%d  max=%d" % (f0[0].mean(), f0[0].min(), f0[0].max()))
 
     print()
-    print('Plane 7:')
+    print("Plane 7:")
     lines7 = read_fov_line_indices(META, 7)
-    print('  rows %d..%d  (%d lines)' % (lines7[0], lines7[-1], len(lines7)))
+    print("  rows %d..%d  (%d lines)" % (lines7[0], lines7[-1], len(lines7)))
     ld7 = ScanImageTiffSeriesLoader(fps, lines7)
-    print('  shape=%s' % str(ld7.shape))
+    print("  shape=%s" % str(ld7.shape))
     f7 = ld7[0:5]
-    print('  frame0 mean=%.1f  min=%d  max=%d' % (f7[0].mean(), f7[0].min(), f7[0].max()))
+    print("  frame0 mean=%.1f  min=%d  max=%d" % (f7[0].mean(), f7[0].min(), f7[0].max()))
 
     print()
-    ops = np.load(session_path.joinpath('suite2p/plane0/ops.npy'), allow_pickle=True).item()
-    s2p = int(np.sum(ops['frames_per_folder'][:3]))
-    print('Loader frames: %d  s2p 3-folder: %d  match=%s' % (ld0.shape[0], s2p, ld0.shape[0]==s2p))
+    ops = np.load(session_path.joinpath("suite2p/plane0/ops.npy"), allow_pickle=True).item()
+    s2p = int(np.sum(ops["frames_per_folder"][:3]))
+    print(
+        "Loader frames: %d  s2p 3-folder: %d  match=%s" % (ld0.shape[0], s2p, ld0.shape[0] == s2p)
+    )
 
     print()
-    print('Mean image correlation (our 200-frame vs s2p full dataset):')
+    print("Mean image correlation (our 200-frame vs s2p full dataset):")
     chunk = ld0[0:200].astype(np.float32)
     our_mean = chunk.mean(axis=0)
-    s2p_mean = ops['meanImg']
-    r = float(np.corrcoef(our_mean.ravel(), s2p_mean.ravel())[0,1])
-    print('  r=%.4f (expected high, ~0.9+ since both are plane 0)' % r)
+    s2p_mean = ops["meanImg"]
+    r = float(np.corrcoef(our_mean.ravel(), s2p_mean.ravel())[0, 1])
+    print("  r=%.4f (expected high, ~0.9+ since both are plane 0)" % r)
