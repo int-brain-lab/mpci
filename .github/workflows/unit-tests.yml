@@ -1,3 +1,5 @@
+name: ruff format/check and unit tests
+
 on:
   workflow_dispatch:
   push:
