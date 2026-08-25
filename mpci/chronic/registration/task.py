@@ -290,8 +290,10 @@ class MesoscopeFOV(MesoscopeTask):
             The provenance of the FOV location.
         check_integrity : bool
             Whether to check that the number of FOVs in Alyx matches the number in the meta data.
-            A previous issue with multidepth recordings caused more FOVs to be registered than expected.
-            This check marks extraneous FOVs in Alyx with a data integrity error timestamp in the JSON field.
+            A previous issue with multidepth recordings caused more FOVs to be registered than
+            expected.
+            This check marks extraneous FOVs in Alyx with a data integrity error timestamp in the
+            JSON field.
 
         Returns
         -------
@@ -302,7 +304,8 @@ class MesoscopeFOV(MesoscopeTask):
         """
         dry = self.one is None or self.one.offline
         alyx_fovs = []
-        # Count the number of slices per stack ID: only register stacks that contain more than one slice.
+        # Count the number of slices per stack ID: only register stacks that contain more than one
+        # slice.
         slice_counts = Counter(f["roiUUID"] for f in meta.get("FOV", []))
         # Create a new stack in Alyx for all stacks containing more than one slice.
         # Map of ScanImage ROI UUID to Alyx ImageStack UUID.
@@ -425,9 +428,7 @@ class MesoscopeFOV(MesoscopeTask):
         return points, connectivity_list
 
     def project_mlapdv(self, meta, atlas=None, provenance=Provenance.ESTIMATE):
-        """
-        Calculate the mean image pixel locations in MLAPDV coordinates and determine the brain
-        location IDs.
+        """Calculate the mean image pixel locations in MLAPDV coordinates.
 
         MLAPDV coordinates are in μm relative to bregma.  Location IDs are from the 2017 Allen
         common coordinate framework atlas.
@@ -492,7 +493,8 @@ class MesoscopeFOV(MesoscopeTask):
         # coordinate (which is ML-AP coordinate)
         coord_dv = (1 - pt @ abc[:2]) / abc[2]
 
-        # We should not use the actual surface of the brain for this, as it might be in one of the sulci
+        # We should not use the actual surface of the brain for this, as it might be in one of the
+        # sulci
         # DO NOT USE THIS:
         # coordDV = interp2(axisMLmm, axisAPmm, surfaceDV, coordML, coordAP)
 
@@ -550,7 +552,8 @@ class MesoscopeFOV(MesoscopeTask):
             coords = np.outer(xx, vX) + np.outer(yy, vY)  # (vX * xx) + (vY * yy)
             coords = coords + [coord_ml, coord_ap, coord_dv]
 
-            # for each point of the FOV create a line parametrization (trajectory normal to the coverslip plane).
+            # for each point of the FOV create a line parametrization (trajectory normal to the
+            # coverslip plane).
             # start just above the coverslip and go 3 mm down, should be enough to 'meet' the brain
             t = np.arange(-voxel_size, 3e3, voxel_size)
 
@@ -659,7 +662,8 @@ class MesoscopeFOVHistology(MesoscopeFOV):
             "input_files": [
                 I("_ibl_rawImagingData.meta.json", self.device_collection, True),
                 I("mpciROIs.stackPos.npy", "alf/FOV*", True),
-                # New additions  # FIXME should be self.device_collection (may require patching exp desc files)
+                # New additions  # FIXME should be self.device_collection (may require patching exp
+                # desc files)
                 I("referenceImage.stack.tif", "raw_imaging_data_??/reference", True, unique=True),
                 I("referenceImage.meta.json", "raw_imaging_data_??/reference", True, unique=True),
                 I(
@@ -668,7 +672,8 @@ class MesoscopeFOVHistology(MesoscopeFOV):
                     False,
                     unique=True,
                 ),
-                # ('referenceImage.mlapdv.npy', 'histology', False)  # may be in another session folder!
+                # ('referenceImage.mlapdv.npy', 'histology', False)  # may be in another session
+                # folder!
             ],
             "output_files": [
                 ("mpciMeanImage.brainLocationIds.npy", "alf/FOV_*", True),
@@ -816,7 +821,8 @@ class MesoscopeFOVHistology(MesoscopeFOV):
         """Download the aligned reference stack Allen atlas indices.
 
         This is the file created by the histology pipeline, one per subject.
-        This file contains the Allen atlas image volume indices for each pixel of the reference stack.
+        This file contains the Allen atlas image volume indices for each pixel of the reference
+        stack.
 
         Parameters
         ----------
@@ -859,7 +865,8 @@ class MesoscopeFOVHistology(MesoscopeFOV):
             lab = self.one.get_details(self.reference_session)["lab"]
             remote_file = f"{lab}/{self.reference_session.session_path_short()}/{local_file.name}"
             try:
-                # assert isinstance(self.data_handler, dh.ServerGlobusDataHandler)  # If not, assume Globus not configured
+                # assert isinstance(self.data_handler, dh.ServerGlobusDataHandler)  # If not,
+                # assume Globus not configured
                 handler = dh.ServerGlobusDataHandler(
                     self.reference_session, {"input_files": [], "output_files": []}, one=self.one
                 )
@@ -886,7 +893,7 @@ class MesoscopeFOVHistology(MesoscopeFOV):
     def load_metadata_from_tif(self):
         # load meta from tif
         # from ScanImageTiffReader import ScanImageTiffReader
-        # tif = ScanImageTiffReader(str(next(self.session_path.glob('raw_imaging_data_??/reference/referenceImage.stack.tif'))))
+        # tif = ScanImageTiffReader(str(next(self.session_path.glob('raw_imaging_data_??/reference/referenceImage.stack.tif')))) # noqa
         # meta = tif.metadata()  # fails - is empty str
         raise NotImplementedError
 
@@ -972,7 +979,8 @@ class MesoscopeFOVHistology(MesoscopeFOV):
         Returns
         -------
         numpy.array
-            The reference image stack extent in mm from the craniotmoy center (left, right, top, bottom).
+            The reference image stack extent in mm from the craniotmoy center (left, right, top,
+            bottom).
         list of dict
             A list of dictionaries containing the FOV coordinates and angles.
             Each dictionary contains:
@@ -1128,7 +1136,8 @@ class MesoscopeFOVHistology(MesoscopeFOV):
         _logger.debug("Craniotomy pixel coordinates: (%d, %d)", *craniotomy_pixel)
 
         # This doesn't work in python 3.10, numpy 2.24
-        # craniotomy_resolved = referenceImage['mlapdv'][craniotomy_pixel] / 1e3  # py 3.11 # ML AP DV, μm -> mm
+        # craniotomy_resolved = referenceImage['mlapdv'][craniotomy_pixel] / 1e3  # py 3.11 # ML AP
+        # DV, μm -> mm
         craniotomy_resolved = (
             reference_image["mlapdv"][craniotomy_pixel[0], craniotomy_pixel[1]] / 1e3
         )
@@ -1183,7 +1192,8 @@ class MesoscopeFOVHistology(MesoscopeFOV):
         list of numpy.array
             The interpolated MLAPDV coordinates for each FOV.
         """
-        # Extract the reference image and mean image extents in mm along the coverslip, relative to the craniotomy center
+        # Extract the reference image and mean image extents in mm along the coverslip, relative to
+        # the craniotomy center
         assert np.all(get_window_center(reference_image["meta"]) == get_window_center(meta))
         assert (
             reference_image["meta"]["scanImageParams"]["objectiveResolution"]
@@ -1194,7 +1204,8 @@ class MesoscopeFOVHistology(MesoscopeFOV):
         # Reference image contains 3-D coordinates in m for each pixel of the reference image
         height, width = reference_image["mlapdv"].shape[:2]
 
-        # The fields of view and reference image extents are in the same coordinate space (objective space in mm)
+        # The fields of view and reference image extents are in the same coordinate space
+        # (objective space in mm)
         # Create objective coordinates directly using linear transformation
         ref_extent = self.get_reference_image_extent(reference_image["meta"])
         r_left, r_right, r_top, r_bottom = ref_extent
@@ -1229,7 +1240,8 @@ class MesoscopeFOVHistology(MesoscopeFOV):
         )
 
         if display:
-            # For sanity, plot a rectangle of the reference image window extent, then plot each pixel of each FOV
+            # For sanity, plot a rectangle of the reference image window extent, then plot each
+            # pixel of each FOV
             _, ax = plt.subplots()
         else:
             ax = None
@@ -1251,14 +1263,16 @@ class MesoscopeFOVHistology(MesoscopeFOV):
             # Create meshgrid for all pixel locations in objective space
             xx, yy = np.meshgrid(x_coords, y_coords)
 
-            # For each of these points, interpolate the mlapdv coordinates using the reference mlapdv
+            # For each of these points, interpolate the mlapdv coordinates using the reference
+            # mlapdv
             # NearestNDInterpolator expects points as a 2D array
             points_to_interpolate = np.column_stack((xx.ravel(), yy.ravel()))
             interpolated_values = interp(points_to_interpolate)
             mlapdv.append(interpolated_values.reshape(height, width, 3))
 
             if display:
-                # For each pixel, plot a specific color based on duplicate values along the first axis for interpolated values
+                # For each pixel, plot a specific color based on duplicate values along the first
+                # axis for interpolated values
                 unique_values = np.unique(interpolated_values, axis=0)
                 for i in range(len(unique_values)):
                     colour = plt.cm.tab20(i % 20)  # Use a colormap to get distinct colors
@@ -1289,11 +1303,11 @@ class MesoscopeFOVHistology(MesoscopeFOV):
         return mlapdv
 
     def interpolate_FOVs_smooth(self, reference_image, meta, display=False):
-        """Interpolate the FOV coordinates from reference stack coordinates using smooth interpolation.
+        """Interpolate the FOV coordinates from reference stack coordinates.
 
-        Unlike `interpolate_FOVs` this method does not cause aliasing artifacts due to nearest-neighbor
-        interpolation. Instead, it uses another form of interpolation to smoothly interpolate the MLAPDV
-        coordinates.
+        Unlike `interpolate_FOVs` this method does not cause aliasing artifacts due to
+        nearest-neighborinterpolation. Instead, it uses another form of interpolation to smoothly
+        interpolate the MLAPDV coordinates.
 
         Parameters
         ----------
@@ -1335,7 +1349,8 @@ class MesoscopeFOVHistology(MesoscopeFOV):
         x_ref = np.linspace(r_left, r_right, width)  # X increases left -> right
         y_ref = np.linspace(r_top, r_bottom, height)  # Y increases top -> bottom
 
-        # Construct one interpolator per MLAPDV axis. Use linear interpolation (piecewise multilinear).
+        # Construct one interpolator per MLAPDV axis. Use linear interpolation (piecewise
+        # multilinear).
         # (y, x) ordering because array indexing is [row(y), col(x)].
         interpolators = []
         for k in range(3):
@@ -1389,7 +1404,8 @@ class MesoscopeFOVHistology(MesoscopeFOV):
             xx, yy = np.meshgrid(x_fov, y_fov)
 
             # Clip query points just inside the reference domain to avoid inadvertent extrapolation
-            # due to floating-point rounding (RegularGridInterpolator extrapolates when fill_value=None).
+            # due to floating-point rounding (RegularGridInterpolator extrapolates when
+            # fill_value=None).
             xxq = np.clip(xx, x_ref[0], x_ref[-1])
             yyq = np.clip(yy, y_ref[0], y_ref[-1])
             query_points = np.column_stack((yyq.ravel(), xxq.ravel()))  # (N, 2) in (y, x) order
@@ -1420,7 +1436,7 @@ class MesoscopeFOVHistology(MesoscopeFOV):
                 ref_center_val, fov_center_val, atol=5.0
             ):  # tolerate small deviations (μm)
                 _logger.debug(
-                    "FOV %d center mismatch (linear interp ≠ nearest reference): ref=%s, interp=%s",
+                    "FOV %d center mismatch (interp ≠ nearest reference): ref=%s, interp=%s",
                     i,
                     ref_center_val,
                     fov_center_val,
@@ -1470,7 +1486,8 @@ class MesoscopeFOVHistology(MesoscopeFOV):
             stack_ixs
         ]
         dv_avg = np.average(stack_dv)
-        # Image coordinates here are fractional x, y values where (0, 0) = left top; (1, 1) = right bottom
+        # Image coordinates here are fractional x, y values where (0, 0) = left top; (1, 1) = right
+        # bottom
         ref_points_rel = np.fliplr(
             np.array([point["coords"] for point in points], dtype=float)
         )  # (y, x)
@@ -1478,7 +1495,8 @@ class MesoscopeFOVHistology(MesoscopeFOV):
             # Convert to pixel coordinates
             ref_points_px = (ref_points_rel * reference_image["mlapdv"].shape[:2]).astype(int)
             # MLAPDV coordinates for each of the three points chosen
-            # ref_points_mlap = reference_image['mlapdv'][*np.hsplit(ref_points_px, 2)].squeeze()  # py 3.11
+            # ref_points_mlap = reference_image['mlapdv'][*np.hsplit(ref_points_px, 2)].squeeze()
+            # # py 3.11
             a, b = np.hsplit(ref_points_px, 2)
             ref_points_mlap = reference_image["mlapdv"][a, b].squeeze()
         else:
@@ -1508,7 +1526,8 @@ class MesoscopeFOVHistology(MesoscopeFOV):
 
         This method accounts for tilt between the imaging plane and the brain surface, adjusting
         ML/AP coordinates and depth (DV) for each pixel. It projects each pixel onto the brain
-        surface plane (defined by reference points), then computes the true depth below the surface.
+        surface plane (defined by reference points), then computes the true depth below the
+        surface.
 
         Parameters
         ----------
@@ -1533,7 +1552,8 @@ class MesoscopeFOVHistology(MesoscopeFOV):
                 fov_meta["Zs"] - dv_avg
             )  # depth below reference plane (μm), positive = deeper
             _logger.info(
-                f"FOV {i}: Original Zs={fov_meta['Zs']:.1f}μm, dv_avg={dv_avg:.1f}μm, converted depth z={z:.1f}μm"
+                f"FOV {i}: Original Zs={fov_meta['Zs']:.1f}μm, dv_avg={dv_avg:.1f}μm"
+                f", converted depth z={z:.1f}μm"
             )
 
             # Replace surface dv with imaging depth
@@ -1557,25 +1577,31 @@ class MesoscopeFOVHistology(MesoscopeFOV):
         """
         Project corrected MLAPDV coordinates from the imaging plane onto the Allen atlas surface.
 
-        For each pixel in the FOV, this method finds the corresponding location on the atlas brain surface
-        using the ML/AP coordinates, then projects the pixel along the local surface normal by the true depth (DV).
-        This accounts for tilt and depth differences between the imaging plane and the brain surface.
+        For each pixel in the FOV, this method finds the corresponding location on the atlas brain
+        surface
+        using the ML/AP coordinates, then projects the pixel along the local surface normal by the
+        true depth (DV).
+        This accounts for tilt and depth differences between the imaging plane and the brain
+        surface.
 
         Parameters
         ----------
         mlapdv_rel : np.ndarray
-            List of arrays, one per FOV, each with shape (height, width, 3), containing MLAPDV coordinates
+            List of arrays, one per FOV, each with shape (height, width, 3), containing MLAPDV
+            coordinates
             in microns for each pixel in the imaging plane (with corrected ML/AP and DV).
 
         Returns
         -------
         list of np.ndarray
-            List of arrays, one per FOV, each with shape (height, width, 3), containing MLAPDV coordinates
+            List of arrays, one per FOV, each with shape (height, width, 3), containing MLAPDV
+            coordinates
             in microns for each pixel projected onto the Allen atlas surface.
 
         Notes
         -----
-        - This method uses the Allen atlas surface triangulation to find the local surface normal and position.
+        - This method uses the Allen atlas surface triangulation to find the local surface normal
+        and position.
         - The output can be used for downstream analysis or registration to atlas space.
 
         TODO combine with correct_fov_depth_and_surface_projection

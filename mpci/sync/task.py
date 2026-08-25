@@ -51,7 +51,8 @@ class MesoscopeSync(MesoscopeTask):
         Returns
         -------
         list of pathlib.Path
-            Files containing frame timestamps for individual FOVs and time offsets for each line scan.
+            Files containing frame timestamps for individual FOVs and time offsets for each line
+            scan.
 
         """
         # TODO function to determine nFOVs

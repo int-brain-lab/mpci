@@ -224,7 +224,8 @@ def plane_normal_form(face: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 
     Returns
     -------
-        Tuple[np.ndarray, np.ndarray]: a tuple of the plane in normal form. p0 = point on plane, n = normal
+        Tuple[np.ndarray, np.ndarray]: a tuple of the plane in normal form. p0 = point on plane, n
+        = normal
     TODO Replace with direct call to surface_normal
     """
     # explicit row indexing (rather than tuple unpacking) preserves contiguity typing
@@ -279,7 +280,7 @@ def plane_normal_form(face: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 def intersect_line_plane(
     ln0: np.ndarray, ln: np.ndarray, p0: np.ndarray, n: np.ndarray
 ) -> np.ndarray:
-    """return the intersection point of a line defined by l0 and l and plane in normal form p0 and n.
+    """return the intersection point of a line and plane.
 
     derivation: https://en.wikipedia.org/wiki/Line%E2%80%93plane_intersection
 
@@ -457,7 +458,7 @@ def point_in_face(face: np.ndarray, point: np.ndarray) -> np.bool_:
 
 
 @nb.njit(
-    "Tuple((float64[:,:,:], float64[:,:], int64[:]))(float64[:,:], int32[:,:], float64[::1], float64[::1])",
+    "Tuple((float64[:,:,:], float64[:,:], int64[:]))(float64[:,:], int32[:,:], float64[::1], float64[::1])",  # noqa
     parallel=True,
     cache=True,
 )
@@ -501,7 +502,7 @@ def intersect_line_mesh(
 
 
 @nb.njit(
-    "Tuple((float64[:,:,:], float64[:,:], int64[:]))(float64[:,:], int32[:,:], float64[:], float64[:])",
+    "Tuple((float64[:,:,:], float64[:,:], int64[:]))(float64[:,:], int32[:,:], float64[:], float64[:])",  # noqa
     parallel=True,
     nogil=True,
     cache=True,
@@ -647,8 +648,7 @@ def find_closest_point_from_line_np(
 def find_closest_point_from_line_nb(
     points: np.ndarray, ln0: np.ndarray, ln: np.ndarray
 ) -> np.ndarray:
-    """for a given set of points, return the point that is closest to the line
-    (defined by a point and a vector).
+    """for a given set of points, return the point that is closest to the line.
 
     Args:
         points (np.ndarray): the points to evaluate

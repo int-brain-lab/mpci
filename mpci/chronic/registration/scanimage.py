@@ -47,7 +47,8 @@ def preprocess_vasculature(
     high_percentile : float
         Upper percentile for contrast stretching.
     crop_size : int
-        Size of the crop to apply to the image.  This should be the size of resulting image in pixels.
+        Size of the crop to apply to the image.  This should be the size of resulting image in
+        pixels.
 
     Returns
     -------
@@ -95,7 +96,8 @@ def register_reference_stacks(
 ):
     """Register one reference stack to another.
 
-    Register using Enhanced Correlation Coefficient (ECC) optimization. This method can handle small rotations
+    Register using Enhanced Correlation Coefficient (ECC) optimization. This method can handle
+    small rotations
     and translations, and is robust to intensity variations.
 
     Parameters

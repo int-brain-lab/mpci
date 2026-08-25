@@ -41,9 +41,9 @@ class TestMesoscopePreprocess(unittest.TestCase):
             file.touch()
 
     def test_meta(self):
-        """
-        Test arguments that are overwritten by meta file and set in task.kwargs,
-        and that explicitly passed kwargs overwrite default and meta args.
+        """Test the arguments that are overwritten by the meta file and set in task.kwargs.
+
+        Explicitly passed kwargs overwrite both the default and the meta args.
         """
         expected = {
             "data_path": [str(self.img_path)],
@@ -377,7 +377,7 @@ class TestMesoscopePreprocessRename(IntegrationTestCase):
         self.assertEqual(expected, set(x.name for x in self.suite2pdir.rglob("*.*")))
 
 
-class TestMesoscopePreprocess(IntegrationTestCase):
+class TestMesoscopePreprocess2(IntegrationTestCase):
     session_path = None
     required_files = [
         "mesoscope/SP053/2024-02-07/001",
@@ -402,7 +402,8 @@ class TestMesoscopePreprocess(IntegrationTestCase):
         """Test MesoscopePreprocess._run method."""
         task = MesoscopePreprocess(self.session_path, one=self.one)
 
-        # first create some raw bin data and assert that these are used instead of calling bin_per_plane
+        # first create some raw bin data and assert that these are used instead of calling
+        # bin_per_plane
         n_planes = 2
         for i in range(n_planes):
             loc = self.session_path.joinpath("suite2p", f"plane{i}")

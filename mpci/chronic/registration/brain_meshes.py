@@ -11,7 +11,7 @@ from typing import Tuple
 
 def calculate_surface_triangulation(atlas: BrainAtlas) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Run surface triangulation on the given brain atlas and return the mesh vertices and connectivity list.
+    Compute surface the brain mesh vertices and connectivity list by surface triangulation.
 
     Parameters
     ----------

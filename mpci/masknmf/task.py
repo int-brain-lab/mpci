@@ -5,7 +5,7 @@ the second runs masknmf on the extracted files.
 """
 
 import os
-from typing import *
+from typing import Union, Tuple
 import logging
 from pathlib import Path
 
@@ -43,9 +43,9 @@ class MotionBinDataset:
 
     @property
     def shape(self):
-        """
-        This property should return the shape of the dataset, in the form: (d1, d2, T) where d1
-        and d2 are the field of view dimensions and T is the number of frames.
+        """Return the shape of the dataset, as (d1, d2, T).
+
+        d1 and d2 are the field of view dimensions and T is the number of frames.
 
         Returns
         -------
@@ -59,9 +59,9 @@ class MotionBinDataset:
         return len(self.shape)
 
     def _compute_shape(self):
-        """
-        Loads the suite2p ops file to retrieve the dimensions of the data.bin file. This is now lazily loaded from a
-        zip file.
+        """Loads the suite2p ops file to retrieve the dimensions of the data.bin file.
+
+        This is now lazily loaded from a zip file.
 
         Returns
         -------
@@ -117,7 +117,9 @@ class Suite2pMotionCorrection(MesoscopePreprocess):
 
 
 class MasknmfPreprocess(MesoscopeTask):
-    """This pipeline does the following right now:
+    """Runs the MaskNmf pipeline.
+
+    This pipeline does the following right now:
     1. Run motion correction + save out registered bin files using suite2p
     2. Compress + Denoise these .bin files
     3. Run signal detection on these bin files.
@@ -175,8 +177,8 @@ class MasknmfPreprocess(MesoscopeTask):
         return signature
 
     def deconv_all_traces(self, trace_matrix):
-        """
-        Runs OASIS deconvolution on calcium imaging traces
+        """Runs OASIS deconvolution on calcium imaging traces.
+
         Args:
             trace_matrix (np.ndarray): Shape (num_frames, num_signals).
 
@@ -195,17 +197,24 @@ class MasknmfPreprocess(MesoscopeTask):
         return deconv_output
 
     def _format_to_mpci(self, demixing_results: masknmf.DemixingResults):
-        """
-        Takes as input the masknmf .hdf5 file and outputs. Uses oasis to deconvolve the traces, and outputs key numpy arrays
-        for downstream analysis
-        Args:
-            demixing_results (masknmf.DemixingResults).
+        """Deconvolve the demixed traces and format them for MPCI.
+
+        Takes as input the masknmf .hdf5 file and outputs. Uses oasis to deconvolve the
+        traces, and outputs key numpy arrays for downstream analysis
+
+        Parameters
+        ----------
+        demixing_results : masknmf.DemixingResults
+            The demixing results to format.
 
         Returns
         -------
-            fluorescence_traces (np.ndarray). Shape (num_frames, num_signals). The extracted fluorescence traces from masknmf.
-            deconvolved_traces (np.ndarray). Shape (num_frames, num_signals). The result of running oasis deconvolution on fluorescence_traces
-            spatial_footprints (sparse.GCXS). Shape (num_signals, fov height, fov width)
+        numpy.ndarray
+            Fluorescence traces of shape (num_frames, num_signals), as extracted by masknmf.
+        numpy.ndarray
+            The result of running oasis deconvolution on those traces, of the same shape.
+        sparse.GCXS
+            Spatial footprints of shape (num_signals, fov height, fov width).
         """
         fluorescence_traces = np.ascontiguousarray(
             demixing_results.ac_array.export_c(), dtype=np.float64

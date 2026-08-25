@@ -47,7 +47,8 @@ class MesoscopePreprocess(MesoscopeTask):
         self.overwrite = kwargs.get("overwrite", False)
         all_files_present = super().setUp(**kwargs)  # Ensure files present
         if not self.overwrite:
-            # Check if the bin files already exist on disk, in which case we don't need to extract tifs
+            # Check if the bin files already exist on disk, in which case we don't need to extract
+            # tifs
             (bin_sig,) = dataset_from_name("data.bin", self.input_files)
             (renamed_bin_sig,) = dataset_from_name(
                 "imaging.frames_motionRegistered.bin", self.input_files
@@ -98,7 +99,8 @@ class MesoscopePreprocess(MesoscopeTask):
 
     @property
     def signature(self):
-        # The number of in and outputs will be dependent on the number of input raw imaging folders and output FOVs
+        # The number of in and outputs will be dependent on the number of input raw imaging folders
+        # and output FOVs
         I = ExpectedDataset.input  # noqa
         signature = {
             "input_files": [
@@ -129,9 +131,11 @@ class MesoscopePreprocess(MesoscopeTask):
         if (
             not self.overwrite
         ):  # If not forcing re-registration, check whether bin files already exist on disk
-            # Including the data.bin in the expected signature ensures raw data files are not needlessly re-downloaded
+            # Including the data.bin in the expected signature ensures raw data files are not
+            # needlessly re-downloaded
             # and/or uncompressed during task setup as the local data.bin may be used instead
-            # NB: The data.bin file is renamed to imaging.frames_motionRegistered.bin before registration to Alyx
+            # NB: The data.bin file is renamed to imaging.frames_motionRegistered.bin before
+            # registration to Alyx
             registered_bin = I("data.bin", "suite2p/plane*", True, unique=False) | I(
                 "imaging.frames_motionRegistered.bin", "suite2p/plane*", True, unique=False
             )
@@ -147,7 +151,8 @@ class MesoscopePreprocess(MesoscopeTask):
         Parameters
         ----------
         stat : numpy.array
-            The loaded stat.npy file. A structured array with fields ('lam', 'ypix', 'xpix', 'neuropil_mask').
+            The loaded stat.npy file. A structured array with fields ('lam', 'ypix', 'xpix',
+            'neuropil_mask').
         ops : numpy.array
             The loaded ops.npy file. A structured array with fields ('Ly', 'Lx').
 
@@ -193,7 +198,8 @@ class MesoscopePreprocess(MesoscopeTask):
             The location of the suite2p output (typically session_path/suite2p).
         rename_dict : dict or None
             The suite2p output filenames and the corresponding ALF name. NB: These files are saved
-            after transposition. Default is None, i.e. using the default mapping hardcoded in the function below.
+            after transposition. Default is None, i.e. using the default mapping hardcoded in the
+            function below.
 
         Returns
         -------
@@ -226,7 +232,8 @@ class MesoscopePreprocess(MesoscopeTask):
                 for file in plane_dir.iterdir():
                     if file.suffix != ".bin":
                         zf.write(file, arcname=file.name)
-            # save frameQC in each dir (for now, maybe there will be fov specific frame QC eventually)
+            # save frameQC in each dir (for now, maybe there will be fov specific frame QC
+            # eventually)
             if frameQC is not None and len(frameQC) > 0:
                 np.save(fov_dir.joinpath("mpci.mpciFrameQC.npy"), frameQC)
                 frameQC_names.to_csv(
@@ -452,7 +459,8 @@ class MesoscopePreprocess(MesoscopeTask):
         cXY -= np.min(cXY, axis=0)
         nXnYnZ = np.array([fov["nXnYnZ"] for fov in meta["FOV"]])
 
-        # Currently supporting z-stacks but not supporting dual plane / volumetric imaging, assert that this is not the case
+        # Currently supporting z-stacks but not supporting dual plane / volumetric imaging, assert
+        # that this is not the case
         if np.any(nXnYnZ[:, 2] > 1):
             raise NotImplementedError(
                 "Dual-plane imaging not yet supported, data seems to more than one plane per FOV"
@@ -485,7 +493,8 @@ class MesoscopePreprocess(MesoscopeTask):
         nchannels = len(meta["channelSaved"]) if isinstance(meta["channelSaved"], list) else 1
 
         # Computing number of unique z-planes (slices in tiff)
-        # FIXME this should work if all FOVs are discrete or if all FOVs are continuous, but may not work for combination of both
+        # FIXME this should work if all FOVs are discrete or if all FOVs are continuous, but may
+        # not work for combination of both
         slice_ids = [fov["slice_id"] for fov in meta["FOV"]]
         nplanes = len(set(slice_ids))
 
@@ -497,9 +506,12 @@ class MesoscopePreprocess(MesoscopeTask):
         db = {
             "data_path": sorted(map(str, self.session_path.glob(f"{self.device_collection}"))),
             "save_path0": str(self.session_path),
-            "look_one_level_down": False,  # don't look in the children folders as that is where the reference data is
-            "num_workers": self.cpu,  # this selects number of cores to parallelize over for the registration step
-            "num_workers_roi": -1,  # for parallelization over FOVs during cell detection, for now don't
+            # don't look in the children folders as that is where the reference data is
+            "look_one_level_down": False,
+            # this selects number of cores to parallelize over for the registration step
+            "num_workers": self.cpu,
+            # for parallelization over FOVs during cell detection, for now don't
+            "num_workers_roi": -1,
             "keep_movie_raw": False,
             "delete_bin": False,  # TODO: delete this on the long run
             "batch_size": 500,  # SP reduced this from 1000
@@ -507,22 +519,28 @@ class MesoscopePreprocess(MesoscopeTask):
             "combined": False,
             "nonrigid": True,
             "maxregshift": 0.05,  # default = 1
-            "denoise": 1,  # whether binned movie should be denoised before cell detection
+            # whether binned movie should be denoised before cell detection
+            "denoise": 1,
             "block_size": [128, 128],
-            "save_mat": True,  # save the data to Fall.mat
-            "move_bin": True,  # move the binary file to save_path
+            # save the data to Fall.mat
+            "save_mat": True,
+            # move the binary file to save_path
+            "move_bin": True,
             "mesoscan": True,
             "nplanes": nplanes,
             "nrois": len(meta["FOV"]),
             "nchannels": nchannels,
             "fs": meta["scanImageParams"]["hRoiManager"]["scanVolumeRate"],
-            "lines": [
-                list(np.asarray(fov["lineIdx"]) - 1) for fov in meta["FOV"]
-            ],  # subtracting 1 to make 0-based
-            "slices": slice_ids,  # this tells us which FOV corresponds to which tiff slices
-            "tau": self.get_default_tau(),  # deduce the GCamp used from Alyx mouse line (defaults to 1.5; that of GCaMP6s)
-            "functional_chan": 1,  # for now, eventually find(ismember(meta.channelSaved == meta.channelID.green))
-            "align_by_chan": 1,  # for now, eventually find(ismember(meta.channelSaved == meta.channelID.red))
+            # subtracting 1 to make 0-based
+            "lines": [list(np.asarray(fov["lineIdx"]) - 1) for fov in meta["FOV"]],
+            # this tells us which FOV corresponds to which tiff slices
+            "slices": slice_ids,
+            # deduce the GCamp used from Alyx mouse line (defaults to 1.5; that of GCaMP6s)
+            "tau": self.get_default_tau(),
+            # for now, eventually find(ismember(meta.channelSaved == meta.channelID.green))
+            "functional_chan": 1,
+            # for now, eventually find(ismember(meta.channelSaved == meta.channelID.red))
+            "align_by_chan": 1,
             "dx": dx.tolist(),
             "dy": dy.tolist(),
         }
@@ -660,14 +678,17 @@ class MesoscopePreprocess(MesoscopeTask):
         """
         Process inputs, run suite2p and make outputs alf compatible.
 
-        The suite2p processing takes place in a 'suite2p' folder within the session path. After running,
-        the data.bin files are moved to 'raw_bin_files' and the rest of the folder is zipped up and moved
+        The suite2p processing takes place in a 'suite2p' folder within the session path. After
+        running,
+        the data.bin files are moved to 'raw_bin_files' and the rest of the folder is zipped up and
+        moved
         to 'alf/
 
         Parameters
         ----------
         rename_files: bool
-            Whether to rename and reorganize the suite2p outputs to be alf compatible. Defaults is True.
+            Whether to rename and reorganize the suite2p outputs to be alf compatible. Defaults is
+            True.
         use_badframes: bool
             Whether to exclude bad frames indicated by the experimenter in badframes.mat.
         overwrite : bool
@@ -713,7 +734,8 @@ class MesoscopePreprocess(MesoscopeTask):
             except Exception:
                 _logger.error("Exception occurred, cleaning up incomplete suite2p folder")
                 # NB: Only remove the suite2p folder if there are no unexpected files in there
-                # If the extraction failed due to currupted tiffs, the ops file will not have been created
+                # If the extraction failed due to currupted tiffs, the ops file will not have been
+                # created
                 if save_path.exists() and set(
                     x.name for x in save_path.rglob("*") if x.is_file()
                 ) <= {"data.bin"}:
@@ -721,7 +743,8 @@ class MesoscopePreprocess(MesoscopeTask):
                 raise  # reraise original exception
 
         """ Bad frames """
-        # exptQC.mat contains experimenter QC values that may not affect ROI detection (e.g. noises, pauses)
+        # exptQC.mat contains experimenter QC values that may not affect ROI detection (e.g.
+        # noises, pauses)
         qc_datasets = dataset_from_name("exptQC.mat", self.input_files)
         qc_paths = [next(self.session_path.glob(d.glob_pattern), None) for d in qc_datasets]
         qc_paths = sorted(map(str, filter(None, qc_paths)))
@@ -734,7 +757,8 @@ class MesoscopePreprocess(MesoscopeTask):
             frameQC_names = pd.DataFrame(columns=["qc_values", "qc_labels"])
 
         # If applicable, save as bad_frames.npy in first raw_imaging_folder for suite2p
-        # badframes.mat contains QC values that do affect ROI detection (e.g. no PMT, lens artefacts)
+        # badframes.mat contains QC values that do affect ROI detection (e.g. no PMT, lens
+        # artefacts)
         badframes = np.array([], dtype="uint32")
         total_frames = 0
         # Ensure all indices are relative to total cumulative frames

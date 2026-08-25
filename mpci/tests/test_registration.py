@@ -214,6 +214,7 @@ class TestRegisterFOV(unittest.TestCase):
     def tearDown(self) -> None:
         """
         The ONE function is cached and therefore the One object persists beyond this test.
+
         Here we return the mode back to the default after testing behaviour in offline mode.
         """
         self.one.mode = "remote"

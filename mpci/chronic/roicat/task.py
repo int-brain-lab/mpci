@@ -12,16 +12,18 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from one.alf.path import ALFPath
 import roicat
-import roicat.data_importing
+
+# import roicat.data_importing
 from roicat.data_importing import Data_roicat
 
 from ibllib.pipes.tasks import Task
 from ibllib.pipes.base_tasks import RegisterRawDataTask
 from ibllib.oneibl.data_handlers import ExpectedDataset
-from typing import *
+from typing import List, Optional
 import scipy
 import scipy.sparse
 import torch
+import pickle
 
 
 logger = logging.getLogger("ibllib.ROICaT")
@@ -65,7 +67,10 @@ class SubjectAggregateTask(Task):
 
 
 def extract_masknmf_spatial_footprints(dr):
-    """Given a masknmf demixingresults object, extracts the spatial footprints in a format needed for ROICaT cross-session matching."""
+    """Extract the spatial footprints from a masknmf DemixingResults object.
+
+    The footprints are returned in the format needed for ROICaT cross-session matching.
+    """
     a = dr.ac_array.a.cpu().t().coalesce()  # Shape (num_neurons, num_pixels)
     row, col = a.indices()
     vals = a.values()
@@ -93,13 +98,13 @@ def extract_suite2p_spatial_footprints(
     ops: np.ndarray,
     stat: np.ndarray,
 ) -> scipy.sparse.csr_matrix:
-    """
-    From the suite2p/ROICaT repos
-    Returns:
-        (scipy.sparse.csr_matrix):
-            spatialFootprints (scipy.sparse.csr_matrix):
-                Sparse array of shape *(n_roi, frame_height * frame_width)*
-                containing the spatial footprints of the ROIs.
+    """From the suite2p/ROICaT repos.
+
+    Returns
+    -------
+    scipy.sparse.csr_matrix
+        spatialFootprints: sparse array of shape (n_roi, frame_height * frame_width)
+        containing the spatial footprints of the ROIs.
     """
     height, width = ops["Ly"], ops["Lx"]
     ## Add some code here to infer the height/width of the data from the ops file
@@ -140,15 +145,19 @@ class DemixingRoicat(Data_roicat):
         roi_image_dims: tuple[int, int] = (36, 36),
         highpass_sigma: Optional[int] = 3,
     ):
-        """
-        Generic interface for doing multi-session tracking with any analysis pipeline
+        """Generic interface for doing multi-session tracking with any analysis pipeline.
+
         Args:
-            mean_img_list (List[np.ndarray]): List of mean images from each imaging session. Each image should have same dimensions.
-            spatial_fp_list (List[np.ndarray]): List of spatial footprint arrays, one for each session. Each individual array has shape (num_rois, num_pixels).
+            mean_img_list (List[np.ndarray]): List of mean images from each imaging session. Each
+            image should have same dimensions.
+            spatial_fp_list (List[np.ndarray]): List of spatial footprint arrays, one for each
+            session. Each individual array has shape (num_rois, num_pixels).
                 Each spatial footprint is flattened into a row of this array in "C" order.
             um_per_pixel (float): Describes the resolution of the imaging
-            roi_image_dims (tuple[int, int]): Each ROI is spatially cropped for purposes of feature extraction in the ROICat pipeline. This specifies the crop dimensions.
-            highpass_sigma (int): We highpass filter the mean image to define an "enhanced" mean image (this is what s2p does) for use in the tracking pipeline.
+            roi_image_dims (tuple[int, int]): Each ROI is spatially cropped for purposes of feature
+            extraction in the ROICat pipeline. This specifies the crop dimensions.
+            highpass_sigma (int): We highpass filter the mean image to define an "enhanced" mean
+            image (this is what s2p does) for use in the tracking pipeline.
         """
         super().__init__()
         self.um_per_pixel = um_per_pixel
@@ -222,8 +231,12 @@ class ROICaTTask(SubjectAggregateTask):
     io_charge = 60  # integer percentage
     priority = 70  # integer percentage, 100 means highest priority
     ram = 12  # RAM needed to run (GB)
-    job_size = "large"  # either 'small' or 'large', defines whether task should be run as part of the large or small job services
-    env = "roicat"  # the environment name within which to run the task (NB: the env is not activated automatically!)
+    # either 'small' or 'large', defines whether task should be run as part of the large or small
+    # job services
+    job_size = "large"
+    # the environment name within which to run the task (NB: the env is not activated
+    # automatically!)
+    env = "roicat"
 
     def __init__(self, subject_path, select_RFM_days_only=False, **kwargs):
         """A task for running ROICaT accross a subject's imaging sessions.
@@ -240,7 +253,8 @@ class ROICaTTask(SubjectAggregateTask):
 
     @property
     def signature(self):
-        # The number of in and outputs will be dependent on the number of input raw imaging folders and output FOVs
+        # The number of in and outputs will be dependent on the number of input raw imaging folders
+        # and output FOVs
         I = ExpectedDataset.input  # noqa
         # TODO Handle mlapdv provenance properly
         inputs = I(
@@ -267,17 +281,22 @@ class ROICaTTask(SubjectAggregateTask):
         Parameters
         ----------
         sessions_to_exclude : list of str, optional
-            List of session paths to exclude from processing, in short format (e.g. 'SP072/2025-09-17/001'), by default None.
+            List of session paths to exclude from processing, in short format (e.g.
+            'SP072/2025-09-17/001'), by default None.
         sessions_to_include : list of str, optional
-            List of session paths to include in processing, in short format (e.g. 'SP072/2025-09-17/001'), by default None.
+            List of session paths to include in processing, in short format (e.g.
+            'SP072/2025-09-17/001'), by default None.
         display : bool, optional
-            Whether to display the mean images for each FOV group and allow the user to exclude additional sessions based on
+            Whether to display the mean images for each FOV group and allow the user to exclude
+            additional sessions based on
             image quality, by default False.
         threshold : float, optional
-            The maximum distance in microns between FOVs for them to be considered part of the same group in the initial
+            The maximum distance in microns between FOVs for them to be considered part of the same
+            group in the initial
             clustering step, by default 300.
         display_processed_images : bool, optional
-            Whether to display processed mean images as ROICaT sees them or the images from mpciMeanImage.images.npy (quicker).
+            Whether to display processed mean images as ROICaT sees them or the images from
+            mpciMeanImage.images.npy (quicker).
             By default True (the former).
         """
         # Load the list of sessions to process
@@ -290,7 +309,8 @@ class ROICaTTask(SubjectAggregateTask):
         grouped = self.group_fovs(paths, **kwargs)
 
         if display:
-            # Display all mean images for user to optionally exclude any additional sessions before processing
+            # Display all mean images for user to optionally exclude any additional sessions before
+            # processing
             for gID, paths in grouped.items():
                 # Load mean images for this group
                 if kwargs.get("display_processed_images", True):
@@ -322,14 +342,18 @@ class ROICaTTask(SubjectAggregateTask):
                         va="top",
                     )
                 logger.info(
-                    "Displaying mean images for FOV group %s. Please inspect and decide if any sessions should be excluded based on image quality or other factors.",
+                    "Displaying mean images for FOV group %s. Please inspect and decide if any"
+                    "sessions should be excluded based on image quality or other factors.",
                     gID,
                 )
                 plt.tight_layout()
                 plt.show()  # plt.savefig("debug_cluster.png", dpi=150)
-                # Prompt the user to input any indices of sessions to exclude from this cluster, separated by commas (e.g., "0,2" to exclude the first and third sessions in the cluster)
+                # Prompt the user to input any indices of sessions to exclude from this cluster,
+                # separated by commas (e.g., "0,2" to exclude the first and third sessions in the
+                # cluster)
                 exclude_input = input(
-                    f"Enter indices of sessions to exclude from FOV group {gID}, separated by commas (or press Enter to keep all): "
+                    f"Enter indices of sessions to exclude from FOV group {gID}, "
+                    f"separated by commas (or press Enter to keep all): "
                 )
                 if exclude_input.strip():
                     exclude_indices = list(map(int, map(str.strip, exclude_input.split(","))))
@@ -362,7 +386,8 @@ class ROICaTTask(SubjectAggregateTask):
             ## Run ROICaT
             defaults = roicat.util.get_default_parameters(pipeline="tracking")
             # dir save
-            # Save to temp dir first then copy to final destination, to avoid issues with network drive
+            # Save to temp dir first then copy to final destination, to avoid issues with network
+            # drive
             defaults["results_saving"]["dir_save"] = Path(tmp_output.name) / f"group_{gID:02d}"
             defaults["results_saving"]["dir_save"].mkdir(exist_ok=True)
             result, run_data, params = roicat.pipelines.pipeline_tracking(
@@ -373,8 +398,10 @@ class ROICaTTask(SubjectAggregateTask):
             """
             Exlude some clusters based on quality metrics (e.g. silhouette score)
 
-            Option 1: Exclude low-quality clusters entirely (NB this will exclude all ROIs in those clusters from the final output)
-            Option 2: Add these two quality metrics as additional columns in the final output, so users can apply their own thresholds
+            Option 1: Exclude low-quality clusters entirely (NB this will exclude all ROIs in those
+            clusters from the final output)
+            Option 2: Add these two quality metrics as additional columns in the final output, so
+            users can apply their own thresholds
             """
             sample_silhouette = np.array(
                 result["clusters"]["quality_metrics"]["sample_silhouette"]
@@ -396,7 +423,8 @@ class ROICaTTask(SubjectAggregateTask):
                 df["eid"] = self.one.path2eid(path.session_path()) if self.one else None
                 dfs.append(df)
             roi_table = pd.concat(dfs, ignore_index=True)
-            # Create a mapping from ROICaT cluster label to a new UUID, with -1 (unclustered) mapping to NA
+            # Create a mapping from ROICaT cluster label to a new UUID, with -1 (unclustered)
+            # mapping to NA
             # TODO We may want to preserve the id2uuid map
             id2uuid = {
                 int(k): None if k == "-1" else uuid.uuid4()
@@ -410,7 +438,8 @@ class ROICaTTask(SubjectAggregateTask):
             logger.info("Number of clusters: %i", roi_table["cluster_id"].unique().size)
             logger.info("Number of discarded ROIs: %i", roi_table["cluster_id"].isna().sum())
 
-            # Drop rows with cluster_id NA (these are the unclustered ROIs that didn't track across sessions)
+            # Drop rows with cluster_id NA (these are the unclustered ROIs that didn't track across
+            # sessions)
             roi_table = roi_table.dropna(subset=["cluster_id"])
             roi_tables.append(roi_table)
 
@@ -433,6 +462,7 @@ class ROICaTTask(SubjectAggregateTask):
     def load_data(self, paths):
         """
         Load the data for ROICaT processing.
+
         Args:
             paths: List of paths, one to each of the suite2p_ROIData.raw.zip files.
 
@@ -520,7 +550,8 @@ class ROICaTTask(SubjectAggregateTask):
             # If animated GIF, do not resize
             note["width"] = "orig" if RegisterRawDataTask._is_animated_gif(img_path) else None
             if group_id is not None:
-                # To avoid image overwrites on Alyx we rename the image to include the group_id if provided
+                # To avoid image overwrites on Alyx we rename the image to include the group_id if
+                # provided
                 img_path = img_path.rename(img_path.with_stem(f"{group_id}_{img_path.stem}"))
                 note["text"] = f"FOV group {group_id} - {img_path.stem}"
             else:
@@ -546,14 +577,17 @@ class ROICaTTask(SubjectAggregateTask):
         alf_paths : list of ALFPath
             List of ALFPath objects pointing to the FOV directories to be grouped.
         threshold : float
-            The maximum distance in microns between FOVs for them to be considered part of the same group.
-            This is a strict threshold used for complete-linkage clustering, which enforces that all
+            The maximum distance in microns between FOVs for them to be considered part of the same
+            group.
+            This is a strict threshold used for complete-linkage clustering, which enforces that
+            all
             members of a cluster are within this distance of each other.
         """
 
         def most_common_suffix(paths):
             """
             Finds the most common numerical string suffix from a list of file paths.
+
             Assumes each path ends with a numerical string (e.g., '00', '04').
 
             Parameters
@@ -614,7 +648,8 @@ class ROICaTTask(SubjectAggregateTask):
         groups = dict.fromkeys(map(int, new_ids))
 
         for cID in new_ids:
-            # in cases where two clustered FOVs come from the same session, choose the top one (TODO this is a HACK for now)
+            # in cases where two clustered FOVs come from the same session, choose the top one
+            # (TODO this is a HACK for now)
             path_list = []
             for p, n in zip(alf_paths, cLabels):
                 if n == cID and (
@@ -624,7 +659,8 @@ class ROICaTTask(SubjectAggregateTask):
 
             groups[int(cID)] = path_list
             if path_list:
-                # in cases where two clustered FOVs come from the same session, choose the top one (TODO this is a HACK for now)
+                # in cases where two clustered FOVs come from the same session, choose the top one
+                # (TODO this is a HACK for now)
                 inferred_name = "FOV_" + most_common_suffix(path_list)
                 cluster_name = f"cFOV_{cID:02d}"
 
@@ -660,7 +696,8 @@ if __name__ == "__main__":
     task.get_signatures()
     # task.assert_expected_inputs()  # TODO support subject path
 
-    # FOV_paths_all = list(np.unique([(Path(path) / '..').resolve() for path in paths_allMLAPDV]))  # parent
+    # FOV_paths_all = list(np.unique([(Path(path) / '..').resolve() for path in paths_allMLAPDV]))
+    # # parent
     # RFM_paths_all = list(np.unique([(Path(path) / '..').resolve() for path in paths_allRFM]))
 
     # if select_RFM_days_only:
@@ -668,10 +705,11 @@ if __name__ == "__main__":
     #     alf_paths_2 = list(np.unique([(Path(path) / '..').resolve() for path in RFM_paths_all]))
     #     alf_paths_full = list(np.unique(list(set(alf_paths_1).intersection(set(alf_paths_2)))))
     # else:
-    #     alf_paths_full = list(np.unique([(Path(path) / '..').resolve() for path in FOV_paths_all]))
+    # alf_paths_full = list(np.unique([(Path(path) / '..').resolve() for path in FOV_paths_all]))
 
     # #exclude the buggy days
-    # alf_paths = list([Path(path).resolve() for path in alf_paths_full if not any(d in path.__str__() for d in days_to_exclude)])
+    # alf_paths = list([Path(path).resolve() for path in alf_paths_full if not any(d in
+    # path.__str__() for d in days_to_exclude)])
     exclude = {
         "SP072/2025-09-17/001",
         "SP072/2025-09-18/001",

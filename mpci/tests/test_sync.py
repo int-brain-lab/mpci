@@ -57,7 +57,8 @@ class TestMesoscopeSyncTimeline(unittest.TestCase):
     def test_get_timeshifts_multidepth(self):
         """Test MescopeSyncTimeline.get_timeshifts method.
 
-        This tests output when given multiple FOVs at different depths. The tasks/mesoscope_tasks.py
+        This tests output when given multiple FOVs at different depths. The
+        tasks/mesoscope_tasks.py
         module in iblscripts more thoroughly tests single-depth imaging with real data.
         """
         line_indices, fov_time_shifts, line_time_shifts = MesoscopeSyncTimeline.get_timeshifts(

@@ -23,11 +23,11 @@ class MesoscopeTask(DynamicTask):
         )
 
     def get_signatures(self, **kwargs):
-        """
-        From the template signature of the task, create the exact list of inputs and outputs to expect based on the
-        available device collection folders.
+        """Create the exact list of inputs and outputs to expect.
 
-        Necessary because we don't know in advance how many device collection folders ("imaging bouts") to expect
+        Derived from the template signature of the task and the available device collection
+        folders. Necessary because we don't know in advance how many device collection folders
+        ("imaging bouts") to expect.
         """
         # Glob for all device collection (raw imaging data) folders
         raw_imaging_folders = [
@@ -38,7 +38,8 @@ class MesoscopeTask(DynamicTask):
         if not raw_imaging_folders:
             _logger.warning('No folders found for device collection "%s"', self.device_collection)
             return
-        # For all inputs and outputs that are part of the device collection, expand to one file per folder
+        # For all inputs and outputs that are part of the device collection, expand to one file per
+        # folder
         # All others keep unchanged
         self.input_files = [
             update_collections(x, raw_imaging_folders, self.device_collection, exact_match=True)
