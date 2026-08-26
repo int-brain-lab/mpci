@@ -11,7 +11,7 @@ from typing import Tuple
 
 def calculate_surface_triangulation(atlas: BrainAtlas) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Run surface triangulation on the given brain atlas and return the mesh vertices and connectivity list.
+    Compute surface the brain mesh vertices and connectivity list by surface triangulation.
 
     Parameters
     ----------
@@ -51,14 +51,11 @@ def get_surface_points(atlas: BrainAtlas, dropna=True) -> np.ndarray:
     np.ndarray
         Surface points with shape (N, 3) in (ml, ap, dv) coordinates.
     """
-
     ap_grid, ml_grid = np.meshgrid(
         atlas.bc.yscale, atlas.bc.xscale
     )  # now this indexes into AP, ML
     points = (
-        np.stack(
-            [ml_grid.T.flatten(), ap_grid.T.flatten(), atlas.top.flatten()], axis=1
-        )
+        np.stack([ml_grid.T.flatten(), ap_grid.T.flatten(), atlas.top.flatten()], axis=1)
         * 1e6  # <- converts the atlas into μm
     )
     if dropna:

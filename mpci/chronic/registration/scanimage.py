@@ -5,6 +5,7 @@ for extracting atlas coordinates from FOV mean images.
 
 TODO This can move into task.py once the majority of the code moves to plane2brain
 """
+
 import json
 import enum
 import logging
@@ -24,10 +25,14 @@ import cv2
 from mpci.scanimage.io import get_window_px
 
 _logger = logging.getLogger(__name__)
-Provenance = enum.Enum('Provenance', ['ESTIMATE', 'FUNCTIONAL', 'LANDMARK', 'HISTOLOGY'])  # py3.11 make StrEnum
+Provenance = enum.Enum(
+    "Provenance", ["ESTIMATE", "FUNCTIONAL", "LANDMARK", "HISTOLOGY"]
+)  # py3.11 make StrEnum
 
 
-def preprocess_vasculature(image_stack, sigma=1.0, low_percentile=1, high_percentile=99, crop_size=390):
+def preprocess_vasculature(
+    image_stack, sigma=1.0, low_percentile=1, high_percentile=99, crop_size=390
+):
     """
     Preprocess image to enhance vasculature and suppress fluorescence.
 
@@ -42,7 +47,8 @@ def preprocess_vasculature(image_stack, sigma=1.0, low_percentile=1, high_percen
     high_percentile : float
         Upper percentile for contrast stretching.
     crop_size : int
-        Size of the crop to apply to the image.  This should be the size of resulting image in pixels.
+        Size of the crop to apply to the image.  This should be the size of resulting image in
+        pixels.
 
     Returns
     -------
@@ -80,15 +86,18 @@ def preprocess_vasculature(image_stack, sigma=1.0, low_percentile=1, high_percen
             assert isinstance(crop_size, int)
             assert crop_size < min(image.shape)
             c = ((np.array(image.shape) - crop_size) / 2).astype(int)
-            image = image[c[0]:(c[0] + crop_size), c[1]:(c[1] + crop_size)]
+            image = image[c[0] : (c[0] + crop_size), c[1] : (c[1] + crop_size)]
 
     return (image * 255).astype(np.uint8)
 
 
-def register_reference_stacks(stack_path, target_stack_path, save_path=None, display=False, **kwargs):
+def register_reference_stacks(
+    stack_path, target_stack_path, save_path=None, display=False, **kwargs
+):
     """Register one reference stack to another.
 
-    Register using Enhanced Correlation Coefficient (ECC) optimization. This method can handle small rotations
+    Register using Enhanced Correlation Coefficient (ECC) optimization. This method can handle
+    small rotations
     and translations, and is robust to intensity variations.
 
     Parameters
@@ -115,36 +124,46 @@ def register_reference_stacks(stack_path, target_stack_path, save_path=None, dis
     """
     img_data = {}
     # Load and process the two stacks
-    for key, path in zip(('stack', 'target_stack'), (stack_path, target_stack_path)):
+    for key, path in zip(("stack", "target_stack"), (stack_path, target_stack_path)):
         if (path := ALFPath(path)).is_file():
             pass
         elif path.is_session_path():
             try:  # glob for reference stack in session folder
-                path = next(path.glob('raw_imaging_data_??/reference/referenceImage.stack.*'))
+                path = next(path.glob("raw_imaging_data_??/reference/referenceImage.stack.*"))
             except StopIteration:
-                raise FileNotFoundError(f'No reference stack found in session path {path}')
+                raise FileNotFoundError(f"No reference stack found in session path {path}")
         else:
-            raise ValueError(f'Invalid stack path {path}')
+            raise ValueError(f"Invalid stack path {path}")
         # Load the image data
         # img_data[key] = ScanImageTiffReader(str(path)).data()
         img_data[key] = skimage.io.imread(path)
-        if kwargs.get('crop_size') is True:
+        if kwargs.get("crop_size") is True:
             try:
                 # Attempt to determine crop size based on window size
-                meta = alfio.load_file_content(path.with_name('referenceImage.meta.json'))
+                meta = alfio.load_file_content(path.with_name("referenceImage.meta.json"))
                 center_px, radius_px, image_size = get_window_px(meta)
-                crop_size = slice(max(0, int(center_px[0] - radius_px[0])), min(image_size[0], int(center_px[0] + radius_px[0]))), \
-                            slice(max(0, int(center_px[1] - radius_px[1])), min(image_size[1], int(center_px[1] + radius_px[1])))
-                kwargs['crop_size'] = crop_size
-                _logger.info(f'Determined crop size for {path.session_path_short()}: {crop_size}')
+                crop_size = (
+                    slice(
+                        max(0, int(center_px[0] - radius_px[0])),
+                        min(image_size[0], int(center_px[0] + radius_px[0])),
+                    ),
+                    slice(
+                        max(0, int(center_px[1] - radius_px[1])),
+                        min(image_size[1], int(center_px[1] + radius_px[1])),
+                    ),
+                )
+                kwargs["crop_size"] = crop_size
+                _logger.info(f"Determined crop size for {path.session_path_short()}: {crop_size}")
             except StopIteration:
-                _logger.warning(f'Could not determine crop size for {path}, using default')
-                kwargs['crop_size'] = 390  # Default crop size for 5mm window at pix_per_um=0.8
+                _logger.warning(f"Could not determine crop size for {path}, using default")
+                kwargs["crop_size"] = 390  # Default crop size for 5mm window at pix_per_um=0.8
 
-        img_data[key + '_processed'] = preprocess_vasculature(img_data[key], **kwargs).astype(np.float32)
+        img_data[key + "_processed"] = preprocess_vasculature(img_data[key], **kwargs).astype(
+            np.float32
+        )
 
     # Calculate quality metric (normalized cross-correlation)
-    ref, stack = img_data['target_stack_processed'], img_data['stack_processed']
+    ref, stack = img_data["target_stack_processed"], img_data["stack_processed"]
 
     # Define 2x3 affine transformation matrix for Euclidean transform
     warp_matrix = np.eye(2, 3, dtype=np.float32)
@@ -153,11 +172,17 @@ def register_reference_stacks(stack_path, target_stack_path, save_path=None, dis
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 5000, 1e-6)
 
     # Run the ECC algorithm
-    (cc, warp_matrix) = cv2.findTransformECC(ref, stack, warp_matrix, cv2.MOTION_EUCLIDEAN, criteria)
+    (cc, warp_matrix) = cv2.findTransformECC(
+        ref, stack, warp_matrix, cv2.MOTION_EUCLIDEAN, criteria
+    )
 
     # Apply the transformation to the processed image
     aligned_processed = cv2.warpAffine(
-        stack, warp_matrix, (stack.shape[1], stack.shape[0]), flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP)
+        stack,
+        warp_matrix,
+        (stack.shape[1], stack.shape[0]),
+        flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
+    )
 
     # Extract parameters
     rotation = np.arctan2(warp_matrix[1, 0], warp_matrix[0, 0])  # in radians
@@ -171,29 +196,44 @@ def register_reference_stacks(stack_path, target_stack_path, save_path=None, dis
     ncc = np.mean(ref_norm * aligned_norm)
 
     params = {
-        'translation': translation,
-        'rotation': rotation,
-        'correlation': cc,
-        'quality_ncc': ncc,
-        'warp_matrix': warp_matrix,
-        'method': 'ecc'
+        "translation": translation,
+        "rotation": rotation,
+        "correlation": cc,
+        "quality_ncc": ncc,
+        "warp_matrix": warp_matrix,
+        "method": "ecc",
     }
     # The same warp we will use on the MLAPDV array
-    transform_robust = (skimage.transform.EuclideanTransform(rotation=params['rotation']) +
-                        skimage.transform.EuclideanTransform(translation=params['translation']))
-    img_data['aligned'] = skimage.transform.warp(
-        np.max(img_data['stack'], axis=0), transform_robust,
-        order=1, mode='constant', cval=0, clip=True, preserve_range=True)
-    img_data['aligned_processed'] = skimage.transform.warp(
-        img_data['stack_processed'], transform_robust,
-        order=1, mode='constant', cval=0, clip=True, preserve_range=True)
+    transform_robust = skimage.transform.EuclideanTransform(
+        rotation=params["rotation"]
+    ) + skimage.transform.EuclideanTransform(translation=params["translation"])
+    img_data["aligned"] = skimage.transform.warp(
+        np.max(img_data["stack"], axis=0),
+        transform_robust,
+        order=1,
+        mode="constant",
+        cval=0,
+        clip=True,
+        preserve_range=True,
+    )
+    img_data["aligned_processed"] = skimage.transform.warp(
+        img_data["stack_processed"],
+        transform_robust,
+        order=1,
+        mode="constant",
+        cval=0,
+        clip=True,
+        preserve_range=True,
+    )
 
     write_stack_registration_qc(img_data, params, save_path=save_path, display=display)
 
-    return img_data['aligned'], params
+    return img_data["aligned"], params
 
 
-def write_stack_registration_qc(img_data, params, save_path=None, display=False, plot_processed=False):
+def write_stack_registration_qc(
+    img_data, params, save_path=None, display=False, plot_processed=False
+):
     """Write QC figure for stack registration.
 
     Writes an animated figure with three subplots, the first switching between aligned and
@@ -222,50 +262,69 @@ def write_stack_registration_qc(img_data, params, save_path=None, display=False,
 
     """
     fig, axs = plt.subplots(2, 2)
-    fig.suptitle('Reference session (*) vs session stack', fontsize=16)
+    fig.suptitle("Reference session (*) vs session stack", fontsize=16)
 
     # Max project the images
-    target_stack = img_data['target_stack_processed'] if plot_processed else np.max(img_data['target_stack'], axis=0)
-    stack = img_data['stack_processed'] if plot_processed else np.max(img_data['stack'], axis=0)
-    aligned = img_data['aligned_processed'] if plot_processed else img_data['aligned']
+    target_stack = (
+        img_data["target_stack_processed"]
+        if plot_processed
+        else np.max(img_data["target_stack"], axis=0)
+    )
+    stack = img_data["stack_processed"] if plot_processed else np.max(img_data["stack"], axis=0)
+    aligned = img_data["aligned_processed"] if plot_processed else img_data["aligned"]
 
     # Calculate difference images
     if plot_processed:
-        unaligned_diff_raw = img_data['target_stack_processed'] - img_data['stack_processed']
-        aligned_diff_raw = img_data['target_stack_processed'] - img_data['aligned_processed']
+        unaligned_diff_raw = img_data["target_stack_processed"] - img_data["stack_processed"]
+        aligned_diff_raw = img_data["target_stack_processed"] - img_data["aligned_processed"]
         maxmax = max(np.max(unaligned_diff_raw), np.max(aligned_diff_raw))
         minmin = min(np.min(unaligned_diff_raw), np.min(aligned_diff_raw))
-        unaligned_diff = (((unaligned_diff_raw - minmin) / (maxmax - minmin)) * 255).astype(np.uint8)
+        unaligned_diff = (((unaligned_diff_raw - minmin) / (maxmax - minmin)) * 255).astype(
+            np.uint8
+        )
         aligned_diff = (((aligned_diff_raw - minmin) / (maxmax - minmin)) * 255).astype(np.uint8)
     else:
-        unaligned_diff_raw = img_data['target_stack'] - img_data['stack']
-        aligned_diff_raw = img_data['target_stack'] - img_data['aligned']
+        unaligned_diff_raw = img_data["target_stack"] - img_data["stack"]
+        aligned_diff_raw = img_data["target_stack"] - img_data["aligned"]
         maxmax = max(np.max(unaligned_diff_raw), np.max(aligned_diff_raw))
         minmin = min(np.min(unaligned_diff_raw), np.min(aligned_diff_raw))
-        unaligned_diff = np.max((((unaligned_diff_raw - minmin) / (maxmax - minmin)) * 255), axis=0).astype(np.uint8)
-        aligned_diff = np.max((((aligned_diff_raw - minmin) / (maxmax - minmin)) * 255), axis=0).astype(np.uint8)
+        unaligned_diff = np.max(
+            (((unaligned_diff_raw - minmin) / (maxmax - minmin)) * 255), axis=0
+        ).astype(np.uint8)
+        aligned_diff = np.max(
+            (((aligned_diff_raw - minmin) / (maxmax - minmin)) * 255), axis=0
+        ).astype(np.uint8)
 
     # Initial plots
     unaligned_plot = axs[0][0].imshow(target_stack)
-    axs[0][0].set_title('Unaligned')
+    axs[0][0].set_title("Unaligned")
     aligned_plot = axs[0][1].imshow(target_stack)
-    axs[0][1].set_title('Aligned')
+    axs[0][1].set_title("Aligned")
     trans_plot = axs[1][0].imshow(stack)
-    axs[1][0].set_title('Transform (unaligned vs aligned)')
-    diff_plot = axs[1][1].imshow(unaligned_diff, cmap='grey')
-    axs[1][1].set_title('Difference')
+    axs[1][0].set_title("Transform (unaligned vs aligned)")
+    diff_plot = axs[1][1].imshow(unaligned_diff, cmap="grey")
+    axs[1][1].set_title("Difference")
 
     # Add large asterisk in top left corner to indicate which image is currently displayed
-    txt = [axs[0][i].text(
-        0.05, 0.95, '*', color='red', fontsize=20,
-        verticalalignment='top', horizontalalignment='left',
-        transform=axs[0][i].transAxes) for i in range(2)]
+    txt = [
+        axs[0][i].text(
+            0.05,
+            0.95,
+            "*",
+            color="red",
+            fontsize=20,
+            verticalalignment="top",
+            horizontalalignment="left",
+            transform=axs[0][i].transAxes,
+        )
+        for i in range(2)
+    ]
     # Remove all axes ticks and labels
     for ax in axs.flatten():
-        ax.axis('off')
+        ax.axis("off")
     # Write params at bottom of figure
-    par_text = [f'{k.capitalize()}: {v}' for k, v in params.items()]
-    fig.text(0., 0.01, ', \n'.join(par_text), ha='left')
+    par_text = [f"{k.capitalize()}: {v}" for k, v in params.items()]
+    fig.text(0.0, 0.01, ", \n".join(par_text), ha="left")
     # Reduce space between subplots
     # fig.tight_layout()
 
@@ -276,24 +335,24 @@ def write_stack_registration_qc(img_data, params, save_path=None, display=False,
             trans_plot.set_data(aligned)
             diff_plot.set_data(aligned_diff)
             for t in txt:
-                t.set_text('')
+                t.set_text("")
         else:
             unaligned_plot.set_data(target_stack)
             aligned_plot.set_data(target_stack)
             trans_plot.set_data(stack)
             diff_plot.set_data(unaligned_diff)
             for t in txt:
-                t.set_text('*')
+                t.set_text("*")
         return aligned_plot, unaligned_plot, diff_plot
 
     ani = animation.FuncAnimation(fig, update, frames=10, interval=1, blit=False)
     # Save animated figure as a GIF
     if save_path:
         save_path = Path(save_path)
-        if save_path.suffix != '.gif':
-            save_path = save_path.with_suffix('.gif')
-        ani.save(save_path, writer='pillow', fps=2)
-        _logger.info(f'Saved stack registration QC to {save_path}')
+        if save_path.suffix != ".gif":
+            save_path = save_path.with_suffix(".gif")
+        ani.save(save_path, writer="pillow", fps=2)
+        _logger.info(f"Saved stack registration QC to {save_path}")
         # Also save the parameters as a JSON file
         params = params.copy()
         for k, v in params.items():
@@ -303,7 +362,7 @@ def write_stack_registration_qc(img_data, params, save_path=None, display=False,
                 params[k] = float(v)
             else:
                 params[k] = v
-        with open(save_path.with_suffix('.json'), 'w') as fp:
+        with open(save_path.with_suffix(".json"), "w") as fp:
             json.dump(params, fp, indent=4)
 
     if display:

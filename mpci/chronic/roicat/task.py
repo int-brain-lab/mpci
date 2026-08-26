@@ -1,7 +1,7 @@
 """WIP ROICaT processing task for MPCI data."""
+
 import uuid
 import logging
-import shutil
 import tempfile
 from itertools import groupby
 from collections import Counter
@@ -11,21 +11,22 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from one.alf.path import ALFPath
-from one.api import ONE
 import roicat
-import roicat.data_importing
+
+# import roicat.data_importing
 from roicat.data_importing import Data_roicat
 
 from ibllib.pipes.tasks import Task
 from ibllib.pipes.base_tasks import RegisterRawDataTask
 from ibllib.oneibl.data_handlers import ExpectedDataset
-from typing import *
+from typing import List, Optional
 import scipy
 import scipy.sparse
 import torch
+import pickle
 
 
-logger = logging.getLogger('ibllib.ROICaT')
+logger = logging.getLogger("ibllib.ROICaT")
 
 
 class SubjectAggregateTask(Task):
@@ -56,16 +57,19 @@ class SubjectAggregateTask(Task):
         list
             The output of the `DataHandler.upload_data` method, e.g. a list of registered datasets.
         """
-        if self.location != 'server':
-            raise NotImplementedError('Dataset registration is only implemented for server-side execution.')
+        if self.location != "server":
+            raise NotImplementedError(
+                "Dataset registration is only implemented for server-side execution."
+            )
         # TODO Register to aggregates endpoint
         raise NotImplementedError
         return self.data_handler.uploadData(self.outputs, self.version, **kwargs)
 
 
 def extract_masknmf_spatial_footprints(dr):
-    """
-    Given a masknmf demixingresults object, extracts the spatial footprints in a format needed for ROICaT cross-session matching
+    """Extract the spatial footprints from a masknmf DemixingResults object.
+
+    The footprints are returned in the format needed for ROICaT cross-session matching.
     """
     a = dr.ac_array.a.cpu().t().coalesce()  # Shape (num_neurons, num_pixels)
     row, col = a.indices()
@@ -89,19 +93,20 @@ def extract_masknmf_spatial_footprints(dr):
 def extract_masknmf_mean_img(dr):
     return dr.pmd_array.mean_img.cpu().numpy()
 
+
 def extract_suite2p_spatial_footprints(
-        ops: np.ndarray,
-        stat: np.ndarray,
+    ops: np.ndarray,
+    stat: np.ndarray,
 ) -> scipy.sparse.csr_matrix:
+    """From the suite2p/ROICaT repos.
+
+    Returns
+    -------
+    scipy.sparse.csr_matrix
+        spatialFootprints: sparse array of shape (n_roi, frame_height * frame_width)
+        containing the spatial footprints of the ROIs.
     """
-    From the suite2p/ROICaT repos
-    Returns:
-        (scipy.sparse.csr_matrix):
-            spatialFootprints (scipy.sparse.csr_matrix):
-                Sparse array of shape *(n_roi, frame_height * frame_width)*
-                containing the spatial footprints of the ROIs.
-    """
-    height, width = ops['Ly'], ops['Lx']
+    height, width = ops["Ly"], ops["Lx"]
     ## Add some code here to infer the height/width of the data from the ops file
     dtype = None
     isInt = np.issubdtype(dtype, np.integer)
@@ -109,45 +114,51 @@ def extract_suite2p_spatial_footprints(
     rois_to_stack = []
 
     for jj, roi in enumerate(stat):
-        lam = np.array(roi['lam'], ndmin=1)
+        lam = np.array(roi["lam"], ndmin=1)
         dtype = lam.dtype
         if isInt:
             lam = dtype(lam / lam.sum() * np.iinfo(dtype).max)
         else:
             lam = lam / lam.sum()
-        ypix = np.array(roi['ypix'], dtype=np.uint64, ndmin=1)
-        xpix = np.array(roi['xpix'], dtype=np.uint64, ndmin=1)
+        ypix = np.array(roi["ypix"], dtype=np.uint64, ndmin=1)
+        xpix = np.array(roi["xpix"], dtype=np.uint64, ndmin=1)
 
         tmp_roi = scipy.sparse.csr_matrix((lam, (ypix, xpix)), shape=(height, width), dtype=dtype)
         rois_to_stack.append(tmp_roi.reshape(1, -1))
 
     return scipy.sparse.vstack(rois_to_stack).tocsr()
 
+
 def extract_suite2p_mean_img(ops: dict) -> np.ndarray:
-    mean_img = ops['meanImg']
+    mean_img = ops["meanImg"]
     return mean_img
 
 
 class DemixingRoicat(Data_roicat):
-
     _notes = "um per pixel always 1.2 for IBL 2p mesoscope data"
-    def __init__(self,
-                 mean_img_list: List[np.ndarray],
-                 spatial_fp_list: List[scipy.sparse.coo_matrix],
-                 um_per_pixel: float = 1.2,
-                 roi_image_dims: tuple[int, int] = (36, 36),
-                 highpass_sigma: Optional[int] = 3):
-        """
-        Generic interface for doing multi-session tracking with any analysis pipeline
+
+    def __init__(
+        self,
+        mean_img_list: List[np.ndarray],
+        spatial_fp_list: List[scipy.sparse.coo_matrix],
+        um_per_pixel: float = 1.2,
+        roi_image_dims: tuple[int, int] = (36, 36),
+        highpass_sigma: Optional[int] = 3,
+    ):
+        """Generic interface for doing multi-session tracking with any analysis pipeline.
+
         Args:
-            mean_img_list (List[np.ndarray]): List of mean images from each imaging session. Each image should have same dimensions.
-            spatial_fp_list (List[np.ndarray]): List of spatial footprint arrays, one for each session. Each individual array has shape (num_rois, num_pixels).
+            mean_img_list (List[np.ndarray]): List of mean images from each imaging session. Each
+            image should have same dimensions.
+            spatial_fp_list (List[np.ndarray]): List of spatial footprint arrays, one for each
+            session. Each individual array has shape (num_rois, num_pixels).
                 Each spatial footprint is flattened into a row of this array in "C" order.
             um_per_pixel (float): Describes the resolution of the imaging
-            roi_image_dims (tuple[int, int]): Each ROI is spatially cropped for purposes of feature extraction in the ROICat pipeline. This specifies the crop dimensions.
-            highpass_sigma (int): We highpass filter the mean image to define an "enhanced" mean image (this is what s2p does) for use in the tracking pipeline.
+            roi_image_dims (tuple[int, int]): Each ROI is spatially cropped for purposes of feature
+            extraction in the ROICat pipeline. This specifies the crop dimensions.
+            highpass_sigma (int): We highpass filter the mean image to define an "enhanced" mean
+            image (this is what s2p does) for use in the tracking pipeline.
         """
-
         super().__init__()
         self.um_per_pixel = um_per_pixel
         self._highpass_sigma = highpass_sigma
@@ -162,9 +173,7 @@ class DemixingRoicat(Data_roicat):
         return self.set_FOV_images(fov_list)
 
     def _filter_and_normalize_mean_img(self):
-        """
-        This pipeline convolves each image with a
-        """
+        """This pipeline convolves each image with a."""
         if self._highpass_sigma is None:
             return self._mean_img_list
         else:
@@ -172,9 +181,9 @@ class DemixingRoicat(Data_roicat):
             Spatially high-pass filter each image and normalize the data between 0 and 1
             """
             radius = int(torch.ceil(torch.tensor(2 * self._highpass_sigma)).item())
-            size = 2 * radius + 1
+            2 * radius + 1
             coords = torch.arange(-radius, radius + 1, dtype=torch.float32)
-            yy, xx = torch.meshgrid(coords, coords, indexing='ij')
+            yy, xx = torch.meshgrid(coords, coords, indexing="ij")
 
             # 2D Gaussian
             kernel = torch.exp(-(xx**2 + yy**2) / (2 * self._highpass_sigma**2))
@@ -193,13 +202,19 @@ class DemixingRoicat(Data_roicat):
                 curr_mean_img = torch.from_numpy(self._mean_img_list[k]).float()
 
                 image = curr_mean_img.unsqueeze(0).unsqueeze(0)
-                image = torch.nn.functional.pad(image,
-                                                pad=(radius, radius, radius, radius), mode="reflect")
+                image = torch.nn.functional.pad(
+                    image, pad=(radius, radius, radius, radius), mode="reflect"
+                )
 
                 # Convolve
-                output = torch.nn.functional.conv2d(image, kernel, padding=0).squeeze(0).squeeze(0).cpu()
+                output = (
+                    torch.nn.functional.conv2d(image, kernel, padding=0)
+                    .squeeze(0)
+                    .squeeze(0)
+                    .cpu()
+                )
 
-                #Normalize + clip
+                # Normalize + clip
                 p1 = torch.quantile(output, 0.01)
                 p99 = torch.quantile(output, 0.99)
                 x_clipped = torch.clamp(output, min=p1, max=p99)
@@ -211,13 +226,17 @@ class DemixingRoicat(Data_roicat):
 
 
 class ROICaTTask(SubjectAggregateTask):
-    cpu = 1   # CPU resource
-    gpu = 1   # GPU resources: as of now, either 0 or 1
+    cpu = 1  # CPU resource
+    gpu = 1  # GPU resources: as of now, either 0 or 1
     io_charge = 60  # integer percentage
     priority = 70  # integer percentage, 100 means highest priority
     ram = 12  # RAM needed to run (GB)
-    job_size = 'large'  # either 'small' or 'large', defines whether task should be run as part of the large or small job services
-    env = 'roicat'  # the environment name within which to run the task (NB: the env is not activated automatically!)
+    # either 'small' or 'large', defines whether task should be run as part of the large or small
+    # job services
+    job_size = "large"
+    # the environment name within which to run the task (NB: the env is not activated
+    # automatically!)
+    env = "roicat"
 
     def __init__(self, subject_path, select_RFM_days_only=False, **kwargs):
         """A task for running ROICaT accross a subject's imaging sessions.
@@ -234,18 +253,23 @@ class ROICaTTask(SubjectAggregateTask):
 
     @property
     def signature(self):
-        # The number of in and outputs will be dependent on the number of input raw imaging folders and output FOVs
+        # The number of in and outputs will be dependent on the number of input raw imaging folders
+        # and output FOVs
         I = ExpectedDataset.input  # noqa
         # TODO Handle mlapdv provenance properly
-        inputs = I('mpciMeanImage.mlapdv_estimate.npy', '????-??-??/???/alf/FOV_??', True, unique=False)
-        inputs &= I('_suite2p_ROIData.raw.zip', '????-??-??/???/alf/FOV_??', True, unique=False)
+        inputs = I(
+            "mpciMeanImage.mlapdv_estimate.npy", "????-??-??/???/alf/FOV_??", True, unique=False
+        )
+        inputs &= I("_suite2p_ROIData.raw.zip", "????-??-??/???/alf/FOV_??", True, unique=False)
         if self.select_RFM_days_only:
-            raise NotImplementedError('AND with aggregates not implemented yet')
+            raise NotImplementedError("AND with aggregates not implemented yet")
             # FIXME may be in 'alf/' if only one protocol run that session
-            inputs &= I('_ibl_passiveRFM.times.npy', '????-??-??/???/alf/task_??', True, unique=False)
+            inputs &= I(
+                "_ibl_passiveRFM.times.npy", "????-??-??/???/alf/task_??", True, unique=False
+            )
         # TODO define output files
         outputs = []
-        return {'input_files': [inputs], 'output_files': outputs}
+        return {"input_files": [inputs], "output_files": outputs}
 
     def get_data_handler(self, **kwargs):
         """Data handlers not supported yet."""
@@ -257,219 +281,293 @@ class ROICaTTask(SubjectAggregateTask):
         Parameters
         ----------
         sessions_to_exclude : list of str, optional
-            List of session paths to exclude from processing, in short format (e.g. 'SP072/2025-09-17/001'), by default None.
+            List of session paths to exclude from processing, in short format (e.g.
+            'SP072/2025-09-17/001'), by default None.
         sessions_to_include : list of str, optional
-            List of session paths to include in processing, in short format (e.g. 'SP072/2025-09-17/001'), by default None.
+            List of session paths to include in processing, in short format (e.g.
+            'SP072/2025-09-17/001'), by default None.
         display : bool, optional
-            Whether to display the mean images for each FOV group and allow the user to exclude additional sessions based on
+            Whether to display the mean images for each FOV group and allow the user to exclude
+            additional sessions based on
             image quality, by default False.
         threshold : float, optional
-            The maximum distance in microns between FOVs for them to be considered part of the same group in the initial
+            The maximum distance in microns between FOVs for them to be considered part of the same
+            group in the initial
             clustering step, by default 300.
         display_processed_images : bool, optional
-            Whether to display processed mean images as ROICaT sees them or the images from mpciMeanImage.images.npy (quicker).
+            Whether to display processed mean images as ROICaT sees them or the images from
+            mpciMeanImage.images.npy (quicker).
             By default True (the former).
         """
         # Load the list of sessions to process
         if sessions_to_include and sessions_to_exclude:
-            raise ValueError('Cannot specify both sessions_to_include and sessions_to_exclude')
-        paths = self.fetch_fov_list(sessions_to_exclude=sessions_to_exclude, sessions_to_include=sessions_to_include)
+            raise ValueError("Cannot specify both sessions_to_include and sessions_to_exclude")
+        paths = self.fetch_fov_list(
+            sessions_to_exclude=sessions_to_exclude, sessions_to_include=sessions_to_include
+        )
         # paths = paths[:24]  # TODO remove limit
         grouped = self.group_fovs(paths, **kwargs)
 
         if display:
-            # Display all mean images for user to optionally exclude any additional sessions before processing
+            # Display all mean images for user to optionally exclude any additional sessions before
+            # processing
             for gID, paths in grouped.items():
                 # Load mean images for this group
-                if kwargs.get('display_processed_images', True):
+                if kwargs.get("display_processed_images", True):
                     mean_images = self.load_data(paths).FOV_images
                 else:
-                    mean_images = [np.load(path / 'mpciMeanImage.images.npy') for path in paths]
+                    mean_images = [np.load(path / "mpciMeanImage.images.npy") for path in paths]
                 # Create a figure with as many subplots as paths in the cluster
                 fig, axs = plt.subplots(1, len(paths), figsize=(5 * len(paths), 5))
-                fig.suptitle(f'FOV group {gID}', fontsize=16)
+                fig.suptitle(f"FOV group {gID}", fontsize=16)
                 for i, (ax, path) in enumerate(zip(axs, paths)):
                     mean_img = mean_images[i]
-                    ax.imshow(mean_img, cmap='gray')
+                    ax.imshow(mean_img, cmap="gray")
                     # Add crosshairs at the center
                     center_y, center_x = mean_img.shape[0] // 2, mean_img.shape[1] // 2
-                    ax.axhline(center_y, color='red', linestyle='--')
-                    ax.axvline(center_x, color='red', linestyle='--')
+                    ax.axhline(center_y, color="red", linestyle="--")
+                    ax.axvline(center_x, color="red", linestyle="--")
 
-                    ax.set_title(f'{path.session_path_short()} - {path.name}')
-                    ax.axis('off')
+                    ax.set_title(f"{path.session_path_short()} - {path.name}")
+                    ax.axis("off")
                     # Overlay a number in the corner for reference
-                    ax.text(0.05, 0.95, f'{i}', transform=ax.transAxes, fontsize=12, color='yellow', ha='left', va='top')
-                logger.info('Displaying mean images for FOV group %s. Please inspect and decide if any sessions should be excluded based on image quality or other factors.', gID)
+                    ax.text(
+                        0.05,
+                        0.95,
+                        f"{i}",
+                        transform=ax.transAxes,
+                        fontsize=12,
+                        color="yellow",
+                        ha="left",
+                        va="top",
+                    )
+                logger.info(
+                    "Displaying mean images for FOV group %s. Please inspect and decide if any"
+                    "sessions should be excluded based on image quality or other factors.",
+                    gID,
+                )
                 plt.tight_layout()
                 plt.show()  # plt.savefig("debug_cluster.png", dpi=150)
-                # Prompt the user to input any indices of sessions to exclude from this cluster, separated by commas (e.g., "0,2" to exclude the first and third sessions in the cluster)
-                exclude_input = input(f'Enter indices of sessions to exclude from FOV group {gID}, separated by commas (or press Enter to keep all): ')
+                # Prompt the user to input any indices of sessions to exclude from this cluster,
+                # separated by commas (e.g., "0,2" to exclude the first and third sessions in the
+                # cluster)
+                exclude_input = input(
+                    f"Enter indices of sessions to exclude from FOV group {gID}, "
+                    f"separated by commas (or press Enter to keep all): "
+                )
                 if exclude_input.strip():
-                    exclude_indices = list(map(int, map(str.strip, exclude_input.split(','))))
-                    grouped[gID] = [path for i, path in enumerate(paths) if i not in exclude_indices]
-                    logger.info('Excluding sessions at indices %s from FOV group %s\n\t%s', exclude_indices, gID,
-                                '\n\t'.join(f'{path.session_path_short()}/{path.name}' for i, path in enumerate(paths) if i in exclude_indices))
+                    exclude_indices = list(map(int, map(str.strip, exclude_input.split(","))))
+                    grouped[gID] = [
+                        path for i, path in enumerate(paths) if i not in exclude_indices
+                    ]
+                    logger.info(
+                        "Excluding sessions at indices %s from FOV group %s\n\t%s",
+                        exclude_indices,
+                        gID,
+                        "\n\t".join(
+                            f"{path.session_path_short()}/{path.name}"
+                            for i, path in enumerate(paths)
+                            if i in exclude_indices
+                        ),
+                    )
 
         # Ensure output directory exists
-        if not (outpath := self.subject_path.joinpath('ROICaT')).exists():
+        if not (outpath := self.subject_path.joinpath("ROICaT")).exists():
             outpath.mkdir(parents=True)
 
-        tmp_output = tempfile.TemporaryDirectory(prefix=f'roicat_{self.subject_path.name}_')
+        tmp_output = tempfile.TemporaryDirectory(prefix=f"roicat_{self.subject_path.name}_")
         roi_tables = []
         all_data = []
         for gID, paths in grouped.items():
-            logger.info(f'\nProcessing FOV set {gID}/{len(grouped)} with {len(paths)} FOVs')
+            logger.info(f"\nProcessing FOV set {gID}/{len(grouped)} with {len(paths)} FOVs")
             # Load the data for ROICaT processing
             data = self.load_data(paths)
 
             ## Run ROICaT
-            defaults = roicat.util.get_default_parameters(pipeline='tracking')
+            defaults = roicat.util.get_default_parameters(pipeline="tracking")
             # dir save
-            # Save to temp dir first then copy to final destination, to avoid issues with network drive
-            defaults['results_saving']['dir_save'] = Path(tmp_output.name) / f'group_{gID:02d}'
-            defaults['results_saving']['dir_save'].mkdir(exist_ok=True)
-            result, run_data, params = roicat.pipelines.pipeline_tracking(defaults, custom_data=data)
+            # Save to temp dir first then copy to final destination, to avoid issues with network
+            # drive
+            defaults["results_saving"]["dir_save"] = Path(tmp_output.name) / f"group_{gID:02d}"
+            defaults["results_saving"]["dir_save"].mkdir(exist_ok=True)
+            result, run_data, params = roicat.pipelines.pipeline_tracking(
+                defaults, custom_data=data
+            )
             all_data.append((result, run_data, params, paths))
 
             """
             Exlude some clusters based on quality metrics (e.g. silhouette score)
 
-            Option 1: Exclude low-quality clusters entirely (NB this will exclude all ROIs in those clusters from the final output)
-            Option 2: Add these two quality metrics as additional columns in the final output, so users can apply their own thresholds
+            Option 1: Exclude low-quality clusters entirely (NB this will exclude all ROIs in those
+            clusters from the final output)
+            Option 2: Add these two quality metrics as additional columns in the final output, so
+            users can apply their own thresholds
             """
-            sample_silhouette = np.array(result['clusters']['quality_metrics']['sample_silhouette'])
-            labels = np.array(result['clusters']['labels'])
-            labels[sample_silhouette < .1] = -1  # mark low-quality samples as unclustered
-            labels_dict = result['clusters']['labels_dict']
-            cluster_silhouette = result['clusters']['quality_metrics']['cluster_silhouette']
-            labels_dict = {k: v for i, (k, v) in enumerate(labels_dict.items()) if cluster_silhouette[i] > .2}  # filter out low-quality clusters
+            sample_silhouette = np.array(
+                result["clusters"]["quality_metrics"]["sample_silhouette"]
+            )
+            labels = np.array(result["clusters"]["labels"])
+            labels[sample_silhouette < 0.1] = -1  # mark low-quality samples as unclustered
+            labels_dict = result["clusters"]["labels_dict"]
+            cluster_silhouette = result["clusters"]["quality_metrics"]["cluster_silhouette"]
+            labels_dict = {
+                k: v for i, (k, v) in enumerate(labels_dict.items()) if cluster_silhouette[i] > 0.2
+            }  # filter out low-quality clusters
 
             # Load the ROI UUIDs from each session into a table
             dfs = []
             for path in paths:
-                df = pd.read_csv(path / 'mpciROIs.uuids.csv', names=['roi_id'], header=0)
-                df['FOV_path'] = path.name
-                df['session_path'] = path.session_path_short()
-                df['eid'] = self.one.path2eid(path.session_path()) if self.one else None
+                df = pd.read_csv(path / "mpciROIs.uuids.csv", names=["roi_id"], header=0)
+                df["FOV_path"] = path.name
+                df["session_path"] = path.session_path_short()
+                df["eid"] = self.one.path2eid(path.session_path()) if self.one else None
                 dfs.append(df)
             roi_table = pd.concat(dfs, ignore_index=True)
-            # Create a mapping from ROICaT cluster label to a new UUID, with -1 (unclustered) mapping to NA
+            # Create a mapping from ROICaT cluster label to a new UUID, with -1 (unclustered)
+            # mapping to NA
             # TODO We may want to preserve the id2uuid map
-            id2uuid = {int(k): None if k == '-1' else uuid.uuid4() for k in result['clusters']['labels_dict']}
-            roi_table['cluster_id'] = [id2uuid[label] or pd.NA for label in result['clusters']['labels']]
-            roi_table['group_id'] = gID
+            id2uuid = {
+                int(k): None if k == "-1" else uuid.uuid4()
+                for k in result["clusters"]["labels_dict"]
+            }
+            roi_table["cluster_id"] = [
+                id2uuid[label] or pd.NA for label in result["clusters"]["labels"]
+            ]
+            roi_table["group_id"] = gID
 
-            logger.info('Number of clusters: %i', roi_table['cluster_id'].unique().size)
-            logger.info('Number of discarded ROIs: %i', roi_table['cluster_id'].isna().sum())
+            logger.info("Number of clusters: %i", roi_table["cluster_id"].unique().size)
+            logger.info("Number of discarded ROIs: %i", roi_table["cluster_id"].isna().sum())
 
-            # Drop rows with cluster_id NA (these are the unclustered ROIs that didn't track across sessions)
-            roi_table = roi_table.dropna(subset=['cluster_id'])
+            # Drop rows with cluster_id NA (these are the unclustered ROIs that didn't track across
+            # sessions)
+            roi_table = roi_table.dropna(subset=["cluster_id"])
             roi_tables.append(roi_table)
 
             # Upload some of the images to Alyx for visualization purposes
             self.upload_visualization_images(
-                defaults['results_saving']['dir_save'] / 'visualization',
-                group_id=gID
+                defaults["results_saving"]["dir_save"] / "visualization", group_id=gID
             )
 
         # Concatenate all roi_tables into one DataFrame
         all_roi_table = pd.concat(roi_tables, ignore_index=True)
-        if not all_roi_table['roi_id'].unique().size == all_roi_table.shape[0]:
-            logger.warning('Duplicate ROI IDs across sessions.')
+        if not all_roi_table["roi_id"].unique().size == all_roi_table.shape[0]:
+            logger.warning("Duplicate ROI IDs across sessions.")
         # Save the combined table to a parquet file
-        all_roi_table.to_parquet(outpath / '_ibl_mpciROIs.tracked.pqt', index=False)
+        all_roi_table.to_parquet(outpath / "_ibl_mpciROIs.tracked.pqt", index=False)
         # Save raw output as a pickle
-        with open(outpath / '_ibl_roicat.raw.pkl', 'wb') as f:
+        with open(outpath / "_ibl_roicat.raw.pkl", "wb") as f:
             pickle.dump(all_data, f)
-        return [outpath / '_ibl_mpciROIs.tracked.pqt', outpath / '_ibl_roicat.raw.pkl']
+        return [outpath / "_ibl_mpciROIs.tracked.pqt", outpath / "_ibl_roicat.raw.pkl"]
 
     def load_data(self, paths):
         """
         Load the data for ROICaT processing.
+
         Args:
-            paths: List of paths, one to each of the suite2p_ROIData.raw.zip files
+            paths: List of paths, one to each of the suite2p_ROIData.raw.zip files.
 
         """
-
-        #Build a list for all mean images
+        # Build a list for all mean images
         mean_images = []
         footprints = []
         for filepath in paths:
-            zip_path = filepath / '_suite2p_ROIData.raw.zip'
+            zip_path = filepath / "_suite2p_ROIData.raw.zip"
             zip = np.load(zip_path, allow_pickle=True)
-            curr_ops = zip['ops'].item()
-            curr_stat = zip['stat']
+            curr_ops = zip["ops"].item()
+            curr_stat = zip["stat"]
             footprints.append(extract_suite2p_spatial_footprints(curr_ops, curr_stat))
             mean_images.append(extract_suite2p_mean_img(curr_ops))
 
+        data = DemixingRoicat(
+            mean_images,
+            footprints,
+            um_per_pixel=1.2,  ##This is specific to S. Picard's 2p mesoscope project
+            highpass_sigma=3,
+        )
 
-        data = DemixingRoicat(mean_images,
-                              footprints,
-                              um_per_pixel=1.2, ##This is specific to S. Picard's 2p mesoscope project
-                              highpass_sigma=3)
-
-        assert data.check_completeness(verbose=False)['tracking'], 'Data object is missing attributes necessary for tracking.'
+        assert data.check_completeness(verbose=False)["tracking"], (
+            "Data object is missing attributes necessary for tracking."
+        )
         return data
 
     def fetch_fov_list(self, sessions_to_exclude=None, sessions_to_include=None):
         """Fetch the list of FOVs to process."""
         match self.location:
-            case 'remote':
-                assert self.one and not self.one.offline, 'Remote data handling requires an active One instance'
-                eids = self.one.search(subject=self.subject_path.name, datasets=['_ibl_mpciMeanImage.mlapdv_estimate.npy'])
-                raise NotImplementedError('Remote data handling not implemented yet')
+            case "remote":
+                assert self.one and not self.one.offline, (
+                    "Remote data handling requires an active One instance"
+                )
+                self.one.search(
+                    subject=self.subject_path.name,
+                    datasets=["_ibl_mpciMeanImage.mlapdv_estimate.npy"],
+                )
+                raise NotImplementedError("Remote data handling not implemented yet")
         # Find ordered list of
         success, files, _ = self.input_files[0].find_files(self.subject_path)
         # Filter sessions with both meanimage and raw zip present
         files_grouped = groupby(sorted(files, key=lambda x: x.parent), key=lambda x: x.parent)
-        alf_paths = [ALFPath(k) for k, g in files_grouped if len(list(g)) == 2]  # both files present
+        alf_paths = [
+            ALFPath(k) for k, g in files_grouped if len(list(g)) == 2
+        ]  # both files present
 
         if sessions_to_exclude:
-            alf_paths = [path for path in alf_paths if path.session_path_short() not in sessions_to_exclude]
+            alf_paths = [
+                path for path in alf_paths if path.session_path_short() not in sessions_to_exclude
+            ]
         if sessions_to_include:
-            alf_paths = [path for path in alf_paths if path.session_path_short() in sessions_to_include]
+            alf_paths = [
+                path for path in alf_paths if path.session_path_short() in sessions_to_include
+            ]
         return alf_paths
 
     def upload_visualization_images(self, save_dir, group_id=None, **kwargs):
         """Upload some of the images to Alyx for visualization purposes."""
         if not self.one or self.one.offline or not save_dir or not save_dir.exists():
-             logger.warning('Skipping upload of visualization images to Alyx.')
-             return
+            logger.warning("Skipping upload of visualization images to Alyx.")
+            return
 
         images = [
-            'alignment/all_to_all_geometric.png', 'alignment/all_to_all_nonrigid.png',
-            'FOV_images_aligned_geometric/FOV_images_aligned_geometric.gif',
-            'FOV_images_aligned_nonrigid/FOV_images_aligned_nonrigid.gif',
-            'FOV_clusters.gif', 'clustering/dist.png'
+            "alignment/all_to_all_geometric.png",
+            "alignment/all_to_all_nonrigid.png",
+            "FOV_images_aligned_geometric/FOV_images_aligned_geometric.gif",
+            "FOV_images_aligned_nonrigid/FOV_images_aligned_nonrigid.gif",
+            "FOV_clusters.gif",
+            "clustering/dist.png",
         ]
         # TODO: Could add gif of ROI samples
-        subject_id = self.one.alyx.rest('subjects', 'read', id=self.subject_path.name)['id']
-        note = dict(user=self.one.alyx.user, content_type='subject', object_id=subject_id,
-                    text='', json=kwargs or None)
+        subject_id = self.one.alyx.rest("subjects", "read", id=self.subject_path.name)["id"]
+        note = dict(
+            user=self.one.alyx.user,
+            content_type="subject",
+            object_id=subject_id,
+            text="",
+            json=kwargs or None,
+        )
         notes = []
         # TODO Handle duplicate notes
         for img in images:
             img_path = save_dir / img
             # If animated GIF, do not resize
-            note['width'] = 'orig' if RegisterRawDataTask._is_animated_gif(img_path) else None
+            note["width"] = "orig" if RegisterRawDataTask._is_animated_gif(img_path) else None
             if group_id is not None:
-                # To avoid image overwrites on Alyx we rename the image to include the group_id if provided
-                img_path = img_path.rename(img_path.with_stem(f'{group_id}_{img_path.stem}'))
-                note['text'] = f'FOV group {group_id} - {img_path.stem}'
+                # To avoid image overwrites on Alyx we rename the image to include the group_id if
+                # provided
+                img_path = img_path.rename(img_path.with_stem(f"{group_id}_{img_path.stem}"))
+                note["text"] = f"FOV group {group_id} - {img_path.stem}"
             else:
-                note['text'] = img_path.stem
+                note["text"] = img_path.stem
             if img_path.exists():
-                with open(img_path, 'rb') as img_file:
-                    files = {'image': img_file}
-                    notes.append(self.one.alyx.rest('notes', 'create', data=note, files=files))
-                    logger.info(f'Uploaded {img} to Alyx for subject {self.subject_path.name}')
+                with open(img_path, "rb") as img_file:
+                    files = {"image": img_file}
+                    notes.append(self.one.alyx.rest("notes", "create", data=note, files=files))
+                    logger.info(f"Uploaded {img} to Alyx for subject {self.subject_path.name}")
             else:
-                logger.warning(f'Visualization image {img} not found at {img_path}, skipping upload.')
+                logger.warning(
+                    f"Visualization image {img} not found at {img_path}, skipping upload."
+                )
         return notes
 
-
-    def group_fovs(self, alf_paths, threshold=300.):
+    def group_fovs(self, alf_paths, threshold=300.0):
         """Group FOVs by their location.
 
         NB: This can be simplified when we've accounted for objective angle
@@ -479,20 +577,25 @@ class ROICaTTask(SubjectAggregateTask):
         alf_paths : list of ALFPath
             List of ALFPath objects pointing to the FOV directories to be grouped.
         threshold : float
-            The maximum distance in microns between FOVs for them to be considered part of the same group.
-            This is a strict threshold used for complete-linkage clustering, which enforces that all
+            The maximum distance in microns between FOVs for them to be considered part of the same
+            group.
+            This is a strict threshold used for complete-linkage clustering, which enforces that
+            all
             members of a cluster are within this distance of each other.
         """
 
         def most_common_suffix(paths):
             """
             Finds the most common numerical string suffix from a list of file paths.
+
             Assumes each path ends with a numerical string (e.g., '00', '04').
 
-            Parameters:
+            Parameters
+            ----------
             paths (list of str): List of file paths.
 
-            Returns:
+            Returns
+            -------
             str: Most common numerical suffix.
             """
             # Extract the suffix from each path (last 2 characters assumed)
@@ -507,15 +610,19 @@ class ROICaTTask(SubjectAggregateTask):
             return most_common[0][0] if most_common else None
 
         # Exclude paths without mlapdv estimates
-        alf_paths = sorted(p for p in alf_paths if (p / 'mpciMeanImage.mlapdv_estimate.npy').exists())
+        alf_paths = sorted(
+            p for p in alf_paths if (p / "mpciMeanImage.mlapdv_estimate.npy").exists()
+        )
 
         # figure out the candidate repeated sites using the MLAPDV data
-        MLAPDVs = np.array([np.load(p / 'mpciMeanImage.mlapdv_estimate.npy') for p in alf_paths]) # shape (n, 512, 512, 3)  [coords in microns: (ML, AP, DV)]
-        MLAPDVs_means = np.mean(MLAPDVs, axis=(1,2))
+        MLAPDVs = np.array(
+            [np.load(p / "mpciMeanImage.mlapdv_estimate.npy") for p in alf_paths]
+        )  # shape (n, 512, 512, 3)  [coords in microns: (ML, AP, DV)]
+        MLAPDVs_means = np.mean(MLAPDVs, axis=(1, 2))
 
         # Complete-linkage clustering enforces max intra-cluster distance ≤ threshold
-        Z = linkage(MLAPDVs_means, method='complete', metric='euclidean')
-        cLabels = fcluster(Z, t=threshold, criterion='distance')  # 1..K
+        Z = linkage(MLAPDVs_means, method="complete", metric="euclidean")
+        cLabels = fcluster(Z, t=threshold, criterion="distance")  # 1..K
 
         # Turn singletons into noise (-1)
         unique, counts = np.unique(cLabels, return_counts=True)
@@ -536,55 +643,61 @@ class ROICaTTask(SubjectAggregateTask):
 
         # Recompute sizes on the NEW cLabels (0..N-1)
         new_ids, new_sizes = np.unique(cLabels[cLabels != -1], return_counts=True)
-        n_clusters = len(new_ids)
+        len(new_ids)
 
         groups = dict.fromkeys(map(int, new_ids))
 
         for cID in new_ids:
-            #in cases where two clustered FOVs come from the same session, choose the top one (TODO this is a HACK for now)
+            # in cases where two clustered FOVs come from the same session, choose the top one
+            # (TODO this is a HACK for now)
             path_list = []
             for p, n in zip(alf_paths, cLabels):
-                if n == cID and (not any(path_list) or p.session_path() != path_list[-1].session_path()):
+                if n == cID and (
+                    not any(path_list) or p.session_path() != path_list[-1].session_path()
+                ):
                     path_list.append(p)
 
             groups[int(cID)] = path_list
             if path_list:
-                #in cases where two clustered FOVs come from the same session, choose the top one (TODO this is a HACK for now)
-                inferred_name = 'FOV_' + most_common_suffix(path_list)
+                # in cases where two clustered FOVs come from the same session, choose the top one
+                # (TODO this is a HACK for now)
+                inferred_name = "FOV_" + most_common_suffix(path_list)
                 cluster_name = f"cFOV_{cID:02d}"
 
-                logger.info('\nCluster name: %s   Inferred name: %s', cluster_name, inferred_name)
-                [logger.info(f"{i:02d} {path}") for i,path in enumerate(path_list)]
+                logger.info("\nCluster name: %s   Inferred name: %s", cluster_name, inferred_name)
+                [logger.info(f"{i:02d} {path}") for i, path in enumerate(path_list)]
 
-                #[print(path[34:-11]) for i,path in enumerate(paths_toFOVs)]
+                # [print(path[34:-11]) for i,path in enumerate(paths_toFOVs)]
 
         return groups
 
 
 def validate_sessions_list(paths):
-    """Ensure paths are short session paths"""
+    """Ensure paths are short session paths."""
     _paths = set()
     # convert full paths to short format
     for p in paths:
-        p = p.replace('\\', '/')
-        if len(p.split('/')) > 3:  # if full path provided, convert to short format
+        p = p.replace("\\", "/")
+        if len(p.split("/")) > 3:  # if full path provided, convert to short format
             _paths.add(ALFPath(p).session_path().relative_to(ROOT).as_posix())
         else:
             _paths.add(p)
     return _paths
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     from pathlib import Path
-    ROOT = Path('/mnt/whiterussian/Subjects')
-    subject = 'SP072'
+
+    ROOT = Path("/mnt/whiterussian/Subjects")
+    subject = "SP072"
     subject_path = ROOT / subject
 
-    task = ROICaTTask(subject_path)#, one=ONE())
+    task = ROICaTTask(subject_path)  # , one=ONE())
     task.get_signatures()
     # task.assert_expected_inputs()  # TODO support subject path
 
-    # FOV_paths_all = list(np.unique([(Path(path) / '..').resolve() for path in paths_allMLAPDV]))  # parent
+    # FOV_paths_all = list(np.unique([(Path(path) / '..').resolve() for path in paths_allMLAPDV]))
+    # # parent
     # RFM_paths_all = list(np.unique([(Path(path) / '..').resolve() for path in paths_allRFM]))
 
     # if select_RFM_days_only:
@@ -592,9 +705,14 @@ if __name__ == '__main__':
     #     alf_paths_2 = list(np.unique([(Path(path) / '..').resolve() for path in RFM_paths_all]))
     #     alf_paths_full = list(np.unique(list(set(alf_paths_1).intersection(set(alf_paths_2)))))
     # else:
-    #     alf_paths_full = list(np.unique([(Path(path) / '..').resolve() for path in FOV_paths_all]))
+    # alf_paths_full = list(np.unique([(Path(path) / '..').resolve() for path in FOV_paths_all]))
 
     # #exclude the buggy days
-    # alf_paths = list([Path(path).resolve() for path in alf_paths_full if not any(d in path.__str__() for d in days_to_exclude)])
-    exclude = {'SP072/2025-09-17/001', 'SP072/2025-09-18/001', 'SP072/2025-09-19/001'}  # These MLAPDV files have odd dimensions; (512, 756, 3), (512, 752, 3)
+    # alf_paths = list([Path(path).resolve() for path in alf_paths_full if not any(d in
+    # path.__str__() for d in days_to_exclude)])
+    exclude = {
+        "SP072/2025-09-17/001",
+        "SP072/2025-09-18/001",
+        "SP072/2025-09-19/001",
+    }  # These MLAPDV files have odd dimensions; (512, 756, 3), (512, 752, 3)
     task._run(sessions_to_exclude=validate_sessions_list(exclude), display=False)

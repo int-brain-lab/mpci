@@ -1,1 +1,1 @@
-from ibllib.tests.base import TEST_DB, IntegrationTest as IntegrationTestCase
+from ibllib.tests.base import TEST_DB, IntegrationTest as IntegrationTestCase  # noqa
