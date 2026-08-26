@@ -43,6 +43,10 @@ jobs:
         python -m pip install --upgrade pip
         python -m pip install -e .
         python -m pip install git+https://github.com/int-brain-lab/ibllib.git@bugfix/integration_test_discovery_failure
+    - name: check INTEGRATION_DATA_DIR is empty
+      env:
+        INTEGRATION_DATA_DIR: ""
+      run: python -c "import os; print(repr(os.environ.get('INTEGRATION_DATA_DIR')))"
     - name: run tests
       # empty (not just unset) so it stays falsy for ibllib's skipUnless(INTEGRATION_DATA_DIR)
       # check on both bash (ubuntu) and pwsh (windows) runners
