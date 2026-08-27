@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import json
-import enum
 import logging
-from collections.abc import Callable
-from itertools import chain, product
+from itertools import product
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 from collections import Counter
 from datetime import datetime
 from uuid import UUID, uuid4
@@ -25,15 +23,19 @@ from one.alf.path import ALFPath
 
 from ibllib.oneibl.data_handlers import (
     ExpectedDataset,
-    ServerGlobusDataHandler,
     PopeyeDataHandler,
-    dataset_from_name,
+    ServerGlobusDataHandler,
 )
 from ibllib.oneibl.patcher import S3Patcher
 
-from mpci.alyx.tasks import MesoscopeTask
+from mpci.alyx.tasks import MesoscopeTask, Provenance
+from mpci.loaders.local import (
+    HISTOLOGY_FILENAME,
+    MISSING_DATA_ERRORS,
+    MesoscopeLocalDataLoader,
+    find_file,
+)
 from mpci.scanimage.io import (
-    patch_imaging_meta,
     get_px_per_um,
     get_window_center,
 )
@@ -62,14 +64,7 @@ IBL_MESOSCOPE_DEFINITIONS = {
     "scanimage_dimensions": ("Y", "X"),
 }
 
-# the exceptions the loaders raise when their input is absent or unusable: nothing found on
-# disk, an ambiguous glob or no reference session given, a field missing from a metadata file,
-# and inconsistent metadata or a failed transfer
-MISSING_DATA_ERRORS = (FileNotFoundError, ValueError, KeyError, AssertionError)
-
 _logger = logging.getLogger(__name__)
-
-Provenance = enum.Enum("Provenance", ["ESTIMATE", "FUNCTIONAL", "LANDMARK", "HISTOLOGY"])
 
 
 class PopeyeS3DataHandler(PopeyeDataHandler):
@@ -83,38 +78,6 @@ class PopeyeS3DataHandler(PopeyeDataHandler):
         return s3_patcher.patch_dataset(
             outputs, created_by=self.one.alyx.user, versions=versions, **kwargs
         )
-
-
-def find_file(path: Path, glob_pattern: str) -> Path:
-    # little helper that should probably live elsewhere
-    """Find the single file in a folder that matches a glob pattern.
-
-    Parameters
-    ----------
-    path : pathlib.Path
-        Folder to search, non-recursively.
-    glob_pattern : str
-        Glob pattern the file name must match.
-
-    Returns
-    -------
-    pathlib.Path
-        Path of the one matching file.
-
-    Raises
-    ------
-    FileNotFoundError
-        If nothing matches.
-    ValueError
-        If more than one file matches.
-    """
-    result = list(path.glob(glob_pattern))
-    if len(result) == 0:
-        raise FileNotFoundError(f"no file that matches {glob_pattern} found at {path}")
-    elif len(result) > 1:
-        raise ValueError(f"multiple matches found for {glob_pattern} found at {path}:\n{result}")
-    else:
-        return result[0]
 
 
 #
@@ -209,33 +172,307 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             raise ValueError("MesocopeFOVAlignment task requires an online ONE instance")
 
         self.eid = self.one.path2eid(self.session_path)
-        self.reference_collection = reference_collection or self.infer_reference_collection(
-            self.session_path
-        )
-        self.ref_session_path = reference_session_path
+
+        # reading is delegated to one loader per session; the loaders only read what is on
+        # disk, so getting the reference session's files there is this task's job, see the
+        # staging section below
+        self.data_loader = MesoscopeLocalDataLoader(self.session_path, reference_collection)
+
+        # NB: `ref_session_path` stays the reference session's real path, as that is what Alyx
+        # is queried with; the loader may end up reading the files from somewhere else
+        self.ref_session_path = None
+        self.ref_session_eid = None
+        self.reference_data_loader = None
         if reference_session_path is not None:
             self.ref_session_path = ALFPath(reference_session_path)
-            self.ref_session_eid = self.one.path2eid(self.ref_session_path)
-            self.ref_session_reference_collection = (
-                ref_session_reference_collection
-                or self.infer_reference_collection(self.ref_session_path)
+            self.reference_data_loader = MesoscopeLocalDataLoader(
+                self.ref_session_path, ref_session_reference_collection
             )
+            # the loaders are ONE-free, so resolving the reference session is done here
+            self.ref_session_eid = self.one.path2eid(self.ref_session_path)
 
         # keep references to links for unlinking during tearDown
         self.links: list[Path] = []
 
+        # the atlas is a dependency of this task rather than data of the session it processes,
+        # so it is loaded here: a task that cannot get one cannot do its job at all
+        self.histology_atlas = MRITorontoAtlas(res_um=histology_atlas_resolution)
+
+        # processing parameters and flags
         self.interpolation_sigma = interpolation_sigma
-        self.histology_atlas_resolution = histology_atlas_resolution
         self.projection_atlas_resolution = projection_atlas_resolution
         self.write_outputs = write_outputs
         self.register_data = register_data
         self.debug = debug
 
+    def setUp(self, **kwargs):
+        """Run the default setup, then point both loaders at where the files can be read.
+
+        On popeye the data handler symlinks this session into a quarantine folder and repoints
+        `session_path` at it, so its loader has to follow. The reference session is not part of
+        the signature and so is not staged by the handler; its loader is pointed at the mirror
+        that `ensure_local_*` symlinks into, see the staging section.
+
+        Parameters
+        ----------
+        **kwargs : dict
+            Keyword arguments forwarded to `MesoscopeTask.setUp`.
+
+        Returns
+        -------
+        bool
+            Whatever the default setup reported.
+        """
+        status = super().setUp(**kwargs)
+        # the collection a session's reference data sits in does not depend on where the files
+        # were staged, so both loaders are rebuilt with the one already resolved
+        if self.data_loader.session_path != self.session_path:
+            _logger.debug("session staged to %s, rebuilding its loader", self.session_path)
+            self.data_loader = MesoscopeLocalDataLoader(
+                self.session_path, self.data_loader.reference_collection
+            )
+
+        if self.location == "popeye" and self.reference_data_loader is not None:
+            # NB: the collection is read off the loader being replaced, which the right hand
+            # side being evaluated first makes safe
+            self.reference_data_loader = MesoscopeLocalDataLoader(
+                self.reference_session_mirror_path(),
+                self.reference_data_loader.reference_collection,
+            )
+        return status
+
     def tearDown(self):
-        """Unlink any symlinks created during the task, then run the default teardown."""
+        """Unlink any symlinks staging created, then run the default teardown."""
         for link in self.links:
             link.unlink()
         super().tearDown()
+
+    #
+    #  ######  ########    ###     ######   #### ##    ##  ######
+    # ##    ##    ##      ## ##   ##    ##   ##  ###   ## ##    ##
+    # ##          ##     ##   ##  ##         ##  ####  ## ##
+    #  ######     ##    ##     ## ##   ####  ##  ## ## ## ##   ####
+    #       ##    ##    ######### ##    ##   ##  ##  #### ##    ##
+    # ##    ##    ##    ##     ## ##    ##   ##  ##   ### ##    ##
+    #  ######     ##    ##     ##  ######   #### ##    ##  ######
+    #
+    # The loaders only read what is already on disk. Getting the reference session's files
+    # there - it is not part of this task's signature, so no data handler stages it - is what
+    # the methods below are for. Each of them guarantees that the matching `can_load_*` of
+    # `reference_data_loader` is true once it returns, or raises.
+    #
+
+    def _assert_reference_session(self, what: str) -> None:
+        """Raise if no reference session is available for whatever is about to be reached.
+
+        Parameters
+        ----------
+        what : str
+            What was being reached, for the error message.
+
+        Raises
+        ------
+        ValueError
+            If the task was constructed without a reference session path.
+        """
+        if self.reference_data_loader is None:
+            raise ValueError(f"cannot reach {what}: no reference session path was given")
+
+    def reference_session_mirror_path(self) -> Path:
+        """Return the quarantine session path the reference session's files are mirrored into.
+
+        On popeye the reference session is not directly readable, so its files are symlinked
+        into the task quarantine folder and read from there. Only the quarantine is written to,
+        never the reference session itself.
+
+        Returns
+        -------
+        pathlib.Path
+            Session path of the mirror, i.e. the folder the reference collection sits in.
+
+        Raises
+        ------
+        ValueError
+            If the task was constructed without a reference session path.
+        """
+        self._assert_reference_session("the reference session")
+        lab = self.one.get_details(self.ref_session_path)["lab"]
+        return (
+            self.data_handler.patch_path
+            / type(self).__name__
+            / lab
+            / "Subjects"
+            / self.ref_session_path.session_path_short()
+        )
+
+    def _symlink_into_mirror(self, source: Path) -> Path:
+        """Symlink one of the reference session's files into the quarantine mirror.
+
+        Parameters
+        ----------
+        source : pathlib.Path
+            The file to link to, on a mount the loader cannot read from directly.
+
+        Returns
+        -------
+        pathlib.Path
+            Path of the created symlink, inside the mirror's reference collection. An existing
+            link is replaced, and the new one is unlinked on teardown.
+        """
+        link = self.reference_data_loader.reference_path / source.name
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(source)
+
+        # keep links for teardown
+        self.links.append(link)
+        return link
+
+    def ensure_local_reference_session_reference_stack(self) -> Path:
+        """Make the reference session's reference stack readable, and return its path.
+
+        Off popeye the stack is read where it lies. On popeye it is symlinked into the
+        quarantine mirror the loader reads from.
+
+        Returns
+        -------
+        pathlib.Path
+            Path the loader reads the `referenceImage.stack` tif from.
+
+        Raises
+        ------
+        ValueError
+            If the task was constructed without a reference session path.
+        FileNotFoundError
+            If no reference stack is found.
+        """
+        self._assert_reference_session("the reference session's reference stack")
+        if self.reference_data_loader.reference_stack.available():
+            return self.reference_data_loader.reference_stack.path()
+
+        source_folder = (
+            self.data_handler.root_path
+            / self.one.get_details(self.ref_session_path)["lab"]
+            / "Subjects"
+            / self.ref_session_path.session_path_short()
+            / self.reference_data_loader.reference_collection
+        )
+        self._symlink_into_mirror(find_file(source_folder, "*referenceImage.stack*"))
+        return self.reference_data_loader.reference_stack.path()
+
+    def ensure_local_reference_session_histology(self, clobber: bool = False) -> Path:
+        """Make the reference session's histology readable, and return its path.
+
+        This is the file created by the histology pipeline, one per subject. It contains a
+        uint16 array with shape (h, w, 3), comprising Allen atlas image volume indices for
+        dimensions representing (ml, ap, dv). The first two dimensions (h, w) should equal
+        those of the reference stack.
+
+        On popeye the file lives in the histology folder and is symlinked into the quarantine
+        mirror the loader reads from. Elsewhere it is fetched with a data handler, falling back
+        to a direct Globus transfer and then to HTTP.
+
+        Parameters
+        ----------
+        clobber : bool
+            If True, re-download the file even if it exists locally. Ignored on popeye, where
+            the file is only ever linked to.
+
+        Returns
+        -------
+        pathlib.Path
+            Path the loader reads the histology from, i.e.
+            `reference_data_loader.histology.path`.
+
+        Raises
+        ------
+        ValueError
+            If the task was constructed without a reference session path.
+        AssertionError
+            If the file could neither be transferred via Globus nor downloaded via HTTP.
+        """
+        self._assert_reference_session("the reference session's histology")
+        if not clobber and self.reference_data_loader.histology.available():
+            return self.reference_data_loader.histology.path
+
+        if self.location == "popeye":
+            lab = self.one.get_details(self.ref_session_path)["lab"]
+            histology_file = (
+                self.data_handler.root_path
+                / "histology"
+                / lab
+                / self.ref_session_path.session_path_short()
+                / HISTOLOGY_FILENAME
+            )
+            self._symlink_into_mirror(histology_file)
+            return self.reference_data_loader.histology.path
+
+        signature = {
+            "input_files": [
+                ExpectedDataset.input(
+                    HISTOLOGY_FILENAME, self.reference_data_loader.reference_collection, True
+                )
+            ],
+            "output_files": [],
+        }
+        if self.location == "server" and self.force:
+            handler = ServerGlobusDataHandler(self.ref_session_path, signature, one=self.one)
+        else:
+            handler = self.data_handler.__class__(self.ref_session_path, signature, one=self.one)
+        handler.setUp()
+
+        _logger.info(
+            "Looking for reference MLAPDV in %s",
+            self.reference_data_loader.reference_path,
+        )
+        # NB: The local reference folder is expected to exist after handler.setUp()
+        local_file = self.reference_data_loader.histology.path
+
+        if not local_file.exists():
+            _logger.warning("getting histology via data handler failed!")
+
+        if clobber or not local_file.exists():
+            _logger.info("attempting to download histology file from flatiron")
+            assert self.one, "ONE required"
+            local_file.parent.mkdir(parents=True, exist_ok=True)
+            lab = self.one.get_details(self.ref_session_path)["lab"]
+            remote_file = f"{lab}/{self.ref_session_path.session_path_short()}/{local_file.name}"
+            try:
+                # the histology folder is not part of the standard endpoints, so mount it as its own
+                handler = ServerGlobusDataHandler(
+                    self.ref_session_path,
+                    {"input_files": [], "output_files": []},
+                    one=self.one,
+                )
+                endpoint_id = next(
+                    v["id"]
+                    for k, v in handler.globus.endpoints.items()
+                    if k.startswith("flatiron")
+                )
+                handler.globus.add_endpoint(
+                    endpoint_id, label="flatiron_histology", root_path="/histology/"
+                )
+                handler.globus.mv(
+                    "flatiron_histology",
+                    "local",
+                    [remote_file],
+                    ["/".join(local_file.parts[-5:])],
+                )
+                assert local_file.exists(), f"failed to download {remote_file} to {local_file}"
+            except Exception as e:
+                _logger.error(f"Failed to download via Globus: {e}, attempting via HTTP")
+                remote_file = f"{self.one.alyx._par.HTTP_DATA_SERVER}/histology/" + remote_file
+                _logger.warning(f"Using HTTP download for {remote_file}")
+                local_file = self.one.alyx.download_file(remote_file, target_dir=local_file.parent)
+                assert local_file.exists(), f"failed to download {remote_file} to {local_file}"
+
+        # whatever route got it here, it has to have landed where the loader reads it from
+        histology_path = self.reference_data_loader.histology.path
+        assert self.reference_data_loader.histology.available(), (
+            f"histology ended up at {local_file} rather than at {histology_path}"
+        )
+        return histology_path
 
     @property
     def signature(self) -> dict:
@@ -274,6 +511,61 @@ class MesoscopeFOVAlignment(MesoscopeTask):
     # ##     ##  #######  ##    ##
     #
 
+    def infer_possible_corrections(self) -> dict[str, bool]:
+        """Work out which of the alignment's corrections this session's data supports.
+
+        Each correction needs its own inputs, and an input that cannot be read, or that reads
+        back unusable, rules its correction out. What comes back is exactly what `align_FOVs`
+        takes, so that it can assume its inputs are there rather than checking again.
+
+        Returns
+        -------
+        dict of str to bool
+            Whether `align_FOVs` can run with `use_histology`, `lateral_correct` and
+            `tilt_correct`.
+        """
+        corrections = {"use_histology": False, "lateral_correct": False, "tilt_correct": False}
+
+        # the tilt is corrected against the brain surface, so its points are all it takes
+        corrections["tilt_correct"] = self.data_loader.brain_surface_points.usable()
+
+        if self.reference_data_loader is None:
+            _logger.warning(
+                "no reference session given: neither histology nor lateral correction is possible"
+            )
+            return corrections
+
+        # the loaders only report on local files, so the transfers are attempted first
+        for ensure_local in (
+            self.ensure_local_reference_session_reference_stack,
+            self.ensure_local_reference_session_histology,
+        ):
+            try:
+                ensure_local()
+            except MISSING_DATA_ERRORS as e:
+                _logger.warning("%s: %s: %s", ensure_local.__name__, type(e).__name__, e)
+
+        corrections["use_histology"] = self.reference_data_loader.histology.usable()
+
+        # both stacks are registered onto one another, so they have to be usable and agree in
+        # shape; the shapes are read off the tif headers rather than by loading the pixels
+        session_stack = self.data_loader.reference_stack
+        reference_stack = self.reference_data_loader.reference_stack
+        if session_stack.usable() and reference_stack.usable():
+            shapes = (session_stack.shape(), reference_stack.shape())
+            corrections["lateral_correct"] = shapes[0] == shapes[1]
+            if not corrections["lateral_correct"]:
+                _logger.warning(
+                    "no lateral correction: this session's reference stack is %s, the "
+                    "reference session's is %s",
+                    *shapes,
+                )
+
+        for correction, possible in corrections.items():
+            if not possible:
+                _logger.info("%s is not possible for %s", correction, self.session_path)
+        return corrections
+
     def _run(self) -> list[Path]:
         """Align this session's FOVs to the atlas and write the mean-image datasets.
 
@@ -289,51 +581,44 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         list of pathlib.Path
             The raw imaging metadata files and the per-FOV mean-image datasets, to register.
         """
-        # Provenance is determined by the ability to load the histology volume
-        try:
-            ref_session_ref_image_mlapdv, _ = self.load_histology()
-            self.provenance = Provenance.HISTOLOGY
-        except Exception:
-            _logger.warning("no histology volume found.")
-            self.provenance = Provenance.ESTIMATE
+        # what the data supports decides both the corrections and the provenance: the FOVs are
+        # placed by geometry alone unless the histology can be looked up
+        corrections = self.infer_possible_corrections()
+        self.provenance = (
+            Provenance.HISTOLOGY if corrections["use_histology"] else Provenance.ESTIMATE
+        )
 
-        # Load main meta
-        _, meta_files, _ = self.input_files[0].find_files(self.session_path)
-        meta = patch_imaging_meta(alfio.load_file_content(meta_files[0]) or {})
+        # Load main meta, already patched to the current version by the loader
+        meta_files = self.data_loader.raw_imaging_metadata.paths()
+        meta = self.data_loader.raw_imaging_metadata.load()
 
         if self.provenance is Provenance.HISTOLOGY:
             _logger.info("Extracting histology MLAPDV datasets")
             # Update the craniotomy center
-            ref_image_meta = self.load_reference_stack_metadata()
+            ref_session_ref_image_mlapdv, _ = self.load_histology_mlapdv()
+            ref_image_meta = self.data_loader.reference_stack_metadata.load()
             if self.register_data:
                 self.update_craniotomy_center(ref_image_meta, ref_session_ref_image_mlapdv)
+            # update the individual meta files
             meta["centerMM"] = ref_image_meta["centerMM"]
-            # write the file
+            # write the file - only writing to the first, but later also reading only from
+            # the first
             if self.write_outputs:
                 with open(meta_files[0], "w") as fp:
                     json.dump(meta, fp)
             # Add reference meta data to meta_files list for registration
-            meta_files.append(
-                next(
-                    self.session_path.glob(f"{self.reference_collection}/referenceImage.meta.json")
-                )
-            )
+            meta_files.append(self.data_loader.reference_stack_metadata.path())
         # this encapsulates the entire alignment pipeline
-        self.fovs_coordinates = self.align_FOVs(
-            use_histology=True if self.provenance is Provenance.HISTOLOGY else False,
-            lateral_correct=True,
-            tilt_correct=True,
-            debug=self.debug,
-        )
+        self.fovs_coordinates = self.align_FOVs(**corrections, debug=self.debug)
 
-        # this loads the metadata from the first imaging bout, but verifies
-        # that all the scanimage related content that is needed here is
-        # consistent across the files
-        raw_imaging_meta = self.load_raw_imaging_metadata()
+        # the metadata of the first imaging bout stands in for all of them, which only holds
+        # if the scanimage content needed here is consistent across the files
+        raw_imaging_meta = self.data_loader.raw_imaging_metadata.load()
+        self.data_loader.raw_imaging_metadata.validate(raw_imaging_meta)
         fov_map = self.get_fov_map(raw_imaging_meta)
 
         # the atlas for the lookup
-        atlas = MRITorontoAtlas(res_um=self.histology_atlas_resolution)
+        atlas = self.histology_atlas
 
         # store the outputs
         mean_images_mlapdv = {}
@@ -416,262 +701,20 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         return sorted([*meta_files, *mean_image_files])
 
     #
-    # ########     ###    ########    ###
-    # ##     ##   ## ##      ##      ## ##
-    # ##     ##  ##   ##     ##     ##   ##
-    # ##     ## ##     ##    ##    ##     ##
-    # ##     ## #########    ##    #########
-    # ##     ## ##     ##    ##    ##     ##
-    # ########  ##     ##    ##    ##     ##
+    # ########  ########   #######   ######  ########  ######   ######  #### ##    ##  ######
+    # ##     ## ##     ## ##     ## ##    ## ##       ##    ## ##    ##  ##  ###   ## ##    ##
+    # ##     ## ##     ## ##     ## ##       ##       ##       ##        ##  ####  ## ##
+    # ########  ########  ##     ## ##       ######    ######   ######   ##  ## ## ## ##   ####
+    # ##        ##   ##   ##     ## ##       ##             ##       ##  ##  ##  #### ##    ##
+    # ##        ##    ##  ##     ## ##    ## ##       ##    ## ##    ##  ##  ##   ### ##    ##
+    # ##        ##     ##  #######   ######  ########  ######   ######  #### ##    ##  ######
     #
 
-    @staticmethod
-    def infer_reference_collection(session_path: str | Path) -> str:
-        """Find the collection that holds a session's reference stack.
+    def load_histology_mlapdv(self) -> tuple[np.ndarray, np.ndarray]:
+        """Fetch the reference session's histology and resolve it to MLAPDV coordinates.
 
-        Only imaging bouts named `raw_imaging_data_??`, i.e. carrying a two digit suffix, are
-        considered.
-
-        Parameters
-        ----------
-        session_path : str or pathlib.Path
-            Path of the session to search.
-
-        Returns
-        -------
-        str
-            Collection holding the reference stack, including the `reference` folder, e.g.
-            'raw_imaging_data_00/reference'. If several imaging bouts hold a reference folder,
-            the last one is returned and a warning is logged.
-
-        Raises
-        ------
-        AssertionError
-            If the session path does not exist.
-        FileNotFoundError
-            If the session holds no imaging bout, or if none of its imaging bouts holds a
-            reference folder.
-        """
-        session_path = Path(session_path)
-        raw_imaging_collections = list(session_path.glob("raw_imaging_data_??"))
-        if len(raw_imaging_collections) == 0:
-            raise FileNotFoundError("no raw imaging collections found")
-        collections_with_ref = list(
-            col
-            for col in raw_imaging_collections
-            if (col / "reference").exists() and (col / "reference").is_dir()
-        )
-        if len(collections_with_ref) == 0:
-            raise FileNotFoundError(
-                "no reference collection found for any of the raw imaging collections"
-            )
-        if len(collections_with_ref) >= 1:
-            _logger.warning(
-                f"number of collections with reference stacks is: \
-                    {len(collections_with_ref)} - taking the last one"
-            )
-        return collections_with_ref[-1].parts[-1] + "/reference"
-
-    def get_raw_imaging_metadata_paths(self) -> list[Path]:
-        """Find this session's raw imaging metadata files, one per imaging bout.
-
-        Requires `setUp` to have run, as `MesoscopeTask.get_signatures` is what expands the
-        `device_collection` glob in the signature into one entry per imaging bout.
-
-        Imaging bouts without a metadata file are skipped; many sessions have such bouts.
-
-        Returns
-        -------
-        list of pathlib.Path
-            Paths to the `_ibl_rawImagingData.meta.json` files that exist, sorted by imaging
-            bout collection. Empty if no bout has one.
-        """
-        datasets = dataset_from_name("_ibl_rawImagingData.meta.json", self.input_files)
-        found, paths, missing = zip(*(d.find_files(self.session_path) for d in datasets))
-        if not all(found):
-            _logger.debug("no raw imaging metadata for %s", set(filter(None, missing)))
-        return sorted(chain.from_iterable(paths))
-
-    def load_raw_imaging_metadata(self) -> dict:
-        """Load the raw imaging metadata of this session.
-
-        A session may hold several imaging bouts, each with its own metadata file. The fields
-        this task depends on must agree across bouts, so any one of them can be returned.
-
-        Returns
-        -------
-        dict
-            Contents of `_ibl_rawImagingData.meta.json` of the first imaging bout.
-
-        Raises
-        ------
-        FileNotFoundError
-            If no imaging bout has a metadata file.
-        AssertionError
-            If the FOV UUIDs, or a FOV's size or center, differ between imaging bouts.
-        """
-        metadata_paths = self.get_raw_imaging_metadata_paths()
-        if not metadata_paths:
-            raise FileNotFoundError(f"no raw imaging metadata found for {self.session_path}")
-        metadata_all = [json.loads(p.read_text(encoding="utf-8")) for p in metadata_paths]
-
-        # the pipeline assumes that the scanimage related information regarding
-        # FOV location and size is consistent across all imaging bouts
-        # assert this here
-        for metadata in metadata_all:
-            # all have the same roi UUIDs
-            fov_uuids = scanimage._get_fov_uuids(metadata["rawScanImageMeta"])
-            assert fov_uuids == scanimage._get_fov_uuids(metadata_all[0]["rawScanImageMeta"])
-            for fov_uuid in fov_uuids:
-                fov_meta = scanimage.get_fov_meta(metadata["rawScanImageMeta"], fov_uuid)
-                _fov_meta = scanimage.get_fov_meta(metadata_all[0]["rawScanImageMeta"], fov_uuid)
-                keys = ["sizeXY", "centerXY"]
-                for key in keys:
-                    assert fov_meta["scanfields"][key] == _fov_meta["scanfields"][key]
-
-        return metadata_all[0]
-
-    def load_reference_stack_metadata(self) -> dict:
-        """Load the metadata of this session's reference stack.
-
-        Returns
-        -------
-        dict
-            Contents of `referenceImage.meta.json`.
-
-        Raises
-        ------
-        FileNotFoundError
-            If no metadata file is found.
-        ValueError
-            If more than one metadata file is found.
-        """
-        meta_filepath = find_file(
-            self.session_path / self.reference_collection, "*referenceImage.meta*"
-        )
-        return json.loads(meta_filepath.read_text(encoding="utf-8"))
-
-    def get_ref_stack_path(self) -> Path:
-        """Return the path to the reference stack of this session.
-
-        Returns
-        -------
-        pathlib.Path
-            Path of the `referenceImage.stack` tif.
-
-        Raises
-        ------
-        FileNotFoundError
-            If no reference stack is found.
-        ValueError
-            If more than one reference stack is found.
-        """
-        return find_file(self.session_path / self.reference_collection, "*referenceImage.stack*")
-
-    def get_reference_session_ref_stack_path(self) -> Path:
-        """Return the path to the reference stack of the reference session.
-
-        On popeye the stack is not directly readable and is symlinked into the task
-        quarantine folder first.
-
-        Returns
-        -------
-        pathlib.Path
-            Path of the `referenceImage.stack` tif, or of its symlink when on popeye.
-
-        Raises
-        ------
-        FileNotFoundError
-            If no reference stack is found.
-        ValueError
-            If more than one reference stack is found.
-        """
-        if self.location == "popeye":
-            return self._symlink_reference_session_reference_stack()
-        else:
-            return find_file(
-                self.ref_session_path / self.ref_session_reference_collection,
-                "*referenceImage.stack*",
-            )
-
-    def load_reference_stack(self) -> np.ndarray:
-        """Load the reference stack of this session.
-
-        Returns
-        -------
-        numpy.ndarray
-            Image stack with shape (Z, Y, X).
-        """
-        return tifffile.imread(self.get_ref_stack_path())
-
-    def load_reference_session_reference_stack(self) -> np.ndarray:
-        """Load the reference stack of the reference session.
-
-        Returns
-        -------
-        numpy.ndarray
-            Image stack with shape (Z, Y, X).
-
-        Raises
-        ------
-        ValueError
-            If the task was constructed without a reference session path.
-        """
-        if self.ref_session_path is not None:
-            return tifffile.imread(self.get_reference_session_ref_stack_path())
-        else:
-            raise ValueError(
-                "cannot load the reference session's reference stack: "
-                "no reference session path was given"
-            )
-
-    def _symlink_reference_session_reference_stack(self) -> Path:
-        """Symlink the reference session's reference stack into the popeye quarantine folder.
-
-        Returns
-        -------
-        pathlib.Path
-            Path of the created symlink. An existing symlink is replaced.
-
-        Raises
-        ------
-        FileNotFoundError
-            If no reference stack is found in the source folder.
-        ValueError
-            If more than one reference stack is found there.
-        """
-        path_short = self.one.eid2path(self.ref_session_eid).session_path_short()
-        lab = self.one.get_details(self.ref_session_path)["lab"]
-        symlinked_ref_stack = (
-            self.data_handler.patch_path
-            / type(self).__name__
-            / lab
-            / "Subjects"
-            / path_short
-            / self.ref_session_reference_collection
-            / "referenceImage.stack.tif"
-        )
-
-        _session_folder = (
-            self.data_handler.root_path
-            / lab
-            / "Subjects"
-            / path_short
-            / self.ref_session_reference_collection
-        )
-
-        ref_stack_path = find_file(_session_folder, "*referenceImage.stack*")
-        if symlinked_ref_stack.exists():
-            symlinked_ref_stack.unlink()
-        symlinked_ref_stack.parent.mkdir(parents=True, exist_ok=True)
-        symlinked_ref_stack.symlink_to(ref_stack_path)
-
-        # keep links for teardown
-        self.links.append(symlinked_ref_stack)
-        return symlinked_ref_stack
-
-    def load_histology(self) -> tuple[np.ndarray, np.ndarray]:
-        """Load the MLAPDV coordinates of the reference session's reference image.
+        The file holds Allen atlas volume indices as they are stored on disk; turning those
+        into coordinates needs the atlas, which is why it happens here rather than in a loader.
 
         Returns
         -------
@@ -681,297 +724,26 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         numpy.ndarray
             Array with shape (h, w, 3) holding the corresponding Allen atlas volume indices,
             with the AP axis flipped to match the atlas volume orientation.
+
+        Raises
+        ------
+        ValueError
+            If the task was constructed without a reference session path, or if the histology
+            does not hold one atlas index triplet per reference image pixel.
         """
-        atlas = MRITorontoAtlas(res_um=self.histology_atlas_resolution)
-        local_histo_path = self._get_atlas_registered_reference_mlap()
-        ccf_idx = np.load(local_histo_path)
+        self.ensure_local_reference_session_histology()
+        ccf_idx = self.reference_data_loader.histology.load()
+        self.reference_data_loader.histology.validate(ccf_idx)
+        atlas = self.histology_atlas
 
         # flip the ap axis to match the atlas volume orientation
         ccf_idx[:, :, 1] = np.abs(ccf_idx[:, :, 1].astype("int64") - atlas.label.shape[0]).astype(
             ccf_idx.dtype
         )
-        # NB: these coordinates belong to the reference session, i.e. the one aligned to histology
         ref_img_histo_mlapdv = (
             atlas.ccf2xyz(ccf_idx * atlas.res_um, ccf_order="mlapdv") * 1e6
         )  # m -> μm
         return ref_img_histo_mlapdv, ccf_idx
-
-    def _load_brain_surface_points_from_metadata(self) -> dict:
-        """Read the brain surface points from the reference stack metadata.
-
-        Returns
-        -------
-        dict
-            The brain surface points, i.e. the 'points' entry of the metadata.
-
-        Raises
-        ------
-        KeyError
-            If the metadata does not contain any points.
-        """
-        ref_img_meta = self.load_reference_stack_metadata()
-        return ref_img_meta["points"]
-
-    def _load_brain_surface_points_from_file(self) -> dict:
-        """Read the brain surface points from the dedicated points file.
-
-        Returns
-        -------
-        dict
-            The brain surface points, i.e. the 'points' entry of `referenceImage.points.json`.
-
-        Raises
-        ------
-        FileNotFoundError
-            If no points file exists.
-        ValueError
-            If more than one points file exists.
-        """
-        ref_points_path = find_file(
-            self.session_path / self.reference_collection, "referenceImage.points.json"
-        )
-        return json.loads(Path(ref_points_path).read_text(encoding="utf-8"))["points"]
-
-    def load_brain_surface_points(
-        self,
-        prefer: Literal["metadata", "file"] = "metadata",
-    ) -> dict:
-        """Load the brain surface points, from either the points file or the stack metadata.
-
-        Both sources are tried. If they exist and disagree, `prefer` decides which one wins;
-        if only the non-preferred source exists, it is used and a warning is logged.
-
-        Parameters
-        ----------
-        prefer : {'metadata', 'file'}
-            Source to use when both exist and their contents differ.
-
-        Returns
-        -------
-        dict
-            The brain surface points.
-
-        Raises
-        ------
-        ValueError
-            If neither source provides points, or if `prefer` is not a valid source.
-        """
-        # from the points file
-        try:
-            brain_surface_points_file = self._load_brain_surface_points_from_file()
-        except FileNotFoundError:
-            brain_surface_points_file = None
-
-        # from the reference stack metadata
-        try:
-            brain_surface_points_meta = self._load_brain_surface_points_from_metadata()
-        except KeyError:
-            brain_surface_points_meta = None
-
-        # if none exists
-        if brain_surface_points_file is None and brain_surface_points_meta is None:
-            raise ValueError("no brain surface points found")
-
-        # if both exist
-        if brain_surface_points_file is not None and brain_surface_points_meta is not None:
-            # and they are the same, it doesn't matter
-            if brain_surface_points_file == brain_surface_points_meta:
-                return brain_surface_points_file
-            # if they aren't, return the preferred
-            match prefer:
-                case "metadata":
-                    return brain_surface_points_meta
-                case "file":
-                    return brain_surface_points_file
-                case _:
-                    raise ValueError(f"invalid preference: {prefer}")
-        # if only one exists:
-        if brain_surface_points_file is None and brain_surface_points_meta is not None:
-            if prefer == "file":
-                _logger.warning("using metadata as a non-preferred source of brain surface points")
-            return brain_surface_points_meta
-        if brain_surface_points_file is not None and brain_surface_points_meta is None:
-            if prefer == "metadata":
-                _logger.warning(
-                    "using points.json file as a non-preferred source of brain surface points"
-                )
-            return brain_surface_points_file
-
-    def _get_atlas_registered_reference_mlap(self, clobber: bool = False) -> Path:
-        """Download the aligned reference stack Allen atlas indices.
-
-        This is the file created by the histology pipeline, one per subject. It contains a
-        uint16 array with shape (h, w, 3), comprising Allen atlas image volume indices for
-        dimensions representing (ml, ap, dv). The first two dimensions (h, w) should equal
-        those of the reference stack.
-
-        On popeye the file is read in place from the histology folder. Elsewhere it is fetched
-        with a data handler, falling back to a direct Globus transfer and then to HTTP.
-
-        Parameters
-        ----------
-        clobber : bool
-            If True, re-download the file even if it exists locally. Ignored on popeye, where
-            the file is always read directly from the histology folder.
-
-        Returns
-        -------
-        pathlib.Path
-            The local filepath of the aligned reference stack file described above.
-
-        Raises
-        ------
-        AssertionError
-            If the file could neither be transferred via Globus nor downloaded via HTTP.
-        """
-        reference_collection = self.ref_session_reference_collection
-
-        if self.location == "popeye":
-            lab = self.one.get_details(self.ref_session_path)["lab"]
-            local_file = (
-                self.data_handler.root_path
-                / "histology"
-                / lab
-                / self.ref_session_path.session_path_short()
-                / "referenceImage.mlapdv.npy"
-            )
-            return local_file
-
-        signature = {
-            "input_files": [
-                ExpectedDataset.input("referenceImage.mlapdv.npy", reference_collection, True)
-            ],
-            "output_files": [],
-        }
-        if self.location == "server" and self.force:
-            handler = ServerGlobusDataHandler(self.ref_session_path, signature, one=self.one)
-        else:
-            handler = self.data_handler.__class__(self.ref_session_path, signature, one=self.one)
-        handler.setUp()
-
-        _logger.info(
-            "Looking for reference MLAPDV in %s",
-            self.ref_session_path.joinpath(reference_collection),
-        )
-        # NB: The local reference folder is expected to exist after handler.setUp()
-        local_file = self.ref_session_path / reference_collection / "referenceImage.mlapdv.npy"
-
-        if not local_file.exists():
-            _logger.warning("getting histology via data handler failed!")
-
-        if clobber or not local_file.exists():
-            _logger.info("attempting to download histology file from flatiron")
-            assert self.one, "ONE required"
-            local_file.parent.mkdir(parents=True, exist_ok=True)
-            lab = self.one.get_details(self.ref_session_path)["lab"]
-            remote_file = f"{lab}/{self.ref_session_path.session_path_short()}/{local_file.name}"
-            try:
-                # the histology folder is not part of the standard endpoints, so mount it as its own
-                handler = ServerGlobusDataHandler(
-                    self.ref_session_path,
-                    {"input_files": [], "output_files": []},
-                    one=self.one,
-                )
-                endpoint_id = next(
-                    v["id"]
-                    for k, v in handler.globus.endpoints.items()
-                    if k.startswith("flatiron")
-                )
-                handler.globus.add_endpoint(
-                    endpoint_id, label="flatiron_histology", root_path="/histology/"
-                )
-                handler.globus.mv(
-                    "flatiron_histology",
-                    "local",
-                    [remote_file],
-                    ["/".join(local_file.parts[-5:])],
-                )
-                assert local_file.exists(), f"failed to download {remote_file} to {local_file}"
-            except Exception as e:
-                _logger.error(f"Failed to download via Globus: {e}, attempting via HTTP")
-                remote_file = f"{self.one.alyx._par.HTTP_DATA_SERVER}/histology/" + remote_file
-                _logger.warning(f"Using HTTP download for {remote_file}")
-                local_file = self.one.alyx.download_file(remote_file, target_dir=local_file.parent)
-                assert local_file.exists(), f"failed to download {remote_file} to {local_file}"
-        return local_file
-
-    #
-    # ##     ##    ###    ##       #### ########     ###    ######## ####  #######  ##    ##
-    # ##     ##   ## ##   ##        ##  ##     ##   ## ##      ##     ##  ##     ## ###   ##
-    # ##     ##  ##   ##  ##        ##  ##     ##  ##   ##     ##     ##  ##     ## ####  ##
-    # ##     ## ##     ## ##        ##  ##     ## ##     ##    ##     ##  ##     ## ## ## ##
-    #  ##   ##  ######### ##        ##  ##     ## #########    ##     ##  ##     ## ##  ####
-    #   ## ##   ##     ## ##        ##  ##     ## ##     ##    ##     ##  ##     ## ##   ###
-    #    ###    ##     ## ######## #### ########  ##     ##    ##    ####  #######  ##    ##
-    #
-
-    def _try_load(self, loader: Callable[[], Any]) -> tuple[bool, Any]:
-        """Attempt a loader, reporting whether its input could be loaded.
-
-        Parameters
-        ----------
-        loader : callable
-            A loader method of this task, taking no arguments.
-
-        Returns
-        -------
-        bool
-            True if the loader returned without raising.
-        object
-            What the loader returned, or None if it raised.
-        """
-        try:
-            return True, loader()
-        except MISSING_DATA_ERRORS as e:
-            _logger.warning(f"{loader.__name__} failed with: {type(e).__name__}: {e}")
-            return False, None
-
-    def verify_data_presence(self) -> dict[str, bool]:
-        """Check which of the inputs the task needs can be loaded.
-
-        Returns
-        -------
-        dict of str to bool
-            One flag per input, plus 'reference_stack_is_compatible' for whether the two
-            reference stacks agree in shape, as the lateral shift correction requires.
-        """
-        loaders = {
-            "has_raw_imaging_metadata": self.load_raw_imaging_metadata,
-            "has_reference_stack": self.load_reference_stack,
-            "has_reference_session_reference_stack": self.load_reference_session_reference_stack,
-            "has_brain_surface_points_file": self._load_brain_surface_points_from_file,
-            "has_brain_surface_points_meta": self._load_brain_surface_points_from_metadata,
-            "has_histology": self.load_histology,
-        }
-        data_presence: dict[str, bool] = {}
-        loaded: dict[str, Any] = {}
-        for key, loader in loaders.items():
-            data_presence[key], loaded[key] = self._try_load(loader)
-
-        # both stacks have to be of the same shape to be registered onto one another
-        data_presence["reference_stack_is_compatible"] = (
-            data_presence["has_reference_stack"]
-            and data_presence["has_reference_session_reference_stack"]
-            and loaded["has_reference_stack"].shape
-            == loaded["has_reference_session_reference_stack"].shape
-        )
-
-        # brain surface points
-        data_presence["has_brain_surface_points"] = (
-            data_presence["has_brain_surface_points_file"]
-            or data_presence["has_brain_surface_points_meta"]
-        )
-        return data_presence
-
-    #
-    # ########  ########   #######   ######  ########  ######   ######  #### ##    ##  ######
-    # ##     ## ##     ## ##     ## ##    ## ##       ##    ## ##    ##  ##  ###   ## ##    ##
-    # ##     ## ##     ## ##     ## ##       ##       ##       ##        ##  ####  ## ##
-    # ########  ########  ##     ## ##       ######    ######   ######   ##  ## ## ## ##   ####
-    # ##        ##   ##   ##     ## ##       ##             ##       ##  ##  ##  #### ##    ##
-    # ##        ##    ##  ##     ## ##    ## ##       ##    ## ##    ##  ##  ##   ### ##    ##
-    # ##        ##     ##  #######   ######  ########  ######   ######  #### ##    ##  ######
-    #
 
     @staticmethod
     def interpolate_histology(
@@ -987,7 +759,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         ----------
         histo_mlapdv : numpy.ndarray
             Array with shape (h, w, 3) holding the (ml, ap, dv) coordinates in μm of each
-            pixel of the reference session's reference image, as returned by `load_histology`.
+            pixel of the reference session's reference image, from `load_histology_mlapdv`.
         sigma : float, optional
             Standard deviation, in pixels, of the Gaussian filter applied to the ML/AP grid
             before building the interpolator. If None, no smoothing is applied.
@@ -1157,10 +929,9 @@ class MesoscopeFOVAlignment(MesoscopeTask):
     ) -> dict[str, dict[str, np.ndarray]]:
         """Assign MLAPDV atlas coordinates to this session's imaging-plane pixels.
 
-        Each optional correction is attempted, and disabled with a logged warning if its
-        required input cannot be loaded: `use_histology` needs the reference session's
-        histology, `tilt_correct` needs the brain surface points, and `lateral_correct` needs
-        the reference session's reference stack to be present and of matching shape.
+        Every correction switched on here is taken to have its inputs in place; deciding which
+        of them this session's data supports is `infer_possible_corrections`'s job, and calling
+        with a correction whose inputs are absent will fail rather than fall back.
 
         When `register_data` is set, the surface normal at the craniotomy center is written to
         the surgery JSON on Alyx as a side effect.
@@ -1176,56 +947,27 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             If True, correct for the session-to-session lateral shift by registering this
             session's reference stack onto the reference session's.
         tilt_correct : bool
-            If True, correct apparent x/y/z shifts caused by tilt between the imaging plane
-            and the brain surface, using the reference stack's brain surface points.
+            If True, resolve depth below the brain surface from the reference stack's brain
+            surface points, and correct the apparent x/y/z shifts the tilt between the imaging
+            plane and that surface causes. Without the points neither is defined, so this
+            governs both.
         debug : bool
             If True, downsample the pixel grid to speed up the run for debugging.
 
         Returns
         -------
         dict of str to dict of str to numpy.ndarray
-            Per-FOV-UUID coordinate dictionaries. Every FOV holds 'pixel' and 'um_global';
-            'dv_below_surface' is added when brain surface points are available,
-            'um_corrected' and 'dv_below_surface_corrected' when tilt correction runs,
-            'mlapdv_on_surface' always, and 'mlapdv' only when depth below the surface could
-            be resolved, i.e. when brain surface points are available.
+            Per-FOV-UUID coordinate dictionaries. Every FOV holds 'pixel', 'um_global' and
+            'mlapdv_on_surface'; 'dv_below_surface', 'um_corrected',
+            'dv_below_surface_corrected' and 'mlapdv' are added when `tilt_correct` runs.
         """
-        # load the data
-        raw_imaging_meta = self.load_raw_imaging_metadata()
-        ref_img_stack = self.load_reference_stack()
-        ref_img_meta = self.load_reference_stack_metadata()
+        raw_imaging_meta = self.data_loader.raw_imaging_metadata.load()
         fov_map = self.get_fov_map(raw_imaging_meta)
-        data_presence = self.verify_data_presence()
 
-        # attempting to load optional datasets and adjusting the pipeline accordingly
-        if use_histology and not data_presence["has_histology"]:
-            _logger.warning("configured to use histology, but no histology could be loaded.")
-            use_histology = False
-
-        if tilt_correct and not data_presence["has_brain_surface_points"]:
-            _logger.warning(
-                "configured to for tilt correction, but no brain surface could be loaded."
-            )
-            tilt_correct = False
-
-        if lateral_correct:
-            if not data_presence["has_reference_stack"]:
-                _logger.warning(
-                    "configured to do lateral correction, but found no reference stack"
-                )
-                lateral_correct = False
-            if not data_presence["has_reference_session_reference_stack"]:
-                _logger.warning(
-                    "configured to do lateral correction, but reference session has no \
-                        reference stack"
-                )
-                lateral_correct = False
-            if not data_presence["reference_stack_is_compatible"]:
-                _logger.warning(
-                    "configured to do lateral correction, but the referrence session \
-                        reference stack is of incompatible shape"
-                )
-                lateral_correct = False
+        # the reference stack and its metadata anchor every path below, whichever corrections
+        # are switched on, so they are inputs rather than optional extras
+        ref_img_stack = self.data_loader.reference_stack.load()
+        ref_img_meta = self.data_loader.reference_stack_metadata.load()
 
         # coordinate systems
         coordinate_systems_2d = scanimage.create_coordinate_systems_from_scanimage_meta(
@@ -1234,7 +976,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             dims=IBL_MESOSCOPE_DEFINITIONS["scanimage_dimensions"],
         )
 
-        # load the reference image stack which is stored on disk in: dv,ml,ap
+        # the reference image stack is stored on disk in: dv,ml,ap
         ref_img_size_px = np.array(ref_img_stack[0].shape)  # ml,ap
 
         # image resolution and dimensions of the reference stack in um
@@ -1242,7 +984,6 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             ref_img_meta["rawScanImageMeta"],
             dims=IBL_MESOSCOPE_DEFINITIONS["scanimage_dimensions"],
         )
-        ref_img_size_um = ref_img_size_px * um_per_px
         ref_img_topleft_ref, ref_img_ref_per_px = ibl.infer_ref_stack_virtual_corner(
             ref_img_meta["rawScanImageMeta"],
             ref_img_size_px,
@@ -1279,8 +1020,10 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                 "um_global",
             )
 
-        if data_presence["has_brain_surface_points"]:
-            brain_surface_points = self.load_brain_surface_points(prefer="metadata")
+        # the brain surface points are what depth below the surface is measured against, so
+        # they resolve the depth and the tilt around it in one go
+        if tilt_correct:
+            brain_surface_points = self.data_loader.brain_surface_points.load(prefer="metadata")
             # this normal is expressed in the coordinate system of the reference stack
             p_surface, n_surface, dv_avg = projections.get_brain_surface_normal(
                 brain_surface_points,
@@ -1301,7 +1044,6 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                     fov_depths[fov_uuid] - dv_avg
                 )
 
-        if tilt_correct and data_presence["has_brain_surface_points"]:
             # this adds to the fovs_coordinates dictionary:
             # 'um_corrected' - for apparent xy shift based on tilt
             # 'dv_below_surface_corrected'  - for apparent z shift based on tilt
@@ -1315,12 +1057,12 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         if lateral_correct:
             # get the transform for session to session correction
             ref_transform = self.register_reference_stacks(
-                self.get_ref_stack_path(),
-                self.get_reference_session_ref_stack_path(),
+                self.data_loader.reference_stack.path(),
+                self.ensure_local_reference_session_reference_stack(),
             )
 
         if use_histology:
-            ref_img_histo_mlapdv, _ = self.load_histology()
+            ref_img_histo_mlapdv, _ = self.load_histology_mlapdv()
             histo_interp_fn = self.interpolate_histology(
                 ref_img_histo_mlapdv, sigma=self.interpolation_sigma
             )
@@ -1354,7 +1096,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                 )  # TODO trace back what those were for - I think not necessary since we are extrapolating now
 
                 # register the brain normal
-                ref_image_meta = self.load_reference_stack_metadata()
+                ref_image_meta = self.data_loader.reference_stack_metadata.load()
                 _, brain_normal = atlas.get_plane_at_point_mlap(
                     ref_image_meta["centerMM"]["ML_resolved"],
                     ref_image_meta["centerMM"]["AP_resolved"],
@@ -1391,66 +1133,15 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                     )
                 )
 
-            # project down into the brain; skipped entirely if no brain surface points are
-            # available, since depth below the surface is undefined without them
-            if data_presence["has_brain_surface_points"]:
-                if tilt_correct:
-                    depths = fovs_coordinates[uuid]["dv_below_surface_corrected"]
-                else:
-                    depths = fovs_coordinates[uuid]["dv_below_surface"]
-
+            # project down into the brain; skipped entirely without the brain surface points,
+            # since depth below the surface is undefined without them
+            if tilt_correct:
                 fovs_coordinates[uuid]["mlapdv"] = projections.project_down_from_surface(
                     coords_on_surface=fovs_coordinates[uuid]["mlapdv_on_surface"],
                     atlas=atlas,
-                    coords_depths=depths,
+                    coords_depths=fovs_coordinates[uuid]["dv_below_surface_corrected"],
                 )
         return fovs_coordinates
-
-    # def write_outputs(self, fovs_coordinates: dict[str, dict[str, np.ndarray]]):
-    #     """Write mean-image MLAPDV and brain-location-ID datasets to disk, unconditionally.
-
-    #     Parameters
-    #     ----------
-    #     fovs_coordinates : dict of str to dict of str to numpy.ndarray
-    #         Per-FOV-UUID coordinate dictionaries, as returned by `align_FOVs`; each must
-    #         contain an 'mlapdv' array.
-
-    #     Notes
-    #     -----
-    #     For debugging purposes only: writes are unconditional, without the `dry` guard used
-    #     elsewhere in this class.
-    #     """
-    #     # just for debugging purposes - write the data locally without any questions asked
-    #     raw_imaging_meta = self.load_raw_imaging_metadata()
-    #     fov_map = self.get_fov_map(raw_imaging_meta)
-    #     n_px_per_row = raw_imaging_meta["rawScanImageMeta"]["Width"]
-    #     # the lookup has to be done on the atlas thas was used for histology
-    #     atlas = MRITorontoAtlas(res_um=self.histology_atlas_resolution)
-
-    #     # save outputs
-    #     for fov_name, fov_uuid in fov_map.items():
-    #         # mpciMeanImage.mlapdv
-    #         mpciMeanImage = np.reshape(
-    #             fovs_coordinates[fov_uuid]["mlapdv"], (n_px_per_row, n_px_per_row, 3)
-    #         )
-    #         save_path = self.session_path / "alf" / fov_name / "mpciMeanImage.mlapdv.npy"
-    #         np.save(
-    #             save_path,
-    #             mpciMeanImage,
-    #         )
-
-    #         # mpciMeanImage.brainLocationIds_ccf_2017s_ccf_2017.npy
-    #         brainLocationIds = atlas.get_labels(mpciMeanImage / 1e6, mode="clip")
-    #         save_path = (
-    #             self.session_path
-    #             / "alf"
-    #             / fov_name
-    #             / "mpciMeanImage.brainLocationIds_ccf_2017.npy"
-    #         )
-    #         np.save(
-    #             save_path,
-    #             brainLocationIds,
-    #         )
 
     #
     #    ###    ##       ##    ## ##     ##
@@ -1514,9 +1205,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         # Update metadata
         ref_image_meta["centerMM"]["ML_resolved"] = craniotomy_resolved[0]
         ref_image_meta["centerMM"]["AP_resolved"] = craniotomy_resolved[1]
-        meta_path = next(
-            self.session_path.glob(f"{self.reference_collection}/referenceImage.meta.json")
-        )
+        meta_path = self.data_loader.reference_stack_metadata.path()
         if self.write_outputs:
             with open(meta_path, "w") as f:
                 json.dump(ref_image_meta, f)
@@ -1754,129 +1443,3 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                     )
 
         return alyx_fovs
-
-
-#
-# ########   #######  ####
-# ##     ## ##     ##  ##
-# ##     ## ##     ##  ##
-# ########  ##     ##  ##
-# ##   ##   ##     ##  ##
-# ##    ##  ##     ##  ##
-# ##     ##  #######  ####
-#
-
-
-class ROICoordinatesExtraction(MesoscopeTask):
-    """Assign MLAPDV brain coordinates and brain region labels to a session's ROIs.
-
-    Indexes the per-FOV mean-image coordinate maps written by `MesoscopeFOVAlignment` at the
-    pixel positions of the suite2p ROI centroids, so this task requires that one to have run.
-    """
-
-    priority = 40
-    job_size = "small"
-
-    def __init__(
-        self,
-        *args,
-        provenance: Provenance = Provenance.ESTIMATE,
-        dry: bool = True,
-        **kwargs,
-    ):
-        """Initialize the task with the provenance of the coordinates to index.
-
-        Parameters
-        ----------
-        *args : tuple
-            Positional arguments forwarded to `MesoscopeTask`; the first is the session path.
-        provenance : Provenance
-            Provenance of the mean-image datasets to read, which sets the dataset suffix of
-            both the inputs and the outputs. Default is `Provenance.ESTIMATE`.
-        dry : bool
-            If True, skip all disk writes. Default is True.
-        **kwargs : dict
-            Keyword arguments forwarded to `MesoscopeTask`.
-        """
-        super().__init__(*args, **kwargs)
-        # provenance defaults to estimate
-        self.provenance = provenance
-        self.dry = dry
-
-    @property
-    def signature(self) -> dict:
-        I = ExpectedDataset.input  # noqa
-        signature = {
-            "input_files": [
-                I("_ibl_rawImagingData.meta.json", self.device_collection, True),
-                I("mpciMeanImage.mlapdv*.npy", "alf/FOV_*", True),
-                I("mpciMeanImage.brainLocationIds*.npy", "alf/FOV_*", True),  # optional?
-                I("mpciROIs.stackPos.npy", "alf/FOV*", True),
-            ],
-            "output_files": [
-                ("mpciROIs.mlapdv*.npy", "alf/FOV_*", True),
-                ("mpciROIs.brainLocationIds*.npy", "alf/FOV_*", True),
-            ],
-        }
-        return signature
-
-    def _run(self) -> list[Path]:
-        """Extract the MLAPDV coordinates and brain region labels of every ROI.
-
-        Returns
-        -------
-        list of pathlib.Path
-            The per-FOV ROI coordinate and brain location datasets, to register. The paths are
-            returned even when `dry` is set, in which case nothing was written.
-        """
-        # empty suffix if provenance is histology
-        suffix = None if self.provenance is Provenance.HISTOLOGY else self.provenance.name.lower()
-        sfx = f"_{suffix}" if suffix else ""
-
-        all_mlapdv = {}
-        all_brain_ids = {}
-        fov_names = [path.name for path in sorted((self.session_path / "alf").glob("FOV_*"))]
-
-        for fov_name in fov_names:
-            fov_path = self.session_path / "alf" / fov_name
-
-            # Load neuron centroids in pixel space
-            stack_pos_file = find_file(fov_path, "mpciROIs.stackPos*")
-            stack_pos = alfio.load_file_content(stack_pos_file)
-
-            # Load MeanImage mlapdv
-            mlapdv_image_file = find_file(fov_path, f"mpciMeanImage.mlapdv{sfx}.npy")
-            mlapdv_image = alfio.load_file_content(mlapdv_image_file)
-
-            # load brain location ids
-            brain_location_ids_file = find_file(
-                fov_path, f"mpciMeanImage.brainLocationIds_ccf_2017{sfx}.npy"
-            )
-
-            brain_location_ids_image = alfio.load_file_content(brain_location_ids_file)
-
-            # extract by indexing
-            i, j = stack_pos[:, :2].T
-            mlapdv = mlapdv_image[i, j]
-            brain_ids = brain_location_ids_image[i, j]
-
-            assert ~np.isnan(brain_ids).any()
-            all_brain_ids[fov_name] = brain_ids.astype(int)
-            all_mlapdv[fov_name] = mlapdv
-
-        # Write MLAPDV + brain location ID of ROIs to disk
-        roi_files = []
-        assert set(all_mlapdv.keys()) == set(all_brain_ids.keys()) and len(all_brain_ids) == len(
-            fov_names
-        )
-        for fov_name in fov_names:
-            fov_path = self.session_path / "alf" / fov_name
-            for attr, arr, sfx in (
-                ("mlapdv", all_mlapdv[fov_name], suffix),
-                ("brainLocationIds", all_brain_ids[fov_name], ("ccf", "2017", suffix)),
-            ):
-                roi_files.append(fov_path / to_alf("mpciROIs", attr, "npy", timescale=sfx))
-                if not self.dry:
-                    np.save(roi_files[-1], arr)
-
-        return sorted([*roi_files])

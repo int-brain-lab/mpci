@@ -1,8 +1,18 @@
 """Tests for mpci.alignment.task.
 
-Happy-path tests for each method of `MesoscopeFOVAlignment`. The heavy dependencies (the
-atlases, the image registration and the surface projections of plane2brain) are mocked; what
-is tested here is this task's own wiring, path resolution and file IO.
+Two kinds of test live here, clearly separated:
+
+- Everywhere above `TestIntegration`: happy-path unit tests for each method of
+  `MesoscopeFOVAlignment`, against a small synthetic session. The heavy dependencies (the
+  atlases, the image registration and the surface projections of plane2brain) are mocked; what
+  is tested is this task's own wiring, staging and processing.
+- `TestIntegration`, at the end: end-to-end tests against real S3 integration data, exercising
+  the real atlases and image registration. They auto-skip when `INTEGRATION_DATA_DIR` is not
+  configured.
+
+Reading the session's data is not tested here; that belongs to `MesoscopeLocalDataLoader` and
+is covered by `test_loaders`. What this task does with the loaders - deciding provenance from
+what they report, and making the reference session's files reachable by them - is.
 
 The metadata fixtures in `fixtures/alignment` are the real files of
 `cortexlab/SP058/2024-07-24/001/raw_imaging_data_02`, so the geometry constants below have to
@@ -22,7 +32,9 @@ from one.alf.path import ALFPath
 from one.api import ONE
 from skimage.transform import EuclideanTransform
 
-from mpci.alignment.task import MesoscopeFOVAlignment, Provenance, find_file
+from mpci.alignment.task import MesoscopeFOVAlignment
+from mpci.alyx.tasks import Provenance
+from mpci.loaders.local import HistologyLoader
 
 from mpci.tests import TEST_DB, IntegrationTestCase
 
@@ -148,12 +160,22 @@ class AlignmentTestCase(unittest.TestCase):
         tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(tempdir.cleanup)
 
-        subject_path = Path(tempdir.name, "cortexlab", "Subjects", "SP000")
+        self.root = Path(tempdir.name)
+        subject_path = self.root / "cortexlab" / "Subjects" / "SP000"
         self.session_path = subject_path / "2023-03-03" / "002"
         self.ref_session_path = subject_path / "2023-01-01" / "001"
         for path in (self.session_path, self.ref_session_path):
             write_session_fixture(path, with_points_file=True)
         self.session_path.joinpath("alf").mkdir()
+
+        # the task loads the histology atlas in its constructor, and reading the real volume
+        # off disk takes about a second, so every task built here gets a stand-in
+        self.atlas = mock.MagicMock()
+        self.atlas.res_um = 25
+        self.atlas.label.shape = (528, 320, 456)
+        atlas_patcher = mock.patch("mpci.alignment.task.MRITorontoAtlas", return_value=self.atlas)
+        atlas_patcher.start()
+        self.addCleanup(atlas_patcher.stop)
 
     def make_task(self, one=None, **kwargs) -> MesoscopeFOVAlignment:
         """Instantiate the task on the synthetic session, with signatures expanded.
@@ -189,8 +211,10 @@ class TestSetup(AlignmentTestCase):
     def test_init(self):
         """Test that the constructor resolves the collections of both sessions."""
         task = self.make_task()
-        self.assertEqual("raw_imaging_data_00/reference", task.reference_collection)
-        self.assertEqual("raw_imaging_data_00/reference", task.ref_session_reference_collection)
+        self.assertEqual("raw_imaging_data_00/reference", task.data_loader.reference_collection)
+        self.assertEqual(
+            "raw_imaging_data_00/reference", task.reference_data_loader.reference_collection
+        )
         self.assertEqual(self.ref_session_path, task.ref_session_path)
         self.assertEqual(self.one.path2eid.return_value, task.eid)
         self.assertEqual([], task.links)
@@ -199,7 +223,7 @@ class TestSetup(AlignmentTestCase):
         """Test that teardown unlinks the symlinks the task created."""
         task = self.make_task()
         link = self.session_path / "alf" / "link.tif"
-        link.symlink_to(task.get_ref_stack_path())
+        link.symlink_to(task.data_loader.reference_stack.path())
         task.links.append(link)
 
         with mock.patch("ibllib.pipes.tasks.Task.tearDown"):
@@ -233,212 +257,21 @@ class TestSetup(AlignmentTestCase):
             MesoscopeFOVAlignment(self.session_path, one=one)
 
 
-class TestDataLoading(AlignmentTestCase):
-    """Tests for the file discovery and loading methods."""
+class TestStaging(AlignmentTestCase):
+    """Tests for making the reference session's files readable by its loader.
 
-    def test_infer_reference_collection(self):
-        """Test that the collection holding the reference stack is found."""
-        collection = MesoscopeFOVAlignment.infer_reference_collection(self.session_path)
-        self.assertEqual("raw_imaging_data_00/reference", collection)
+    Each `ensure_local_*` has to leave the matching `available()` of `reference_data_loader`
+    true, whichever route it took to get there, which is what these tests check.
 
-    def test_get_raw_imaging_metadata_paths(self):
-        """Test that the metadata file of every imaging bout is found."""
-        paths = self.make_task().get_raw_imaging_metadata_paths()
-        expected = [self.session_path / "raw_imaging_data_00" / "_ibl_rawImagingData.meta.json"]
-        self.assertEqual(expected, [Path(p) for p in paths])
-
-    def test_load_raw_imaging_metadata(self):
-        """Test that the raw imaging metadata is loaded and its FOVs validated."""
-        meta = self.make_task().load_raw_imaging_metadata()
-        self.assertEqual(N_PX_PER_FOV, meta["rawScanImageMeta"]["Width"])
-        self.assertEqual(FOV_UUIDS, [fov["roiUUID"] for fov in meta["FOV"]])
-
-    def test_load_reference_stack_metadata(self):
-        """Test that the reference stack metadata is loaded."""
-        meta = self.make_task().load_reference_stack_metadata()
-        self.assertEqual(reference_stack_metadata(), meta)
-        self.assertEqual(3, len(meta["points"]))
-
-    def test_get_ref_stack_path(self):
-        """Test that this session's reference stack is found."""
-        path = self.make_task().get_ref_stack_path()
-        expected = (
-            self.session_path / "raw_imaging_data_00" / "reference" / "referenceImage.stack.tif"
-        )
-        self.assertEqual(expected, path)
-
-    def test_get_reference_session_ref_stack_path(self):
-        """Test that the reference session's reference stack is found off popeye."""
-        task = self.make_task()
-        self.assertNotEqual("popeye", task.location)
-        expected = (
-            self.ref_session_path
-            / "raw_imaging_data_00"
-            / "reference"
-            / "referenceImage.stack.tif"
-        )
-        self.assertEqual(expected, task.get_reference_session_ref_stack_path())
-
-    def test_load_reference_stack(self):
-        """Test that this session's reference stack is loaded as (Z, Y, X)."""
-        stack = self.make_task().load_reference_stack()
-        self.assertEqual(REF_STACK_SHAPE, stack.shape)
-
-    def test_load_reference_session_reference_stack(self):
-        """Test that the reference session's reference stack is loaded as (Z, Y, X)."""
-        stack = self.make_task().load_reference_session_reference_stack()
-        self.assertEqual(REF_STACK_SHAPE, stack.shape)
-
-    def test_load_histology(self):
-        """Test that the histology MLAPDV map is derived from the atlas indices on disk."""
-        task = self.make_task()
-        ccf_idx = np.random.default_rng(0).integers(
-            0, 100, size=(*REF_STACK_SHAPE[1:], 3), dtype="uint16"
-        )
-        histo_path = self.session_path / "referenceImage.mlapdv.npy"
-        np.save(histo_path, ccf_idx)
-
-        atlas = mock.MagicMock()
-        atlas.res_um = 25
-        atlas.label.shape = (528, 320, 456)
-        # return the input unchanged, in m, so that the μm conversion can be checked
-        atlas.ccf2xyz.side_effect = lambda coords, ccf_order: coords / 1e6
-
-        with (
-            mock.patch("mpci.alignment.task.MRITorontoAtlas", return_value=atlas),
-            mock.patch.object(
-                task, "_get_atlas_registered_reference_mlap", return_value=histo_path
-            ),
-        ):
-            mlapdv, returned_idx = task.load_histology()
-
-        self.assertEqual((*REF_STACK_SHAPE[1:], 3), mlapdv.shape)
-        # the AP axis is flipped against the atlas volume
-        expected_ap = np.abs(ccf_idx[:, :, 1].astype("int64") - atlas.label.shape[0])
-        np.testing.assert_array_equal(expected_ap, returned_idx[:, :, 1])
-        np.testing.assert_array_almost_equal(returned_idx * atlas.res_um, mlapdv)
-
-    def test_load_brain_surface_points_from_metadata(self):
-        """Test that the surface points are read from the reference stack metadata."""
-        task = self.make_task()
-        points = task._load_brain_surface_points_from_metadata()
-        ref_meta = task.load_reference_stack_metadata()
-        self.assertEqual(ref_meta["points"], points)
-
-    def test_load_brain_surface_points_from_file(self):
-        """Test that the surface points are read from the dedicated points file."""
-        task = self.make_task()
-        points = task._load_brain_surface_points_from_file()
-        ref_meta = task.load_reference_stack_metadata()
-        self.assertEqual(ref_meta["points"], points)
-        # test for failure in case no referenceImage.points file is found
-        points_file = self.session_path / task.reference_collection / "referenceImage.points.json"
-        points_file.unlink()
-        with self.assertRaises(FileNotFoundError):
-            points = task._load_brain_surface_points_from_file()
-
-    def test_load_brain_surface_points(self):
-        """Test that identical sources are resolved without regard to the preference."""
-        task = self.make_task()
-        ref_meta = task.load_reference_stack_metadata()
-        expected = ref_meta["points"]
-        self.assertEqual(expected, task.load_brain_surface_points(prefer="metadata"))
-        self.assertEqual(expected, task.load_brain_surface_points(prefer="file"))
-        points_file = self.session_path / task.reference_collection / "referenceImage.points.json"
-        points_file.unlink()
-        task.load_brain_surface_points(prefer="file")
-
-    def test_symlink_reference_session_reference_stack(self):
-        """Test that the reference session's stack is symlinked into the patch folder."""
-        task = self.make_task()
-        # the method only reads these two paths off the data handler, so no stub is needed
-        root_path = self.ref_session_path.parents[4]
-        task.data_handler = mock.MagicMock(root_path=root_path, patch_path=root_path / "patch")
-        task.one.eid2path.return_value = ALFPath(self.ref_session_path)
-        task.one.get_details.return_value = {"lab": "cortexlab"}
-
-        link = task._symlink_reference_session_reference_stack()
-
-        self.assertTrue(link.is_symlink())
-        # the link points at the stack of the reference session
-        self.assertEqual(task.get_reference_session_ref_stack_path(), link.readlink())
-        # and sits under the patch folder, in a folder named after the task
-        self.assertTrue(link.is_relative_to(root_path / "patch" / type(task).__name__))
-        # it is kept for tearDown to unlink
-        self.assertEqual([link], task.links)
-
-    def test_symlink_reference_session_reference_stack_replaces(self):
-        """Test that an existing symlink is replaced rather than left in place."""
-        task = self.make_task()
-        root_path = self.ref_session_path.parents[4]
-        task.data_handler = mock.MagicMock(root_path=root_path, patch_path=root_path / "patch")
-        task.one.eid2path.return_value = ALFPath(self.ref_session_path)
-        task.one.get_details.return_value = {"lab": "cortexlab"}
-
-        stale_target = self.session_path / "raw_imaging_data_00" / "reference"
-        link = task._symlink_reference_session_reference_stack()
-        link.unlink()
-        link.symlink_to(stale_target)
-
-        link = task._symlink_reference_session_reference_stack()
-        self.assertEqual(task.get_reference_session_ref_stack_path(), link.readlink())
-
-    def test_get_atlas_registered_reference_mlap(self):
-        """Test that an already present histology file is returned without downloading."""
-        task = self.make_task()
-        histo_path = (
-            self.ref_session_path
-            / task.ref_session_reference_collection
-            / "referenceImage.mlapdv.npy"
-        )
-        np.save(histo_path, np.zeros((*REF_STACK_SHAPE[1:], 3), dtype="uint16"))
-
-        with mock.patch.object(
-            task, "_get_atlas_registered_reference_mlap", return_value=histo_path
-        ):
-            local_file = task._get_atlas_registered_reference_mlap()
-            self.assertEqual(histo_path, local_file)
-
-    def test_find_file(self):
-        """Test the find_file helper against a unique match, and against an ambiguous one."""
-        reference_path = self.session_path / "raw_imaging_data_00" / "reference"
-        glob_pattern = "*referenceImage.stack*"
-        self.assertEqual(
-            reference_path / "referenceImage.stack.tif",
-            find_file(reference_path, glob_pattern),
-        )
-
-        # a second file matching the pattern leaves the match ambiguous
-        (reference_path / "referenceImage.stack.001.tif").touch()
-        with self.assertRaises(ValueError) as context:
-            find_file(reference_path, glob_pattern)
-        self.assertIn(glob_pattern, str(context.exception))
-
-    def test_get_fov_map(self):
-        """Test that FOV names are mapped onto their ScanImage ROI UUIDs."""
-        task = self.make_task()
-        meta = task.load_raw_imaging_metadata()
-        fov_map = task.get_fov_map(meta)
-        expected = {f"FOV_{i:02}": fov_uuid for i, fov_uuid in enumerate(FOV_UUIDS)}
-        self.assertEqual(expected, fov_map)
-
-
-class TestAtlasRegisteredReferenceMlap(AlignmentTestCase):
-    """Tests for the retrieval of the reference session's atlas indices.
-
-    The tasks are built with `force`, so the retrieval runs through `ServerGlobusDataHandler`
-    rather than through `self.data_handler.__class__`. That keeps the handler patchable by
-    name, so no stand-in handler class is needed.
+    Off popeye the tasks are built with `force`, so the histology retrieval runs through
+    `ServerGlobusDataHandler` rather than through `self.data_handler.__class__`. That keeps the
+    handler patchable by name, so no stand-in handler class is needed.
     """
 
     def setUp(self) -> None:
         super().setUp()
-        self.histology_file = (
-            self.ref_session_path
-            / "raw_imaging_data_00"
-            / "reference"
-            / "referenceImage.mlapdv.npy"
-        )
+        self.reference_collection = self.ref_session_path / "raw_imaging_data_00" / "reference"
+        self.histology_file = self.reference_collection / "referenceImage.mlapdv.npy"
 
     def write_histology_file(self, *args, **kwargs) -> Path:
         """Write the atlas indices where the retrieval expects to find them.
@@ -453,15 +286,41 @@ class TestAtlasRegisteredReferenceMlap(AlignmentTestCase):
         np.save(self.histology_file, np.zeros((*REF_STACK_SHAPE[1:], 3), dtype="uint16"))
         return self.histology_file
 
-    def test_file_provided_by_the_data_handler(self):
-        """Test that a file the data handler put in place is returned as is."""
+    def make_popeye_task(self) -> MesoscopeFOVAlignment:
+        """Build a task as it runs on popeye, past the setup that repoints its loaders.
+
+        Returns
+        -------
+        MesoscopeFOVAlignment
+            A task whose reference loader reads from the quarantine mirror rather than from
+            the reference session itself.
+        """
+        task = self.make_task(location="popeye")
+        task.data_handler = mock.MagicMock(
+            root_path=self.root, patch_path=self.root / "quarantine"
+        )
+        task.one.get_details.return_value = {"lab": "cortexlab"}
+        task.one.eid2path.return_value = ALFPath(self.ref_session_path)
+        # the real setUp resolves signatures and data handlers, neither of which is under test
+        with mock.patch("ibllib.pipes.tasks.Task.setUp", return_value=True):
+            task.setUp()
+        return task
+
+    #
+    # the histology
+    #
+
+    def test_histology_provided_by_the_data_handler(self):
+        """Test that a file the data handler puts in place needs no further retrieval."""
         task = self.make_task(force=True)
-        self.write_histology_file()
 
         with mock.patch("mpci.alignment.task.ServerGlobusDataHandler") as handler_class:
-            local_file = task._get_atlas_registered_reference_mlap()
+            # setting the handler up is what brings the file in
+            handler_class.return_value.setUp.side_effect = self.write_histology_file
+            local_file = task.ensure_local_reference_session_histology()
 
         self.assertEqual(self.histology_file, local_file)
+        self.assertTrue(task.reference_data_loader.histology.available())
         # the handler is set up on the reference session, asking for the atlas indices
         session_path, signature = handler_class.call_args[0]
         self.assertEqual(self.ref_session_path, session_path)
@@ -474,7 +333,20 @@ class TestAtlasRegisteredReferenceMlap(AlignmentTestCase):
         handler_class.return_value.globus.mv.assert_not_called()
         task.one.alyx.download_file.assert_not_called()
 
-    def test_falls_back_to_globus(self):
+    def test_histology_already_local_is_not_fetched_again(self):
+        """Test that a histology the loader can already read short-circuits the whole retrieval."""
+        task = self.make_task(force=True)
+        self.write_histology_file()
+
+        with mock.patch("mpci.alignment.task.ServerGlobusDataHandler") as handler_class:
+            task.ensure_local_reference_session_histology()  # sets the handler up once
+            handler_class.reset_mock()
+            local_file = task.ensure_local_reference_session_histology()
+
+        self.assertEqual(self.histology_file, local_file)
+        handler_class.assert_not_called()
+
+    def test_histology_falls_back_to_globus(self):
         """Test that a missing file is fetched by mounting the histology folder over Globus."""
         task = self.make_task(force=True)
         task.one.get_details.return_value = {"lab": "cortexlab"}
@@ -485,9 +357,10 @@ class TestAtlasRegisteredReferenceMlap(AlignmentTestCase):
             # the transfer is what puts the file in place
             globus.mv.side_effect = self.write_histology_file
             with self.assertLogs("mpci.alignment.task", "WARNING"):
-                local_file = task._get_atlas_registered_reference_mlap()
+                local_file = task.ensure_local_reference_session_histology()
 
         self.assertEqual(self.histology_file, local_file)
+        self.assertTrue(task.reference_data_loader.histology.available())
         globus.add_endpoint.assert_called_once_with(
             "endpoint-uuid", label="flatiron_histology", root_path="/histology/"
         )
@@ -496,7 +369,7 @@ class TestAtlasRegisteredReferenceMlap(AlignmentTestCase):
         self.assertEqual(["cortexlab/SP000/2023-01-01/001/referenceImage.mlapdv.npy"], remote)
         task.one.alyx.download_file.assert_not_called()
 
-    def test_falls_back_to_http(self):
+    def test_histology_falls_back_to_http(self):
         """Test that a failing Globus transfer is followed by an HTTP download."""
         task = self.make_task(force=True)
         task.one.get_details.return_value = {"lab": "cortexlab"}
@@ -506,9 +379,10 @@ class TestAtlasRegisteredReferenceMlap(AlignmentTestCase):
             # without a flatiron endpoint the transfer cannot even be set up
             handler_class.return_value.globus.endpoints = {}
             with self.assertLogs("mpci.alignment.task", "ERROR"):
-                local_file = task._get_atlas_registered_reference_mlap()
+                local_file = task.ensure_local_reference_session_histology()
 
         self.assertEqual(self.histology_file, local_file)
+        self.assertTrue(task.reference_data_loader.histology.available())
         (remote_file,) = task.one.alyx.download_file.call_args[0]
         self.assertIn(
             "/histology/cortexlab/SP000/2023-01-01/001/referenceImage.mlapdv.npy", remote_file
@@ -517,57 +391,121 @@ class TestAtlasRegisteredReferenceMlap(AlignmentTestCase):
             self.histology_file.parent, task.one.alyx.download_file.call_args[1]["target_dir"]
         )
 
-    def test_popeye_reads_in_place(self):
-        """Test that on popeye the histology folder is addressed directly, without a transfer."""
-        task = self.make_task(location="popeye")
-        root_path = Path("/mnt/ceph")
-        task.data_handler = mock.MagicMock(root_path=root_path)
+    def test_histology_that_never_arrives(self):
+        """Test that a retrieval putting nothing in place fails rather than reporting success."""
+        task = self.make_task(force=True)
         task.one.get_details.return_value = {"lab": "cortexlab"}
 
         with mock.patch("mpci.alignment.task.ServerGlobusDataHandler") as handler_class:
-            local_file = task._get_atlas_registered_reference_mlap()
+            handler_class.return_value.globus.endpoints = {}
+            with (
+                self.assertLogs("mpci.alignment.task", "ERROR"),
+                self.assertRaises(AssertionError),
+            ):
+                task.ensure_local_reference_session_histology()
 
-        expected = (
-            root_path
+    def test_histology_on_popeye_is_linked_from_the_histology_folder(self):
+        """Test that the file the histology pipeline wrote is linked into the mirror.
+
+        It lives outside any session folder there, so the loader can only reach it through a
+        link it can see.
+        """
+        task = self.make_popeye_task()
+        histology_source = (
+            self.root
             / "histology"
             / "cortexlab"
             / "SP000/2023-01-01/001"
             / "referenceImage.mlapdv.npy"
         )
-        self.assertEqual(expected, local_file)
-        handler_class.assert_not_called()
+        histology_source.parent.mkdir(parents=True)
+        np.save(histology_source, np.zeros((*REF_STACK_SHAPE[1:], 3), dtype="uint16"))
+
+        self.assertFalse(task.reference_data_loader.histology.available())
+        local_file = task.ensure_local_reference_session_histology()
+
+        self.assertTrue(task.reference_data_loader.histology.available())
+        self.assertEqual(task.reference_data_loader.histology.path, local_file)
+        self.assertEqual(histology_source, local_file.readlink())
+        self.assertTrue(local_file.is_relative_to(self.root / "quarantine"))
+        self.assertEqual([local_file], task.links)
+        # nothing was transferred, and nothing was written into the reference session
         task.one.alyx.download_file.assert_not_called()
+        self.assertFalse(self.histology_file.exists())
 
+    #
+    # the reference session's reference stack
+    #
 
-class TestValidation(AlignmentTestCase):
-    """Tests for the input validation methods."""
-
-    def test_verify_data_presence(self):
-        """Test that a complete session reports every input as present."""
+    def test_reference_stack_is_read_where_it_lies(self):
+        """Test that off popeye the stack needs no staging at all."""
         task = self.make_task()
-        # remove points file even though it should be present - this will make _try_load fail
-        points_file = self.session_path / task.reference_collection / "referenceImage.points.json"
-        points_file.unlink()
-        # no attempt at loading histology here
-        with mock.patch.object(
-            task, "load_histology", side_effect=AssertionError, __name__="load_histology"
+        self.assertNotEqual("popeye", task.location)
+        expected = self.reference_collection / "referenceImage.stack.tif"
+
+        self.assertEqual(expected, task.ensure_local_reference_session_reference_stack())
+        self.assertTrue(task.reference_data_loader.reference_stack.available())
+        self.assertEqual([], task.links)
+
+    def test_reference_stack_on_popeye_is_linked_into_the_mirror(self):
+        """Test that on popeye the stack is symlinked out of the read-only mount."""
+        task = self.make_popeye_task()
+        self.assertFalse(task.reference_data_loader.reference_stack.available())
+
+        link = task.ensure_local_reference_session_reference_stack()
+
+        self.assertTrue(task.reference_data_loader.reference_stack.available())
+        self.assertTrue(link.is_symlink())
+        # the link points at the stack of the reference session on the mount
+        self.assertEqual(self.reference_collection / "referenceImage.stack.tif", link.readlink())
+        # and sits under the quarantine folder, in a folder named after the task
+        self.assertTrue(link.is_relative_to(self.root / "quarantine" / type(task).__name__))
+        # it is kept for tearDown to unlink
+        self.assertEqual([link], task.links)
+        self.assertEqual(REF_STACK_SHAPE, task.reference_data_loader.reference_stack.load().shape)
+
+    def test_reference_stack_on_popeye_replaces_a_stale_link(self):
+        """Test that an existing symlink is replaced rather than left pointing somewhere else."""
+        task = self.make_popeye_task()
+        link = task.ensure_local_reference_session_reference_stack()
+        link.unlink()
+        link.symlink_to(self.session_path / "raw_imaging_data_00" / "reference")
+
+        # available() is what short-circuits, and a link to a folder still counts as present,
+        # so the stale link has to be replaced by the staging itself
+        task.links.clear()
+        link.unlink()
+        link = task.ensure_local_reference_session_reference_stack()
+        self.assertEqual(self.reference_collection / "referenceImage.stack.tif", link.readlink())
+
+    #
+    # without a reference session there is nothing to stage
+    #
+
+    def test_staging_needs_a_reference_session(self):
+        """Test that both routes say so rather than failing obscurely."""
+        task = self.make_task(reference_session_path=None)
+        self.assertIsNone(task.reference_data_loader)
+        for ensure_local in (
+            task.ensure_local_reference_session_reference_stack,
+            task.ensure_local_reference_session_histology,
         ):
-            data_presence = task.verify_data_presence()
-        expected = {
-            "has_raw_imaging_metadata": True,
-            "has_reference_stack": True,
-            "has_reference_session_reference_stack": True,
-            "reference_stack_is_compatible": True,
-            "has_brain_surface_points_file": False,
-            "has_brain_surface_points_meta": True,
-            "has_brain_surface_points": True,
-            "has_histology": False,
-        }
-        self.assertEqual(expected, data_presence)
+            with self.subTest(call=ensure_local.__name__):
+                with self.assertRaises(ValueError) as context:
+                    ensure_local()
+                self.assertIn("no reference session", str(context.exception))
 
 
 class TestProcessing(AlignmentTestCase):
     """Tests for the interpolation, image registration and alignment pipeline methods."""
+
+    def test_get_fov_map(self):
+        """Test that FOV names are mapped onto their ScanImage ROI UUIDs."""
+        task = self.make_task()
+        meta = task.data_loader.raw_imaging_metadata.load()
+        fov_map = task.get_fov_map(meta)
+        expected = {f"FOV_{i:02}": fov_uuid for i, fov_uuid in enumerate(FOV_UUIDS)}
+        self.assertEqual(expected, fov_map)
 
     def test_interpolate_histology(self):
         """Test that the interpolator returns the ML/AP coordinates of the sampled pixels."""
@@ -595,8 +533,8 @@ class TestProcessing(AlignmentTestCase):
             mock.patch("mpci.alignment.task.evaluate", return_value=np.array([0.9])),
         ):
             result = task.register_reference_stacks(
-                task.get_ref_stack_path(),
-                task.get_reference_session_ref_stack_path(),
+                task.data_loader.reference_stack.path(),
+                task.ensure_local_reference_session_reference_stack(),
                 save_transform=True,
             )
 
@@ -630,7 +568,9 @@ class TestProcessing(AlignmentTestCase):
 
         with (
             mock.patch("mpci.alignment.task.ProjectionAtlas", return_value=atlas),
-            mock.patch.object(task, "load_histology", return_value=(histology_mlapdv(), None)),
+            mock.patch.object(
+                task, "load_histology_mlapdv", return_value=(histology_mlapdv(), None)
+            ),
             mock.patch.object(
                 task, "register_reference_stacks", return_value=EuclideanTransform(np.eye(3))
             ),
@@ -666,37 +606,23 @@ class TestProcessing(AlignmentTestCase):
         surgery_mock.assert_not_called()
 
     def test_align_FOVs_fallback(self):
-        """Test that every FOV gets a full set of coordinates, with all corrections enabled
-        but not being able to load the corresponding datasets -> fallback to geometry based
-        alignment
+        """Test that FOVs still get surface coordinates with every correction switched off.
+
+        This is what a session whose data supports no correction is aligned with: the plain
+        projection onto the atlas surface, and no depth below it.
 
         Runs in debug mode, which downsamples the pixel grid of the real fixture geometry from
         512**2 to a tractable number of positions.
         """
-
         task = self.make_task()
         n_pixels = len(np.arange(N_PX_PER_FOV**2)[::DEBUG_DOWNSAMPLE])
 
         atlas = mock.MagicMock()
-        # the surface lookup keeps the ML/AP columns and appends a DV column
         atlas.get_dv_for_mlap.side_effect = lambda mlap: np.c_[mlap, np.full(len(mlap), -200.0)]
         atlas.get_plane_at_point_mlap.return_value = (None, np.array([0.0, 0.0, 1.0]))
 
-        mock_data_presence = {
-            "has_raw_imaging_metadata": True,
-            "has_reference_stack": False,
-            "has_reference_session_reference_stack": False,
-            "has_brain_surface_points_file": False,
-            "reference_stack_is_compatible": False,
-            "has_brain_surface_points_meta": False,
-            "has_brain_surface_points": False,
-            "has_histology": False,
-        }
-
         with (
-            mock.patch.object(task, "verify_data_presence", return_value=mock_data_presence),
             mock.patch("mpci.alignment.task.ProjectionAtlas", return_value=atlas),
-            mock.patch.object(task, "update_surgery_json") as surgery_mock,
             mock.patch(
                 "mpci.alignment.task.projections.project_coords_onto_atlas_surface",
                 # the projection turns (ml, ap) into (ml, ap, dv) on the atlas surface
@@ -704,21 +630,17 @@ class TestProcessing(AlignmentTestCase):
             ),
         ):
             fovs_coordinates = task.align_FOVs(
-                use_histology=True, lateral_correct=True, tilt_correct=True, debug=True
+                use_histology=False, lateral_correct=False, tilt_correct=False, debug=True
             )
 
         self.assertEqual(set(FOV_UUIDS), set(fovs_coordinates))
         for fov_uuid in FOV_UUIDS:
-            # with self.subTest(fov_uuid=fov_uuid):
             coordinates = fovs_coordinates[fov_uuid]
-            # the surface projection is all that can be resolved without surface points
             self.assertEqual({"pixel", "um_global", "mlapdv_on_surface"}, set(coordinates))
             self.assertEqual((n_pixels, 2), coordinates["pixel"].shape)
             self.assertEqual((n_pixels, 2), coordinates["um_global"].shape)
             self.assertEqual((n_pixels, 3), coordinates["mlapdv_on_surface"].shape)
             self.assertFalse(np.isnan(coordinates["mlapdv_on_surface"]).any())
-        # register_data is off, so nothing is written back to Alyx
-        surgery_mock.assert_not_called()
 
     def test_run_estimate(self):
         """Test the full task for an ESTIMATE run, i.e. without histology available."""
@@ -729,18 +651,17 @@ class TestProcessing(AlignmentTestCase):
             for fov_uuid in FOV_UUIDS
         }
 
-        atlas = mock.MagicMock()
-        atlas.get_labels.return_value = np.ones((N_PX_PER_FOV, N_PX_PER_FOV), dtype=int)
+        self.atlas.get_labels.return_value = np.ones((N_PX_PER_FOV, N_PX_PER_FOV), dtype=int)
+        corrections = {"use_histology": False, "lateral_correct": True, "tilt_correct": True}
         with (
-            mock.patch.object(task, "load_histology", side_effect=FileNotFoundError),
+            mock.patch.object(task, "infer_possible_corrections", return_value=corrections),
             mock.patch.object(task, "align_FOVs", return_value=fovs_coordinates) as align_mock,
-            mock.patch("mpci.alignment.task.MRITorontoAtlas", return_value=atlas),
-            self.assertLogs("mpci.alignment.task", "WARNING"),
         ):
             outputs = task._run()
 
+        # without histology the coordinates are an estimate, whatever else was possible
         self.assertIs(Provenance.ESTIMATE, task.provenance)
-        align_mock.assert_called_once()
+        align_mock.assert_called_once_with(**corrections, debug=task.debug)
         # one metadata file plus an MLAPDV and a brain location dataset per FOV
         self.assertEqual(1 + 2 * N_FOV, len(outputs))
         for i in range(N_FOV):
@@ -750,7 +671,7 @@ class TestProcessing(AlignmentTestCase):
             self.assertTrue(expected.exists())
 
     def test_run_histology(self):
-        """Test the full task for an histology"""
+        """Test the full task for a HISTOLOGY run, i.e. with the histology resolved."""
         task = self.make_task(write_outputs=True, register_data=False)
         n_pixels = N_PX_PER_FOV**2
         fovs_coordinates = {
@@ -758,19 +679,19 @@ class TestProcessing(AlignmentTestCase):
             for fov_uuid in FOV_UUIDS
         }
 
-        atlas = mock.MagicMock()
-        atlas.get_labels.return_value = np.ones((N_PX_PER_FOV, N_PX_PER_FOV), dtype=int)
-        # subject_json = {"json": {"craniotomy_00": {"center": [2.5, -2.3]}}}
+        self.atlas.get_labels.return_value = np.ones((N_PX_PER_FOV, N_PX_PER_FOV), dtype=int)
+        corrections = {"use_histology": True, "lateral_correct": True, "tilt_correct": True}
         with (
-            # mock.patch.object(task.one.alyx, "rest", return_value=subject_json),
-            mock.patch.object(task, "load_histology", return_value=(histology_mlapdv(), None)),
+            mock.patch.object(task, "infer_possible_corrections", return_value=corrections),
+            mock.patch.object(
+                task, "load_histology_mlapdv", return_value=(histology_mlapdv(), None)
+            ),
             mock.patch.object(task, "align_FOVs", return_value=fovs_coordinates) as align_mock,
-            mock.patch("mpci.alignment.task.MRITorontoAtlas", return_value=atlas),
         ):
             _ = task._run()
 
         self.assertIs(Provenance.HISTOLOGY, task.provenance)
-        align_mock.assert_called_once()
+        align_mock.assert_called_once_with(**corrections, debug=task.debug)
 
         for i in range(N_FOV):
             fov_path = self.session_path / "alf" / f"FOV_{i:02}"
@@ -785,7 +706,7 @@ class TestAlyx(AlignmentTestCase):
     def test_update_craniotomy_center(self):
         """Test that the resolved craniotomy center is derived and returned."""
         task = self.make_task(register_data=False, write_outputs=True)
-        ref_image_meta = task.load_reference_stack_metadata()
+        ref_image_meta = task.data_loader.reference_stack_metadata.load()
         ref_stack_mlapdv = histology_mlapdv() * 1e3  # μm -> the method divides by 1e3
 
         subject_json = {"json": {"craniotomy_00": {"center": [2.5, -2.3]}}}
@@ -808,7 +729,7 @@ class TestAlyx(AlignmentTestCase):
         task = self.make_task(
             register_data=True, write_outputs=True, reference_session_path=self.session_path
         )
-        ref_image_meta = task.load_reference_stack_metadata()
+        ref_image_meta = task.data_loader.reference_stack_metadata.load()
         ref_stack_mlapdv = histology_mlapdv() * 1e3  # μm -> the method divides by 1e3
 
         subject_json = {"json": {"craniotomy_00": {"center": [2.5, -2.3]}}}
@@ -924,7 +845,7 @@ class TestAlyx(AlignmentTestCase):
         do not have.
         """
         task = self.make_task()
-        meta = task.load_raw_imaging_metadata()
+        meta = task.data_loader.raw_imaging_metadata.load()
         for fov in meta["FOV"]:
             fov["MLAPDV"] = {"estimate": MLAPDV_CORNERS}
         # the brain location IDs of the mean images are read back from disk
@@ -954,7 +875,7 @@ class TestAlyx(AlignmentTestCase):
         of the last one.
         """
         task = self.make_task(register_data=True)
-        meta = task.load_raw_imaging_metadata()
+        meta = task.data_loader.raw_imaging_metadata.load()
         meta["FOV"] = meta["FOV"][:1]
         meta["FOV"][0]["MLAPDV"] = {"estimate": MLAPDV_CORNERS}
         # the brain location IDs of the mean image are read back from disk
@@ -1003,6 +924,121 @@ class TestAlyx(AlignmentTestCase):
         self.assertEqual([2317.2, 2862.7, 2317.3, 2862.7], location["x"])
         self.assertEqual([-1599.8, -1625.2, -2181.4, -2206.9], location["y"])
         self.assertEqual([-535.5, -748.7, -466.3, -679.4], location["z"])
+
+
+#
+# integration tests
+#
+
+# a session to align, and the histology-aligned reference session of the same subject, whose
+# reference collection holds `referenceImage.mlapdv.npy`
+INTEGRATION_SESSION = ("mesoscope", "SP058", "2024-07-24", "001")
+INTEGRATION_REFERENCE_SESSION = ("mesoscope", "SP058", "2024-08-14", "001")
+
+
+class TestIntegration(IntegrationTestCase):
+    """End-to-end tests against real integration data.
+
+    Unlike the rest of this module, these exercise the real atlases, the real image
+    registration between two reference stacks and files pulled from the S3 integration data
+    mount, so they auto-skip when `INTEGRATION_DATA_DIR` is not configured.
+    """
+
+    required_files = ["/".join(INTEGRATION_SESSION), "/".join(INTEGRATION_REFERENCE_SESSION)]
+    # every test writes into the session, so each gets its own mirror
+    _writable_scope = "test"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.one = ONE(**TEST_DB)
+        self.session_path = ALFPath(self.data_path.joinpath(*INTEGRATION_SESSION))
+        self.ref_session_path = ALFPath(self.data_path.joinpath(*INTEGRATION_REFERENCE_SESSION))
+
+        # the task writes the mean image datasets into alf, and patches both metadata files
+        if self.session_path.joinpath("alf").exists():
+            self.backup_alf(self.session_path)
+        self.protect(self.session_path.glob("raw_imaging_data_*/_ibl_rawImagingData.meta.json"))
+        self.protect(
+            self.session_path.glob("raw_imaging_data_*/reference/referenceImage.meta.json")
+        )
+
+    def protect(self, paths) -> None:
+        """Copy the given files to a temp dir and restore them on teardown.
+
+        Backing up in place (e.g. alongside the original with a suffix) would leave a second
+        file that wildcard-based lookups like `find_file` could pick up alongside the original,
+        so the copies live outside the session tree entirely.
+
+        Parameters
+        ----------
+        paths : iterable of pathlib.Path
+            Files to copy aside and put back after the test.
+        """
+        backup_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, backup_dir, ignore_errors=True)
+        for index, path in enumerate(paths):
+            backup = backup_dir / f"{index}_{path.name}"
+            shutil.copy(path, backup)
+            self.addCleanup(shutil.move, backup, path)
+
+    def make_task(self, **kwargs) -> MesoscopeFOVAlignment:
+        """Build the task on the real session, writing outputs but leaving Alyx alone.
+
+        Parameters
+        ----------
+        **kwargs : dict
+            Keyword arguments overriding the defaults passed to `MesoscopeFOVAlignment`.
+
+        Returns
+        -------
+        MesoscopeFOVAlignment
+            A task with its `input_files`/`output_files` resolved.
+        """
+        kwargs = {
+            "reference_session_path": self.ref_session_path,
+            "one": self.one,
+            "write_outputs": True,
+            "register_data": False,
+            "debug": False,
+        } | kwargs
+        task = MesoscopeFOVAlignment(self.session_path, **kwargs)
+        task.get_signatures()
+        return task
+
+    def test_run_histology(self):
+        """Test the full task against histology, exercising the real atlases end to end.
+
+        Also covers the lateral shift correction against the reference session's stack and the
+        tilt correction from the brain surface points, both unique to a real run.
+        """
+        # a synthetic histology stands in for the subject's, which the integration session may
+        # not have; forcing it usable is what makes the run take the histology branch
+        with (
+            mock.patch.object(
+                MesoscopeFOVAlignment,
+                "load_histology_mlapdv",
+                return_value=(histology_mlapdv(), None),
+            ),
+            mock.patch.object(HistologyLoader, "usable", return_value=True),
+        ):
+            task = self.make_task(debug=True)
+            status = task.run()
+        self.assertEqual(0, status, task.log)
+        self.assertIs(Provenance.HISTOLOGY, task.provenance)
+
+    def test_run_estimate(self):
+        """Test the full task with the histology withheld.
+
+        Without histology the task projects along the brain normal from the craniotomy center
+        instead of looking coordinates up, which is what runs for any subject that has not
+        been aligned to histology yet.
+        """
+        task = self.make_task(debug=True)
+        # with the histology reported unusable the inference rules the lookup out
+        with mock.patch.object(task.reference_data_loader.histology, "usable", return_value=False):
+            status = task.run()
+        self.assertEqual(0, status, task.log)
+        self.assertIs(Provenance.ESTIMATE, task.provenance)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Tests for the ROICoordinatesExtraction task of mpci.alignment.task.
+"""Tests for the ROICoordinatesExtraction task of mpci.roi.task.
 
 The per-FOV mean image maps are synthetic and linear in the pixel indices, so the coordinates
 expected for a ROI follow from its pixel position alone. The raw imaging metadata fixture and
@@ -12,7 +12,8 @@ from pathlib import Path
 
 import numpy as np
 
-from mpci.alignment.task import Provenance, ROICoordinatesExtraction
+from mpci.alyx.tasks import Provenance
+from mpci.roi.task import ROICoordinatesExtraction
 from mpci.tests.test_alignment import RAW_IMAGING_META_FILE, mock_one
 
 

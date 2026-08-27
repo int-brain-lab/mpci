@@ -8,7 +8,8 @@ from ibllib.pipes.dynamic_pipeline import _get_sync_config
 
 from mpci.alyx.tasks import MesoscopeRegisterSnapshots
 from mpci.suite2p.task import MesoscopePreprocess
-from mpci.alignment.task import MesoscopeFOVAlignment, ROICoordinatesExtraction
+from mpci.alignment.task import MesoscopeFOVAlignment
+from mpci.roi.task import ROICoordinatesExtraction
 from mpci.sync.task import MesoscopeSync
 from mpci.scanimage.task import MesoscopeCompress
 
