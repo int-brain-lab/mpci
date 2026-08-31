@@ -8,6 +8,7 @@ from typing import Literal
 from collections import Counter
 from datetime import datetime
 from uuid import UUID, uuid4
+import shutil
 
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
@@ -121,6 +122,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         write_outputs: bool = False,  # for now safety first. FIXME change this eventually
         register_data: bool = False,  # for now safety first. FIXME change this eventually
         debug: bool = True,
+        backup: bool = False,
+        backup_folder: Path | None = None,
         **kwargs,
     ):
         """Initialize the task with this session's and the reference session's identifiers.
@@ -154,6 +157,15 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             fields. Default is False.
         debug : bool, optional
             If True, downsample the pixel grid for faster debugging runs. Default is True.
+        backup : bool, optional
+            If True, copy a dataset that is about to be overwritten into the backup folder
+            first, see `backup_file`. Only has an effect together with `write_outputs`, as
+            nothing is overwritten without it. Default is False.
+        backup_folder : pathlib.Path, optional
+            Root folder the backups are written to, mirroring each file's subject, date,
+            number and collection below it. It lives outside any session tree, so that no glob
+            over a session folder can reach the copies. Resolved from `location` if not given,
+            and only needed when `backup` is set.
         **kwargs : dict
             Keyword arguments forwarded to `MesoscopeTask`.
 
@@ -204,6 +216,21 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         self.write_outputs = write_outputs
         self.register_data = register_data
         self.debug = debug
+
+        # backups live outside any session tree, so that no glob over a session can pick them
+        # up; where that is depends on where the task runs
+        self.backup = backup
+        if self.backup and backup_folder is None:
+            match self.location:
+                case "server":
+                    backup_folder = Path("/mnt/s0/Data/backups")
+                case "popeye" | "local":
+                    backup_folder = Path.home() / "backups"
+                case _:
+                    raise NotImplementedError(
+                        f"no backup folder defined for location {self.location!r}"
+                    )
+        self.backup_folder = backup_folder
 
         _logger.info(
             "Initialized %s for %s (reference session: %s)",
@@ -506,6 +533,60 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         )
         return histology_path
 
+    def backup_file(self, filepath: Path) -> Path:
+        """Copy a dataset into the backup folder, before it is overwritten.
+
+        The backup mirrors the file's subject, date, number and collection, rooted at
+        `backup_folder` instead of the data repository. Living outside every session tree is
+        what makes the copies safe: no glob over a session folder - whether this codebase's or
+        an unknown one's - can reach them, so nothing has to be tolerant of a backup suffix.
+
+        The name carries a timestamp, so that repeated runs keep every backup rather than the
+        second one overwriting the pristine original with an already processed file. It goes
+        before the extension, which is left in place so the copy stays readable by whatever
+        reads the original.
+
+        Parameters
+        ----------
+        filepath : pathlib.Path
+            File to copy, inside a session folder. It has to exist; the copy is taken as it
+            is, nothing is written to it.
+
+        Returns
+        -------
+        pathlib.Path
+            Path of the copy, e.g. a file at
+            '/mnt/s0/Data/Subjects/SP058/2024-07-24/001/alf/FOV_00/mpciMeanImage.mlapdv.npy'
+            backed up to '<backup_folder>/SP058/2024-07-24/001/alf/FOV_00/
+            mpciMeanImage.mlapdv.20260831T140322.npy'.
+
+        Raises
+        ------
+        ValueError
+            If no backup folder was resolved, i.e. the task was constructed neither with
+            `backup` nor with an explicit `backup_folder`, or if `filepath` holds no session
+            path to mirror.
+        FileNotFoundError
+            If `filepath` does not exist.
+        """
+        if self.backup_folder is None:
+            raise ValueError("cannot back up: no backup folder was resolved for this task")
+
+        # subject, date, number and collection are all mirrored, so the backup sits at the same
+        # place below `backup_folder` as the original does below the data repository
+        filepath = ALFPath(filepath)
+        filepath_backup = (
+            self.backup_folder / filepath.session_path_short() / filepath.relative_to_session()
+        )
+        # the timestamp goes before the extension rather than after it, so that repeated runs
+        # keep every backup while the copy stays readable by whatever reads the original
+        timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+        filepath_backup = filepath_backup.with_suffix(f".{timestamp}{filepath_backup.suffix}")
+        filepath_backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(filepath, filepath_backup)
+        _logger.info("backed up %s to %s", filepath, filepath_backup)
+        return filepath_backup
+
     @property
     def signature(self) -> dict:
         I = ExpectedDataset.input  # noqa
@@ -611,7 +692,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         output datasets, and only a HISTOLOGY run updates the craniotomy center.
 
         Writing to disk requires `write_outputs` and registering to Alyx requires
-        `register_data`; the returned paths are the same either way.
+        `register_data`; the returned paths are the same either way. With `backup` set, any
+        dataset that is about to be overwritten is copied aside first, see `backup_file`.
 
         Returns
         -------
@@ -635,19 +717,26 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
         if self.provenance is Provenance.HISTOLOGY:
             _logger.info("Extracting histology MLAPDV datasets")
+
             # Update the craniotomy center
             ref_session_ref_image_mlapdv, _ = self.load_histology_mlapdv()
             ref_image_meta = self.data_loader.reference_stack_metadata.load()
             if self.register_data:
                 self.update_craniotomy_center(ref_image_meta, ref_session_ref_image_mlapdv)
+
             # update the individual meta files
             meta["centerMM"] = ref_image_meta["centerMM"]
+
             # write the file - only writing to the first, but later also reading only from
             # the first
             if self.write_outputs:
-                _logger.debug("writing updated centerMM to %s", meta_files[0])
-                with open(meta_files[0], "w") as fp:
+                filepath = meta_files[0]
+                if filepath.exists() and self.backup:
+                    self.backup_file(filepath)
+                _logger.debug("writing updated centerMM to %s", filepath)
+                with open(filepath, "w") as fp:
                     json.dump(meta, fp)
+
             # Add reference meta data to meta_files list for registration
             meta_files.append(self.data_loader.reference_stack_metadata.path())
 
@@ -730,29 +819,47 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             }
 
         # Save the mean image datasets
-        suffix = "" if self.provenance is Provenance.HISTOLOGY else self.provenance.name.lower()
+        provenance_suffix = (
+            "" if self.provenance is Provenance.HISTOLOGY else self.provenance.name.lower()
+        )
+        # storing all outputs
         mean_image_files = []
+
         for fov_name, fov_uuid in fov_map.items():
             alf_path = self.session_path.joinpath("alf", fov_name)
             alf_path.mkdir(parents=True, exist_ok=True)
-            for attr, arr, sfx in (
-                ("mlapdv", mean_images_mlapdv[fov_uuid], suffix),
-                (
-                    "brainLocationIds",
-                    mean_images_ids[fov_uuid],
-                    ("ccf", "2017", suffix),
-                ),
-            ):
-                mean_image_files.append(
-                    alf_path / to_alf("mpciMeanImage", attr, "npy", timescale=sfx)
-                )
-                if self.write_outputs:
-                    _logger.debug("writing %s", mean_image_files[-1])
-                    np.save(mean_image_files[-1], arr)
-        if self.write_outputs:
-            _logger.info("Wrote %d mean-image dataset(s)", len(mean_image_files))
-        else:
-            _logger.debug("write_outputs is False, skipping writing mean-image datasets")
+
+            # mpciMeanImage.mlapdv
+            filepath = alf_path / to_alf(
+                "mpciMeanImage",
+                "mlapdv",
+                "npy",
+                timescale=provenance_suffix,
+            )
+            mean_image_files.append(filepath)
+            if self.write_outputs:
+                if filepath.exists() and self.backup:
+                    self.backup_file(filepath)
+                np.save(filepath, mean_images_mlapdv[fov_uuid])
+                _logger.info("wrote %s", filepath)
+            else:
+                _logger.info("would have written %s", filepath)
+
+            # mpciMeanImage.brainLocatoinIds
+            filepath = alf_path / to_alf(
+                "mpciMeanImage",
+                "brainLocationIds",
+                "npy",
+                timescale=("ccf", "2017", provenance_suffix),
+            )
+            mean_image_files.append(filepath)
+            if self.write_outputs:
+                if filepath.exists() and self.backup:
+                    self.backup_file(filepath)
+                np.save(filepath, mean_images_ids[fov_uuid])
+                _logger.info("wrote %s", filepath)
+            else:
+                _logger.info("would have written %s", filepath)
 
         # Register FOVs in Alyx
         if self.register_data:
@@ -1276,7 +1383,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         ----------
         ref_image_meta : dict
             Contents of this session's `referenceImage.meta.json`; updated in place with the
-            resolved ML/AP center, and written back to disk when `write_outputs` is set.
+            resolved ML/AP center, and written back to disk when `write_outputs` is set. The
+            file it overwrites is backed up first when `backup` is set.
         ref_session_ref_stack_mlapdv : numpy.ndarray
             Array with shape (h, w, 3) holding the (ml, ap, dv) coordinates in μm of each
             pixel of the reference session's reference image.
@@ -1319,6 +1427,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         ref_image_meta["centerMM"]["AP_resolved"] = craniotomy_resolved[1]
         meta_path = self.data_loader.reference_stack_metadata.path()
         if self.write_outputs:
+            if meta_path.exists() and self.backup:
+                self.backup_file(meta_path)
             with open(meta_path, "w") as f:
                 json.dump(ref_image_meta, f)
 
@@ -1522,7 +1632,6 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             data["brain_region"] = np.unique(mean_image_ids).astype(int).tolist()
 
             if not self.register_data:
-                _logger.debug(data)
                 fov_data["location"].append(data)
             else:
                 # Whether to patch or create a new location
