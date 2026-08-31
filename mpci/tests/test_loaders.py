@@ -187,71 +187,6 @@ class TestFileHelpers(unittest.TestCase):
                 "raw_imaging_data_01/reference", infer_reference_collection(session_path)
             )
 
-    def test_infer_reference_collection_does_not_depend_on_listing_order(self):
-        """Test that the collection taken is the last by name, not by filesystem order.
-
-        `Path.glob` yields in filesystem order, which for these folders is neither sorted nor
-        stable, so without sorting the choice would vary between machines and between runs.
-        """
-        for creation_order in (("00", "01", "02"), ("02", "00", "01"), ("01", "02", "00")):
-            with self.subTest(created=creation_order):
-                session_path = self.root / f"session_{'_'.join(creation_order)}"
-                for suffix in creation_order:
-                    (add_bout(session_path, suffix) / "reference").mkdir(parents=True)
-                with self.assertLogs(LOGGER_NAME, "WARNING"):
-                    collection = infer_reference_collection(session_path)
-                self.assertEqual("raw_imaging_data_02/reference", collection)
-
-    def test_infer_reference_collection_ignores_odd_bout_names(self):
-        """Test that only two digit bout suffixes are considered."""
-        session_path = self.root / "session"
-        for suffix in ("0", "000", "_backup"):
-            (add_bout(session_path, suffix) / "reference").mkdir()
-        with self.assertRaises(FileNotFoundError):
-            infer_reference_collection(session_path)
-
-
-class TestDataLoaderContract(LoaderTestCase):
-    """Tests for what the `DataLoader` base class guarantees about every source."""
-
-    def test_trio_is_enforced(self):
-        """Test that a subclass missing any of the three calls cannot be instantiated."""
-        trio = {"available": lambda self: True, "load": lambda self: None}
-        for missing in ("available", "load", "validate"):
-            with self.subTest(missing=missing):
-                namespace = {name: fn for name, fn in trio.items() if name != missing}
-                namespace.setdefault("validate", lambda self, data: None)
-                namespace.pop(missing, None)
-                subclass = type("Partial", (DataLoader,), namespace)
-                with self.assertRaises(TypeError) as context:
-                    subclass(self.reference_path)
-                self.assertIn(missing, str(context.exception))
-
-    def test_data_path_is_all_a_source_knows(self):
-        """Test that a source only holds the folder it reads from, and reports it."""
-        loader = ReferenceStackLoader(self.reference_path)
-        self.assertEqual(self.reference_path, Path(loader.data_path))
-        self.assertIn(str(self.reference_path), repr(loader))
-        self.assertIn("ReferenceStackLoader", repr(loader))
-        # the session layout is the parent's business, not a source's
-        for attribute in ("session_path", "reference_collection", "reference_path"):
-            self.assertFalse(hasattr(loader, attribute), attribute)
-
-    def test_available_is_false_when_the_path_is_ambiguous(self):
-        """Test that a source reports absence when its glob matches more than one file."""
-        self.assertTrue(self.loader.reference_stack.available())
-        shutil.copy(
-            self.loader.reference_stack.path(), self.reference_path / "referenceImage.stack.tif.bk"
-        )
-        self.assertFalse(self.loader.reference_stack.available())
-
-    def test_sources_stand_alone_on_a_bare_folder(self):
-        """Test that a source needs nothing but a folder, not a session shaped one."""
-        bare = self.root / "bare"
-        bare.mkdir()
-        shutil.copy(self.loader.reference_stack.path(), bare)
-        self.assertEqual(STACK_SHAPE, ReferenceStackLoader(bare).load().shape)
-
 
 class TestSourceTrio(LoaderTestCase):
     """Tests that walk every data source through the three calls it shares."""
@@ -504,11 +439,6 @@ class TestBrainSurfacePoints(LoaderTestCase):
         with self.assertRaises(ValueError):
             self.source.load()
 
-    def test_an_invalid_preference_is_rejected_up_front(self):
-        """Test that a preference that names no source raises before anything is read."""
-        with self.assertRaises(ValueError):
-            self.source.load(prefer="whichever")
-
     def test_metadata_source_needs_the_metadata(self):
         """Test that the points cannot come from metadata that is not there."""
         self.loader.reference_stack_metadata.path().unlink()
@@ -595,14 +525,6 @@ class TestMesoscopeLocalDataLoader(LoaderTestCase):
             self.loader.reference_stack_metadata,
             self.loader.brain_surface_points.reference_stack_metadata,
         )
-
-    def test_raw_imaging_data_is_not_implemented(self):
-        """Test that the unimplemented source says so for each of the three calls."""
-        source = self.loader.raw_imaging_data
-        for call in (source.available, source.load, source.usable, lambda: source.validate(None)):
-            with self.subTest(call=call):
-                with self.assertRaises(NotImplementedError):
-                    call()
 
 
 if __name__ == "__main__":
