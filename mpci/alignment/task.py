@@ -205,6 +205,13 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         self.register_data = register_data
         self.debug = debug
 
+        _logger.info(
+            "Initialized %s for %s (reference session: %s)",
+            type(self).__name__,
+            self.session_path,
+            self.ref_session_path,
+        )
+
     def setUp(self, **kwargs):
         """Run the default setup, then point both loaders at where the files can be read.
 
@@ -223,9 +230,17 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         bool
             Whatever the default setup reported.
         """
+        _logger.debug("Setting up %s for %s", type(self).__name__, self.session_path)
         status = super().setUp(**kwargs)
+        # `data_loader` was built in __init__ against the original session_path; if the data
+        # handler above staged this session somewhere else (e.g. popeye's quarantine folder,
+        # which repoints session_path), that loader now reads from the wrong place and has to
+        # be rebuilt. Off popeye nothing moves, so the path still matches and this is a no-op.
+        #
         # the collection a session's reference data sits in does not depend on where the files
-        # were staged, so both loaders are rebuilt with the one already resolved
+        # were staged, so both loaders are rebuilt with the one already resolved - re-inferring
+        # it here instead could fail, since a freshly staged folder may not have every file
+        # symlinked into it yet
         if self.data_loader.session_path != self.session_path:
             _logger.debug("session staged to %s, rebuilding its loader", self.session_path)
             self.data_loader = MesoscopeLocalDataLoader(
@@ -233,16 +248,28 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             )
 
         if self.location == "popeye" and self.reference_data_loader is not None:
+            # the reference session is not part of this task's signature, so the data handler
+            # above never stages it. Its files instead trickle into a quarantine mirror one at
+            # a time, symlinked lazily by ensure_local_reference_session_* only as each is
+            # needed - so the loader is pointed at that mirror now, even though nothing may be
+            # symlinked into it yet.
+            #
             # NB: the collection is read off the loader being replaced, which the right hand
             # side being evaluated first makes safe
             self.reference_data_loader = MesoscopeLocalDataLoader(
                 self.reference_session_mirror_path(),
                 self.reference_data_loader.reference_collection,
             )
+            _logger.debug(
+                "reference session's loader repointed at quarantine mirror %s",
+                self.reference_data_loader.session_path,
+            )
         return status
 
     def tearDown(self):
         """Unlink any symlinks staging created, then run the default teardown."""
+        if self.links:
+            _logger.debug("unlinking %d staged symlink(s)", len(self.links))
         for link in self.links:
             link.unlink()
         super().tearDown()
@@ -349,6 +376,10 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         """
         self._assert_reference_session("the reference session's reference stack")
         if self.reference_data_loader.reference_stack.available():
+            _logger.debug(
+                "reference session's reference stack already local at %s",
+                self.reference_data_loader.reference_stack.path(),
+            )
             return self.reference_data_loader.reference_stack.path()
 
         source_folder = (
@@ -358,6 +389,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             / self.ref_session_path.session_path_short()
             / self.reference_data_loader.reference_collection
         )
+        _logger.debug("symlinking reference session's reference stack from %s", source_folder)
         self._symlink_into_mirror(find_file(source_folder, "*referenceImage.stack*"))
         return self.reference_data_loader.reference_stack.path()
 
@@ -524,10 +556,12 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             Whether `align_FOVs` can run with `use_histology`, `lateral_correct` and
             `tilt_correct`.
         """
+        _logger.info("Inferring possible corrections for %s", self.session_path)
         corrections = {"use_histology": False, "lateral_correct": False, "tilt_correct": False}
 
         # the tilt is corrected against the brain surface, so its points are all it takes
         corrections["tilt_correct"] = self.data_loader.brain_surface_points.usable()
+        _logger.debug("tilt correction usable: %s", corrections["tilt_correct"])
 
         if self.reference_data_loader is None:
             _logger.warning(
@@ -546,6 +580,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                 _logger.warning("%s: %s: %s", ensure_local.__name__, type(e).__name__, e)
 
         corrections["use_histology"] = self.reference_data_loader.histology.usable()
+        _logger.debug("reference session histology usable: %s", corrections["use_histology"])
 
         # both stacks are registered onto one another, so they have to be usable and agree in
         # shape; the shapes are read off the tif headers rather than by loading the pixels
@@ -554,6 +589,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         if session_stack.usable() and reference_stack.usable():
             shapes = (session_stack.shape(), reference_stack.shape())
             corrections["lateral_correct"] = shapes[0] == shapes[1]
+            _logger.debug("reference stack shapes: this session %s, reference session %s", *shapes)
             if not corrections["lateral_correct"]:
                 _logger.warning(
                     "no lateral correction: this session's reference stack is %s, the "
@@ -564,6 +600,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         for correction, possible in corrections.items():
             if not possible:
                 _logger.info("%s is not possible for %s", correction, self.session_path)
+        _logger.info("Corrections resolved for %s: %s", self.session_path, corrections)
         return corrections
 
     def _run(self) -> list[Path]:
@@ -581,16 +618,20 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         list of pathlib.Path
             The raw imaging metadata files and the per-FOV mean-image datasets, to register.
         """
+        _logger.info("Starting FOV alignment run for %s", self.session_path)
+
         # what the data supports decides both the corrections and the provenance: the FOVs are
         # placed by geometry alone unless the histology can be looked up
         corrections = self.infer_possible_corrections()
         self.provenance = (
             Provenance.HISTOLOGY if corrections["use_histology"] else Provenance.ESTIMATE
         )
+        _logger.info("Provenance set to %s", self.provenance.name)
 
         # Load main meta, already patched to the current version by the loader
         meta_files = self.data_loader.raw_imaging_metadata.paths()
         meta = self.data_loader.raw_imaging_metadata.load()
+        _logger.debug("loaded raw imaging metadata from %d file(s)", len(meta_files))
 
         if self.provenance is Provenance.HISTOLOGY:
             _logger.info("Extracting histology MLAPDV datasets")
@@ -604,12 +645,16 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             # write the file - only writing to the first, but later also reading only from
             # the first
             if self.write_outputs:
+                _logger.debug("writing updated centerMM to %s", meta_files[0])
                 with open(meta_files[0], "w") as fp:
                     json.dump(meta, fp)
             # Add reference meta data to meta_files list for registration
             meta_files.append(self.data_loader.reference_stack_metadata.path())
+
         # this encapsulates the entire alignment pipeline
+        _logger.info("Running FOV alignment with corrections: %s", corrections)
         self.fovs_coordinates = self.align_FOVs(**corrections, debug=self.debug)
+        _logger.info("Alignment computed coordinates for %d FOV(s)", len(self.fovs_coordinates))
 
         # the metadata of the first imaging bout stands in for all of them, which only holds
         # if the scanimage content needed here is consistent across the files
@@ -621,6 +666,9 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         atlas = self.histology_atlas
 
         # store the outputs
+        _logger.info(
+            "Computing mean-image MLAPDV and brain location datasets for %d FOV(s)", len(fov_map)
+        )
         mean_images_mlapdv = {}
         mean_images_ids = {}
         for fov_name, fov_uuid in fov_map.items():
@@ -632,6 +680,12 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                 values = self.fovs_coordinates[fov_uuid]["mlapdv"]
                 from scipy.interpolate import interp1d
 
+                _logger.debug(
+                    "%s: stretching debug-downsampled coordinates from %d to %d points",
+                    fov_name,
+                    old_len,
+                    target_len,
+                )
                 fn = interp1d(
                     np.linspace(0, 1, old_len),
                     values,
@@ -644,6 +698,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             )
             mean_images_mlapdv[fov_uuid] = mean_image_mlapdv
             mean_images_ids[fov_uuid] = atlas.get_labels(mean_image_mlapdv / 1e6, mode="clip")
+            _logger.debug("%s (%s): mean image computed", fov_name, fov_uuid)
 
         for fov_name, fov_uuid in fov_map.items():
             (fov,) = [fov for fov in meta["FOV"] if fov["roiUUID"] == fov_uuid]
@@ -692,13 +747,27 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                     alf_path / to_alf("mpciMeanImage", attr, "npy", timescale=sfx)
                 )
                 if self.write_outputs:
+                    _logger.debug("writing %s", mean_image_files[-1])
                     np.save(mean_image_files[-1], arr)
+        if self.write_outputs:
+            _logger.info("Wrote %d mean-image dataset(s)", len(mean_image_files))
+        else:
+            _logger.debug("write_outputs is False, skipping writing mean-image datasets")
 
         # Register FOVs in Alyx
         if self.register_data:
+            _logger.info("Registering %d FOV(s) to Alyx", len(fov_map))
             self.register_fovs(meta, self.provenance)
+        else:
+            _logger.debug("register_data is False, skipping FOV registration")
 
-        return sorted([*meta_files, *mean_image_files])
+        outputs = sorted([*meta_files, *mean_image_files])
+        _logger.info(
+            "Finished FOV alignment run for %s: %d output file(s)",
+            self.session_path,
+            len(outputs),
+        )
+        return outputs
 
     #
     # ########  ########   #######   ######  ########  ######   ######  #### ##    ##  ######
@@ -731,6 +800,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             If the task was constructed without a reference session path, or if the histology
             does not hold one atlas index triplet per reference image pixel.
         """
+        _logger.debug("resolving reference session histology to MLAPDV coordinates")
         self.ensure_local_reference_session_histology()
         ccf_idx = self.reference_data_loader.histology.load()
         self.reference_data_loader.histology.validate(ccf_idx)
@@ -743,6 +813,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         ref_img_histo_mlapdv = (
             atlas.ccf2xyz(ccf_idx * atlas.res_um, ccf_order="mlapdv") * 1e6
         )  # m -> μm
+        _logger.debug("resolved histology MLAPDV grid with shape %s", ref_img_histo_mlapdv.shape)
         return ref_img_histo_mlapdv, ccf_idx
 
     @staticmethod
@@ -820,6 +891,11 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             Transform mapping coordinates of this session's stack onto the reference session's.
         """
         # TODO refactor, and settle on where the transform output should be stored
+        _logger.info(
+            "Registering reference stack %s onto reference session's %s",
+            ref_stack_path,
+            ref_sess_ref_stack_path,
+        )
 
         # load the stacks of this session and of the reference session
         img_data = {}
@@ -845,6 +921,14 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         # score the transform by normalized cross-correlation, before and after
         ncc_before = evaluate(img_data["stack"], img_data["target_stack"])
         ncc_after = evaluate(img_data["aligned"], img_data["target_stack"])
+        _logger.debug(
+            "reference stack registration: ncc before=%.4f, after=%.4f, translation=%s, "
+            "rotation=%.4f",
+            ncc_before.mean(),
+            ncc_after.mean(),
+            ref_transform.translation,
+            ref_transform.rotation,
+        )
 
         params = {
             "translation": ref_transform.translation,
@@ -961,13 +1045,24 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             'mlapdv_on_surface'; 'dv_below_surface', 'um_corrected',
             'dv_below_surface_corrected' and 'mlapdv' are added when `tilt_correct` runs.
         """
+        _logger.info(
+            "Aligning FOVs for %s (use_histology=%s, lateral_correct=%s, tilt_correct=%s, "
+            "debug=%s)",
+            self.session_path,
+            use_histology,
+            lateral_correct,
+            tilt_correct,
+            debug,
+        )
         raw_imaging_meta = self.data_loader.raw_imaging_metadata.load()
         fov_map = self.get_fov_map(raw_imaging_meta)
+        _logger.debug("FOV map: %s", fov_map)
 
         # the reference stack and its metadata anchor every path below, whichever corrections
         # are switched on, so they are inputs rather than optional extras
         ref_img_stack = self.data_loader.reference_stack.load()
         ref_img_meta = self.data_loader.reference_stack_metadata.load()
+        _logger.debug("loaded reference stack with shape %s", ref_img_stack.shape)
 
         # coordinate systems
         coordinate_systems_2d = scanimage.create_coordinate_systems_from_scanimage_meta(
@@ -1009,6 +1104,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
         if debug:
             pixel_indices = pixel_indices[::128]
+            _logger.debug("debug run: downsampled pixel grid to %d points", len(pixel_indices))
 
         for fov_uuid in fov_map.values():
             fovs_coordinates[fov_uuid] = {}
@@ -1023,12 +1119,16 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         # the brain surface points are what depth below the surface is measured against, so
         # they resolve the depth and the tilt around it in one go
         if tilt_correct:
+            _logger.info("Applying tilt correction from brain surface points")
             brain_surface_points = self.data_loader.brain_surface_points.load(prefer="metadata")
             # this normal is expressed in the coordinate system of the reference stack
             p_surface, n_surface, dv_avg = projections.get_brain_surface_normal(
                 brain_surface_points,
                 ref_img_meta,
                 coordinate_systems_ref,
+            )
+            _logger.debug(
+                "brain surface: %d point(s), average depth %.2f", len(brain_surface_points), dv_avg
             )
 
             # extract depths from scanimage metadata
@@ -1055,6 +1155,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             )
 
         if lateral_correct:
+            _logger.info("Applying lateral correction by registering reference stacks")
             # get the transform for session to session correction
             ref_transform = self.register_reference_stacks(
                 self.data_loader.reference_stack.path(),
@@ -1062,10 +1163,16 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             )
 
         if use_histology:
+            _logger.info(
+                "Looking up atlas coordinates via reference session histology (sigma=%s)",
+                self.interpolation_sigma,
+            )
             ref_img_histo_mlapdv, _ = self.load_histology_mlapdv()
             histo_interp_fn = self.interpolate_histology(
                 ref_img_histo_mlapdv, sigma=self.interpolation_sigma
             )
+        else:
+            _logger.info("Projecting onto atlas surface along the brain normal (no histology)")
 
         # this is the atlas to project onto
         atlas = ProjectionAtlas(res_um=self.projection_atlas_resolution)
@@ -1141,6 +1248,11 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                     atlas=atlas,
                     coords_depths=fovs_coordinates[uuid]["dv_below_surface_corrected"],
                 )
+            _logger.debug("FOV %s: atlas coordinates resolved", uuid)
+
+        _logger.info(
+            "Finished aligning %d FOV(s) for %s", len(fovs_coordinates), self.session_path
+        )
         return fovs_coordinates
 
     #
