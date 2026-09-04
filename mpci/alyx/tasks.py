@@ -2,12 +2,15 @@ import logging
 import importlib.metadata
 from itertools import chain
 
+import one.alf.io as alfio
+
 from ibllib.pipes.base_tasks import DynamicTask, RegisterRawDataTask
 from ibllib.oneibl.data_handlers import update_collections
 from ibllib.io.raw_daq_loaders import load_timeline_sync_and_chmap
 from ibllib.oneibl.data_handlers import ExpectedDataset, dataset_from_name
 
 import mpci
+from mpci.scanimage.io import patch_imaging_meta
 
 _logger = logging.getLogger(__name__)
 
@@ -43,6 +46,29 @@ class MesoscopeTask(DynamicTask):
             update_collections(x, raw_imaging_folders, self.device_collection, exact_match=True) for x in self.input_files]
         self.output_files = [
             update_collections(x, raw_imaging_folders, self.device_collection, exact_match=True) for x in self.output_files]
+
+    def load_meta_files(self):
+        """Load the extracted imaging metadata files.
+
+        Loads and consolidates the imaging data metadata from rawImagingData.meta.json files.
+        These files contain ScanImage metadata extracted from the raw tiff headers by the
+        function `mesoscopeMetadataExtraction.m` in iblscripts/deploy/mesoscope.
+
+        Returns
+        -------
+        dict
+            Single, consolidated dictionary containing metadata.
+        list of dict
+            The meta data for each individual imaging bout.
+        """
+        # Load metadata and make sure all metadata is consistent across FOVs
+        meta_files = sorted(self.session_path.glob(f'{self.device_collection}/*rawImagingData.meta.*'))
+        collections = sorted(set(f.parts[-2] for f in meta_files))
+        # Check there is exactly 1 meta file per collection
+        assert len(meta_files) == len(list(self.session_path.glob(self.device_collection))) == len(collections)
+        raw_meta = map(alfio.load_file_content, meta_files)
+        all_meta = list(map(patch_imaging_meta, raw_meta))
+        return self._consolidate_metadata(all_meta) if len(all_meta) > 1 else all_meta[0], all_meta
 
     def load_sync(self):
         """

@@ -310,13 +310,40 @@ class ScanImageTiffSeriesLoader(LazyFrameLoader):
         return stacked[perm]
 
 
+def get_frame_loader(folders: list[Path], fov: int, meta=None, memmap: bool = True) -> ScanImageTiffSeriesLoader:
+    """
+    Return a :class:`ScanImageTiffSeriesLoader` for the given field of view.
+
+    This is a convenience function that wraps the class constructor.
+
+    Parameters
+    ----------
+    folders:
+        List of directories containing raw imaging data.
+    fov:
+        Field of view index.
+    meta:
+        Metadata file path.
+    memmap:
+        Whether to use memory mapping.
+
+    Returns
+    -------
+    ScanImageTiffSeriesLoader
+        A loader for the specified field of view.
+    """
+    fps = collect_tiff_paths(folders)
+    lines = read_fov_line_indices(meta, fov)
+    return ScanImageTiffSeriesLoader(fps, lines, memmap=memmap)
+
+
 if __name__ == '__main__':
     import numpy as np
     import time
 
     session_path = Path('/mnt/whiterussian/Subjects/SP072/2025-10-01/001')
     folders = sorted(session_path.glob('raw_imaging_data_??'))
-    
+
     META = folders[0] / '_ibl_rawImagingData.meta.json'
 
     print('Collecting tiff paths...')

@@ -11,13 +11,11 @@ import numpy as np
 import pandas as pd
 import sparse
 from scipy.io import loadmat
-import one.alf.io as alfio
 from one.alf.path import session_path_parts
 from iblutil.util import flatten, ensure_list
 from ibllib.oneibl.data_handlers import ExpectedDataset, dataset_from_name
 
 from mpci.alyx.tasks import MesoscopeTask
-from mpci.scanimage.io import patch_imaging_meta
 
 _logger = logging.getLogger(__name__)
 
@@ -92,26 +90,27 @@ class MesoscopePreprocess(MesoscopeTask):
     def signature(self):
         # The number of in and outputs will be dependent on the number of input raw imaging folders and output FOVs
         I = ExpectedDataset.input  # noqa
+        alf_collection = 'alf/FOV_??/suite2p'
         signature = {
             'input_files': [I('_ibl_rawImagingData.meta.json', self.device_collection, True, unique=False),
                             I('*.tif', self.device_collection, True, unique=False) |
                             I('imaging.frames.tar.bz2', self.device_collection, True, unique=False),
                             ('exptQC.mat', self.device_collection, False)],
-            'output_files': [('mpci.ROIActivityF.npy', 'alf/FOV*', True),
-                             ('mpci.ROINeuropilActivityF.npy', 'alf/FOV*', True),
-                             ('mpci.ROIActivityDeconvolved.npy', 'alf/FOV*', True),
-                             ('mpci.badFrames.npy', 'alf/FOV*', True),
-                             ('mpci.mpciFrameQC.npy', 'alf/FOV*', True),
-                             ('mpciFrameQC.names.tsv', 'alf/FOV*', True),
-                             ('mpciMeanImage.images.npy', 'alf/FOV*', True),
-                             ('mpciROIs.stackPos.npy', 'alf/FOV*', True),
-                             ('mpciROIs.mpciROITypes.npy', 'alf/FOV*', True),
-                             ('mpciROIs.cellClassifier.npy', 'alf/FOV*', True),
-                             ('mpciROIs.uuids.csv', 'alf/FOV*', True),
-                             ('mpciROITypes.names.tsv', 'alf/FOV*', True),
-                             ('mpciROIs.masks.sparse_npz', 'alf/FOV*', True),
-                             ('mpciROIs.neuropilMasks.sparse_npz', 'alf/FOV*', True),
-                             ('_suite2p_ROIData.raw.zip', 'alf/FOV*', False),
+            'output_files': [('mpci.ROIActivityF.npy', alf_collection, True),
+                             ('mpci.ROINeuropilActivityF.npy', alf_collection, True),
+                             ('mpci.ROIActivityDeconvolved.npy', alf_collection, True),
+                             ('mpci.badFrames.npy', alf_collection, True),
+                             ('mpci.mpciFrameQC.npy', alf_collection, True),
+                             ('mpciFrameQC.names.tsv', alf_collection, True),
+                             ('mpciMeanImage.images.npy', alf_collection, True),
+                             ('mpciROIs.stackPos.npy', alf_collection, True),
+                             ('mpciROIs.mpciROITypes.npy', alf_collection, True),
+                             ('mpciROIs.cellClassifier.npy', alf_collection, True),
+                             ('mpciROIs.uuids.csv', alf_collection, True),
+                             ('mpciROITypes.names.tsv', alf_collection, True),
+                             ('mpciROIs.masks.sparse_npz', alf_collection, True),
+                             ('mpciROIs.neuropilMasks.sparse_npz', alf_collection, True),
+                             ('_suite2p_ROIData.raw.zip', alf_collection, False),
                              ('imaging.frames_motionRegistered.bin', 'suite2p/plane*', False)]
         }
         if not self.overwrite:  # If not forcing re-registration, check whether bin files already exist on disk
@@ -240,29 +239,6 @@ class MesoscopePreprocess(MesoscopeTask):
         # Collect all files in those directories
         datasets = self.session_path.joinpath('alf').rglob('FOV_??/*.*.*')
         return sorted(x for x in datasets if x.name in fov_dsets)
-
-    def load_meta_files(self):
-        """Load the extracted imaging metadata files.
-
-        Loads and consolidates the imaging data metadata from rawImagingData.meta.json files.
-        These files contain ScanImage metadata extracted from the raw tiff headers by the
-        function `mesoscopeMetadataExtraction.m` in iblscripts/deploy/mesoscope.
-
-        Returns
-        -------
-        dict
-            Single, consolidated dictionary containing metadata.
-        list of dict
-            The meta data for each individual imaging bout.
-        """
-        # Load metadata and make sure all metadata is consistent across FOVs
-        meta_files = sorted(self.session_path.glob(f'{self.device_collection}/*rawImagingData.meta.*'))
-        collections = sorted(set(f.parts[-2] for f in meta_files))
-        # Check there is exactly 1 meta file per collection
-        assert len(meta_files) == len(list(self.session_path.glob(self.device_collection))) == len(collections)
-        raw_meta = map(alfio.load_file_content, meta_files)
-        all_meta = list(map(patch_imaging_meta, raw_meta))
-        return self._consolidate_metadata(all_meta) if len(all_meta) > 1 else all_meta[0], all_meta
 
     @staticmethod
     def _consolidate_metadata(meta_data_all: list) -> dict:
