@@ -583,7 +583,10 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
         filepath_backup = filepath_backup.with_suffix(f".{timestamp}{filepath_backup.suffix}")
         filepath_backup.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy(filepath, filepath_backup)
+        if filepath_backup.exists():
+            # paranoia safe (it should never exist)
+            raise FileExistsError(f"trying to backup to {filepath_backup} but it already exists")
+        shutil.copy2(filepath, filepath_backup)
         _logger.info("backed up %s to %s", filepath, filepath_backup)
         return filepath_backup
 
