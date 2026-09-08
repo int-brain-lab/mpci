@@ -699,6 +699,106 @@ class TestProcessing(AlignmentTestCase):
             expected = fov_path / "mpciMeanImage.brainLocationIds_ccf_2017.npy"
             self.assertTrue(expected.exists())
 
+    def metadata_on_disk(self) -> dict:
+        """Read back the raw imaging metadata of the session's first imaging bout.
+
+        Returns
+        -------
+        dict
+            Contents of the `_ibl_rawImagingData.meta.json` the task writes to.
+        """
+        path = self.session_path / "raw_imaging_data_00" / "_ibl_rawImagingData.meta.json"
+        return json.loads(path.read_text())
+
+    def run_for_metadata(self, use_histology: bool, **kwargs) -> None:
+        """Run the task far enough to have it update and write the metadata.
+
+        Only the alignment itself is stubbed out, so that what reaches the metadata is what
+        `_run` really put there.
+
+        Parameters
+        ----------
+        use_histology : bool
+            Whether the run resolves the histology, which decides its provenance.
+        **kwargs : dict
+            Keyword arguments overriding the defaults passed to `MesoscopeFOVAlignment`.
+        """
+        task = self.make_task(**{"write_outputs": True, "register_data": False} | kwargs)
+        n_pixels = N_PX_PER_FOV**2
+        # pixel i gets coordinates (i, i, i), so every corner below is its own flat index
+        fovs_coordinates = {
+            fov_uuid: {"mlapdv": np.tile(np.arange(n_pixels)[:, None], (1, 3)).astype(float)}
+            for fov_uuid in FOV_UUIDS
+        }
+        self.atlas.get_labels.return_value = np.ones((N_PX_PER_FOV, N_PX_PER_FOV), dtype=int)
+        corrections = {
+            "use_histology": use_histology,
+            "lateral_correct": True,
+            "tilt_correct": True,
+        }
+        with (
+            mock.patch.object(task, "infer_possible_corrections", return_value=corrections),
+            mock.patch.object(
+                task, "load_histology_mlapdv", return_value=(histology_mlapdv(), None)
+            ),
+            mock.patch.object(task, "align_FOVs", return_value=fovs_coordinates),
+        ):
+            task._run()
+
+    def test_run_writes_the_updated_metadata(self):
+        """Test that the FOV locations the run adds to the metadata reach the file on disk.
+
+        The metadata is modified in place and written back, so what makes this worth testing
+        is not the mutation but that the file is written after it rather than before.
+        """
+        # the fixture is the untouched acquisition metadata, so anything found below is ours
+        self.assertFalse(any("MLAPDV" in fov for fov in self.metadata_on_disk()["FOV"]))
+
+        self.run_for_metadata(use_histology=False)
+
+        written = self.metadata_on_disk()
+        self.assertEqual(N_FOV, len(written["FOV"]))
+        for fov in written["FOV"]:
+            self.assertEqual(["estimate"], list(fov["MLAPDV"]))
+            self.assertEqual(["estimate"], list(fov["brainLocationIds"]))
+            # pixel i was given the coordinates (i, i, i), so each corner is its flat index
+            last = N_PX_PER_FOV - 1
+            center = round(N_PX_PER_FOV / 2) - 1
+            self.assertEqual(
+                {
+                    "topLeft": [0.0] * 3,
+                    "topRight": [float(last)] * 3,
+                    "bottomLeft": [float(last * N_PX_PER_FOV)] * 3,
+                    "bottomRight": [float(last * N_PX_PER_FOV + last)] * 3,
+                    "center": [float(center * N_PX_PER_FOV + center)] * 3,
+                },
+                fov["MLAPDV"]["estimate"],
+            )
+            # the labels are all ones, so every corner reads back the same brain location
+            self.assertEqual({1}, set(fov["brainLocationIds"]["estimate"].values()))
+
+    def test_run_writes_the_metadata_of_either_provenance(self):
+        """Test that a HISTOLOGY run writes its locations, and the craniotomy center with them.
+
+        An ESTIMATE run used to be the one that never wrote, so both are covered here.
+        """
+        self.run_for_metadata(use_histology=True)
+
+        written = self.metadata_on_disk()
+        for fov in written["FOV"]:
+            self.assertEqual(["histology"], list(fov["MLAPDV"]))
+            self.assertEqual(["histology"], list(fov["brainLocationIds"]))
+        # a HISTOLOGY run also resolves the craniotomy center into the same file
+        self.assertIn("ML_resolved", written["centerMM"])
+
+    def test_run_leaves_the_metadata_alone_without_write_outputs(self):
+        """Test that nothing is written to the metadata file when `write_outputs` is off."""
+        before = self.metadata_on_disk()
+
+        self.run_for_metadata(use_histology=False, write_outputs=False)
+
+        self.assertEqual(before, self.metadata_on_disk())
+
 
 class TestAlyx(AlignmentTestCase):
     """Tests for the methods writing to Alyx."""

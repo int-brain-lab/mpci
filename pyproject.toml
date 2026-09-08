@@ -9,7 +9,7 @@ description = "Multi-Photon Calcium Imaging"
 authors = [
     {name = "IBL Staff"},
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = {text = "MIT"}
 dependencies = [
     "plane2brain @ git+https://github.com/int-brain-lab/plane2brain.git",
@@ -36,7 +36,7 @@ suite2p = [
 masknmf = [
     "mpci[suite2p]",  # suite2p is currently a requirement due to class inheritance
     "masknmf @ git+https://github.com/apasarkar/masknmf-toolbox.git@xarray-compatability",
-    "fastplotlib @ git+https://github.com/fastplotlib/fastplotlib.git@ndwidget-proper-async"
+    "fastplotlib @ git+https://github.com/fastplotlib/fastplotlib.git@ndwidget"
 ]
 
 [project.urls]

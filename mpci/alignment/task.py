@@ -624,66 +624,6 @@ class MesoscopeFOVAlignment(MesoscopeTask):
     # ##     ##  #######  ##    ##
     #
 
-    def infer_possible_corrections(self) -> dict[str, bool]:
-        """Work out which of the alignment's corrections this session's data supports.
-
-        Each correction needs its own inputs, and an input that cannot be read, or that reads
-        back unusable, rules its correction out. What comes back is exactly what `align_FOVs`
-        takes, so that it can assume its inputs are there rather than checking again.
-
-        Returns
-        -------
-        dict of str to bool
-            Whether `align_FOVs` can run with `use_histology`, `lateral_correct` and
-            `tilt_correct`.
-        """
-        _logger.info("Inferring possible corrections for %s", self.session_path)
-        corrections = {"use_histology": False, "lateral_correct": False, "tilt_correct": False}
-
-        # the tilt is corrected against the brain surface, so its points are all it takes
-        corrections["tilt_correct"] = self.data_loader.brain_surface_points.usable()
-        _logger.debug("tilt correction usable: %s", corrections["tilt_correct"])
-
-        if self.reference_data_loader is None:
-            _logger.warning(
-                "no reference session given: neither histology nor lateral correction is possible"
-            )
-            return corrections
-
-        # the loaders only report on local files, so the transfers are attempted first
-        for ensure_local in (
-            self.ensure_local_reference_session_reference_stack,
-            self.ensure_local_reference_session_histology,
-        ):
-            try:
-                ensure_local()
-            except MISSING_DATA_ERRORS as e:
-                _logger.warning("%s: %s: %s", ensure_local.__name__, type(e).__name__, e)
-
-        corrections["use_histology"] = self.reference_data_loader.histology.usable()
-        _logger.debug("reference session histology usable: %s", corrections["use_histology"])
-
-        # both stacks are registered onto one another, so they have to be usable and agree in
-        # shape; the shapes are read off the tif headers rather than by loading the pixels
-        session_stack = self.data_loader.reference_stack
-        reference_stack = self.reference_data_loader.reference_stack
-        if session_stack.usable() and reference_stack.usable():
-            shapes = (session_stack.shape(), reference_stack.shape())
-            corrections["lateral_correct"] = shapes[0] == shapes[1]
-            _logger.debug("reference stack shapes: this session %s, reference session %s", *shapes)
-            if not corrections["lateral_correct"]:
-                _logger.warning(
-                    "no lateral correction: this session's reference stack is %s, the "
-                    "reference session's is %s",
-                    *shapes,
-                )
-
-        for correction, possible in corrections.items():
-            if not possible:
-                _logger.info("%s is not possible for %s", correction, self.session_path)
-        _logger.info("Corrections resolved for %s: %s", self.session_path, corrections)
-        return corrections
-
     def _run(self) -> list[Path]:
         """Align this session's FOVs to the atlas and write the mean-image datasets.
 
@@ -724,18 +664,9 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             if self.register_data:
                 self.update_craniotomy_center(ref_image_meta, ref_session_ref_image_mlapdv)
 
-            # update the individual meta files
+            # update the individual meta files; the write happens once, further below, after
+            # the FOV locations have been added too
             meta["centerMM"] = ref_image_meta["centerMM"]
-
-            # write the file - only writing to the first, but later also reading only from
-            # the first
-            if self.write_outputs:
-                filepath = meta_files[0]
-                if filepath.exists() and self.backup:
-                    self.backup_file(filepath)
-                _logger.debug("writing updated centerMM to %s", filepath)
-                with open(filepath, "w") as fp:
-                    json.dump(meta, fp)
 
             # Add reference meta data to meta_files list for registration
             meta_files.append(self.data_loader.reference_stack_metadata.path())
@@ -750,9 +681,6 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         raw_imaging_meta = self.data_loader.raw_imaging_metadata.load()
         self.data_loader.raw_imaging_metadata.validate(raw_imaging_meta)
         fov_map = self.get_fov_map(raw_imaging_meta)
-
-        # the atlas for the lookup
-        atlas = self.histology_atlas
 
         # store the outputs
         _logger.info(
@@ -786,37 +714,25 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                 self.fovs_coordinates[fov_uuid]["mlapdv"], (n_px_per_row, n_px_per_row, 3)
             )
             mean_images_mlapdv[fov_uuid] = mean_image_mlapdv
-            mean_images_ids[fov_uuid] = atlas.get_labels(mean_image_mlapdv / 1e6, mode="clip")
-            _logger.debug("%s (%s): mean image computed", fov_name, fov_uuid)
+            mean_images_ids[fov_uuid] = self.histology_atlas.get_labels(
+                mean_image_mlapdv / 1e6, mode="clip"
+            )
 
-        for fov_name, fov_uuid in fov_map.items():
-            (fov,) = [fov for fov in meta["FOV"] if fov["roiUUID"] == fov_uuid]
-            if "MLAPDV" not in fov:
-                fov["MLAPDV"] = {}
-                fov["brainLocationIds"] = {}
-            fov["MLAPDV"][self.provenance.name.lower()] = {
-                "topLeft": mean_images_mlapdv[fov_uuid][0, 0, :].tolist(),
-                "topRight": mean_images_mlapdv[fov_uuid][0, -1, :].tolist(),
-                "bottomLeft": mean_images_mlapdv[fov_uuid][-1, 0, :].tolist(),
-                "bottomRight": mean_images_mlapdv[fov_uuid][-1, -1, :].tolist(),
-                "center": mean_images_mlapdv[fov_uuid][
-                    round(mean_images_mlapdv[fov_uuid].shape[0] / 2) - 1,
-                    round(mean_images_mlapdv[fov_uuid].shape[1] / 2) - 1,
-                    :,
-                ].tolist(),
-            }
-            fov["brainLocationIds"][self.provenance.name.lower()] = {
-                "topLeft": int(mean_images_ids[fov_uuid][0, 0]),
-                "topRight": int(mean_images_ids[fov_uuid][0, -1]),
-                "bottomLeft": int(mean_images_ids[fov_uuid][-1, 0]),
-                "bottomRight": int(mean_images_ids[fov_uuid][-1, -1]),
-                "center": int(
-                    mean_images_ids[fov_uuid][
-                        round(mean_images_ids[fov_uuid].shape[0] / 2) - 1,
-                        round(mean_images_ids[fov_uuid].shape[1] / 2),
-                    ]
-                ),
-            }
+        # the FOV locations are added to the metadata in place, and written back below; this is
+        # also what `register_fovs` reads the FOV corners off
+        self.update_metadata_locations(meta, mean_images_mlapdv, mean_images_ids)
+
+        # write the metadata back, now carrying both the FOV locations and, on a HISTOLOGY run,
+        # the resolved craniotomy center - only the first file is written, as only the first is
+        # read back
+        if self.write_outputs:
+            if meta_files[0].exists() and self.backup:
+                self.backup_file(meta_files[0])
+            _logger.info("writing updated metadata to %s", meta_files[0])
+            with open(meta_files[0], "w") as fp:
+                json.dump(meta, fp)
+        else:
+            _logger.info("would have written updated metadata to %s", meta_files[0])
 
         # Save the mean image datasets
         provenance_suffix = (
@@ -868,13 +784,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         else:
             _logger.debug("register_data is False, skipping FOV registration")
 
-        outputs = sorted([*meta_files, *mean_image_files])
-        _logger.info(
-            "Finished FOV alignment run for %s: %d output file(s)",
-            self.session_path,
-            len(outputs),
-        )
-        return outputs
+        _logger.info("Finished FOV alignment run for %s", self.session_path)
+        return sorted([*meta_files, *mean_image_files])
 
     #
     # ########  ########   #######   ######  ########  ######   ######  #### ##    ##  ######
@@ -1110,6 +1021,66 @@ class MesoscopeFOVAlignment(MesoscopeTask):
     # ##         ##  ##        ##       ##        ##  ##   ### ##
     # ##        #### ##        ######## ######## #### ##    ## ########
     #
+
+    def infer_possible_corrections(self) -> dict[str, bool]:
+        """Work out which of the alignment's corrections this session's data supports.
+
+        Each correction needs its own inputs, and an input that cannot be read, or that reads
+        back unusable, rules its correction out. What comes back is exactly what `align_FOVs`
+        takes, so that it can assume its inputs are there rather than checking again.
+
+        Returns
+        -------
+        dict of str to bool
+            Whether `align_FOVs` can run with `use_histology`, `lateral_correct` and
+            `tilt_correct`.
+        """
+        _logger.info("Inferring possible corrections for %s", self.session_path)
+        corrections = {"use_histology": False, "lateral_correct": False, "tilt_correct": False}
+
+        # the tilt is corrected against the brain surface, so its points are all it takes
+        corrections["tilt_correct"] = self.data_loader.brain_surface_points.usable()
+        _logger.debug("tilt correction usable: %s", corrections["tilt_correct"])
+
+        if self.reference_data_loader is None:
+            _logger.warning(
+                "no reference session given: neither histology nor lateral correction is possible"
+            )
+            return corrections
+
+        # the loaders only report on local files, so the transfers are attempted first
+        for ensure_local in (
+            self.ensure_local_reference_session_reference_stack,
+            self.ensure_local_reference_session_histology,
+        ):
+            try:
+                ensure_local()
+            except MISSING_DATA_ERRORS as e:
+                _logger.warning("%s: %s: %s", ensure_local.__name__, type(e).__name__, e)
+
+        corrections["use_histology"] = self.reference_data_loader.histology.usable()
+        _logger.debug("reference session histology usable: %s", corrections["use_histology"])
+
+        # both stacks are registered onto one another, so they have to be usable and agree in
+        # shape; the shapes are read off the tif headers rather than by loading the pixels
+        session_stack = self.data_loader.reference_stack
+        reference_stack = self.reference_data_loader.reference_stack
+        if session_stack.usable() and reference_stack.usable():
+            shapes = (session_stack.shape(), reference_stack.shape())
+            corrections["lateral_correct"] = shapes[0] == shapes[1]
+            _logger.debug("reference stack shapes: this session %s, reference session %s", *shapes)
+            if not corrections["lateral_correct"]:
+                _logger.warning(
+                    "no lateral correction: this session's reference stack is %s, the "
+                    "reference session's is %s",
+                    *shapes,
+                )
+
+        for correction, possible in corrections.items():
+            if not possible:
+                _logger.info("%s is not possible for %s", correction, self.session_path)
+        _logger.info("Corrections resolved for %s: %s", self.session_path, corrections)
+        return corrections
 
     def align_FOVs(
         self,
@@ -1517,6 +1488,70 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             after the order in which the FOVs appear in the metadata.
         """
         return {f"FOV_{i:02}": fov["roiUUID"] for i, fov in enumerate(raw_imaging_meta["FOV"])}
+
+    def update_metadata_locations(
+        self,
+        meta: dict,
+        mean_images_mlapdv: dict[str, np.ndarray],
+        mean_images_ids: dict[str, np.ndarray],
+    ) -> None:
+        """Add this run's FOV corner and center locations to the raw imaging metadata.
+
+        Modifies `meta` in place, adding to each of its FOVs the MLAPDV coordinates and the
+        Allen atlas brain location IDs of that FOV's four corners and its center. Both are
+        filed under the current provenance, so that a HISTOLOGY and an ESTIMATE run can put
+        their locations side by side in one file rather than overwriting one another.
+
+        This is what `register_fovs` reads the FOV corners off, and what the caller writes back
+        to `_ibl_rawImagingData.meta.json`.
+
+        Parameters
+        ----------
+        meta : dict
+            Contents of `_ibl_rawImagingData.meta.json`. Modified in place; nothing is
+            returned, as the caller already holds the dict that is updated.
+        mean_images_mlapdv : dict of str to numpy.ndarray
+            Per FOV UUID, the (ml, ap, dv) coordinates in μm of every pixel of that FOV's mean
+            image, with shape (h, w, 3).
+        mean_images_ids : dict of str to numpy.ndarray
+            Per FOV UUID, the Allen atlas brain location ID of every pixel of that FOV's mean
+            image, with shape (h, w).
+
+        Raises
+        ------
+        ValueError
+            If a FOV UUID is not found in the metadata, or is found more than once.
+        """
+        provenance = self.provenance.name.lower()
+        for fov_uuid, mlapdv in mean_images_mlapdv.items():
+            ids = mean_images_ids[fov_uuid]
+            (fov,) = [fov for fov in meta["FOV"] if fov["roiUUID"] == fov_uuid]
+
+            # the locations go under the current provenance, so their dict has to exist first.
+            # `setdefault` keeps a rerun additive: assigning `{}` would drop the other
+            # provenance's entries, which come back from disk with the metadata every run.
+            fov.setdefault("MLAPDV", {})
+            fov.setdefault("brainLocationIds", {})
+
+            # NB: indexed as two scalars rather than by an unpacked tuple, as the latter is
+            # syntax this project's minimum python, 3.10, does not have
+            center_row = round(mlapdv.shape[0] / 2) - 1
+            center_column = round(mlapdv.shape[1] / 2) - 1
+            fov["MLAPDV"][provenance] = {
+                "topLeft": mlapdv[0, 0, :].tolist(),
+                "topRight": mlapdv[0, -1, :].tolist(),
+                "bottomLeft": mlapdv[-1, 0, :].tolist(),
+                "bottomRight": mlapdv[-1, -1, :].tolist(),
+                "center": mlapdv[center_row, center_column, :].tolist(),
+            }
+            fov["brainLocationIds"][provenance] = {
+                "topLeft": int(ids[0, 0]),
+                "topRight": int(ids[0, -1]),
+                "bottomLeft": int(ids[-1, 0]),
+                "bottomRight": int(ids[-1, -1]),
+                "center": int(ids[center_row, center_column]),
+            }
+            _logger.debug("%s: %s locations added to the metadata", fov_uuid, provenance)
 
     def delete_registered_fovs(self):
         """Delete this session's FOVs of the current provenance from Alyx.
