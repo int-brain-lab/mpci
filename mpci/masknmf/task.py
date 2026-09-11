@@ -6,13 +6,16 @@ the second runs masknmf on the extracted files.
 import os
 from typing import *
 import logging
+import subprocess
 from pathlib import Path
 
 import masknmf
 import numpy as np
-from ibllib.oneibl.data_handlers import ExpectedDataset
+from iblutil.util import flatten, ensure_list
+from ibllib.oneibl.data_handlers import ExpectedDataset, dataset_from_name
 from mpci.suite2p.task import MesoscopePreprocess
 from mpci.alyx.tasks import MesoscopeTask
+from mpci.masknmf.io import get_frame_loader
 import sparse
 
 logger = logging.getLogger('ibllib.' + __name__)
@@ -118,34 +121,74 @@ class MasknmfPreprocess(MesoscopeTask):
         2. Compress + Denoise these .bin files
         3. Run signal detection on these bin files"""
 
-    def __init__(self, session_path, device_collection=None, **kwargs):
-        if device_collection is None:
-            device_collection = 'suite2p/plane*'
-        super().__init__(session_path, device_collection=device_collection, **kwargs)
+    def __init__(self, *args, **kwargs):
+        self._teardown_files = []
+        super().__init__(*args, **kwargs)
 
     @property
     def signature(self):
         signature = {}
         I, O = ExpectedDataset.input, ExpectedDataset.output
-        try:
-            n = int(self.device_collection.split("plane")[-1])
-            alf_collection = f'alf/FOV_{n:02d}'
-        except ValueError:
-            alf_collection = 'alf/FOV_??'
+        alf_collection = 'alf/FOV_??/masknmf'
         signature['input_files'] = [
-            I('imaging.frames_motionRegistered.bin', self.device_collection, True, unique=False),
-            I('ops.npy', self.device_collection, False, unique=False), #| I('_suite2p_ROIData.raw.zip', alf_collection, True),
-            I('mpci.times.npy', alf_collection, True, unique=False),]
-        # TODO Move these to alf/FOV_XX/masknmf when stable
+            I('_ibl_rawImagingData.meta.json', self.device_collection, True, unique=False),
+            I('*.tif', self.device_collection, True, unique=False) | I('imaging.frames.tar.bz2', self.device_collection, True, unique=False),
+            I('mpci.times.npy', 'alf/FOV_??', True, unique=False),]
         signature['output_files'] = [
-            O('demixing.hdf5', f'{self.device_collection}/masknmf_output', True, unique=False),
-            O('mpciROIs.masks.sparse_npz', f'{self.device_collection}/masknmf_output', True, unique=False),
-            O('mpciROIs.stackPos.npy', f'{self.device_collection}/masknmf_output', True, unique=False),
-            O('mpci.ROIActivityF.npy', f'{self.device_collection}/masknmf_output', True, unique=False),
-            O('mpci.ROIActivityDeconvolved.npy', f'{self.device_collection}/masknmf_output', True, unique=False),
+            O('demixing.hdf5', alf_collection, True, unique=False),
+            O('mpciROIs.masks.sparse_npz', alf_collection, True, unique=False),
+            O('mpciROIs.stackPos.npy', alf_collection, True, unique=False),
+            O('mpci.ROIActivityF.npy', alf_collection, True, unique=False),
+            O('mpci.ROIActivityDeconvolved.npy', alf_collection, True, unique=False),
             ]
         return signature
-    
+
+    def setUp(self, **kwargs):
+        """Set up task.
+
+        This will check the local filesystem for the raw tif files and if not present, will assume
+        they have been compressed and deleted, in which case the signature will be replaced with
+        the compressed input.
+
+        Note: this will not work correctly if only some collections have compressed tifs.
+        """
+        all_files_present = super().setUp(**kwargs)  # Ensure files present
+        tif_sig = dataset_from_name('*.tif', self.input_files)
+        if not tif_sig:
+            return all_files_present  # No tifs in the signature; just return
+        tif_sig = tif_sig[0]
+        tifs_present, *_ = tif_sig.find_files(self.session_path)
+        if tifs_present or not all_files_present:
+            return all_files_present  # Tifs present on disk; no need to decompress
+        # Decompress imaging files
+        tif_sigs = dataset_from_name('imaging.frames.tar.bz2', self.input_files)
+        present, files, _ = zip(*(x.find_files(self.session_path) for x in tif_sigs))
+        if not all(present):
+            return False  # Compressed files missing; return
+        files = flatten(files)
+        logger.info('Decompressing %i file(s)', len(files))
+        for file in files:
+            cmd = 'tar -xvjf "{input}"'.format(input=file.name)
+            logger.debug(cmd)
+            process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=file.parent)
+            stdout, _ = process.communicate()  # b'x 2023-02-17_2_test_2P_00001_00001.tif\n'
+            logger.debug(stdout.decode())
+            tifs = [file.parent.joinpath(x.split()[-1]) for x in stdout.decode().splitlines() if x.endswith('.tif')]
+            assert process.returncode == 0 and len(tifs) > 0
+            assert all(map(Path.exists, tifs))
+            self._teardown_files.extend(tifs)
+        return all_files_present
+
+    def tearDown(self):
+        """Tear down task.
+
+        This removes any decompressed tif files.
+        """
+        for file in self._teardown_files:
+            logger.debug('Removing %s', file)
+            file.unlink()
+        return super().tearDown()
+
     def deconv_all_traces(self, trace_matrix):
         """
         Runs OASIS deconvolution on calcium imaging traces
@@ -196,21 +239,23 @@ class MasknmfPreprocess(MesoscopeTask):
         spatial_footprints = spatial_footprints.asformat('gcxs')
         return fluorescence_traces.astype(np.float32), deconv_traces.astype(np.float32), spatial_footprints
 
-    def _run(self, roidetect=False, rename_files=True, **kwargs):
+    def _run(self, load_into_ram=True, FOVs=None, **kwargs):
 
         out = []
-        _, bin_files, _ = self.input_files[0].find_files(self.session_path)
-        
-        for bin_file in bin_files:            
-            metadata_file = bin_file.with_name('ops.npy')
-            moco_data = MotionBinDataset(bin_file, metadata_file)
-            (out_path := bin_file.parent.joinpath('masknmf_output')).mkdir(exist_ok=True)
+        # Load and consolidate the image metadata from JSON files
+        metadata, all_meta = self.load_meta_files()
+        device_collections = sorted(self.session_path.glob(self.device_collection))
+        FOVs = ensure_list(FOVs) if FOVs is not None else metadata['FOV']
+        for i, fov in enumerate(FOVs):
+            # metadata_file = bin_file.with_name('ops.npy')
+            # moco_data = MotionBinDataset(bin_file, metadata_file)
+            (out_path := self.session_path.joinpath(f'alf/FOV_{i:02d}/masknmf')).mkdir(exist_ok=True)
             out_demix_path = out_path / 'demixing.hdf5'
             out_roi_masks = out_path / 'mpciROIs.masks.sparse_npz'
             out_stack_pos = out_path / 'mpciROIs.stackPos.npy'
             out_fluorescence_traces = out_path / 'mpci.ROIActivityF.npy'
             out_deconvolved_traces = out_path / 'mpci.ROIActivityDeconvolved.npy'
-            
+
             # FIXME this is a hack
             out_motion_corrected = out_demix_path.with_stem('moco_rewrite_masknmf')
             if out_motion_corrected.exists():
@@ -224,25 +269,39 @@ class MasknmfPreprocess(MesoscopeTask):
                 logger.info(f'Removing existing demixing file at {out_demix_path}')
                 out_demix_path.unlink()
 
+            frames = get_frame_loader(device_collections, i, meta=metadata)
+            if load_into_ram:
+                frames = frames[:]  # Load all frames into RAM
+            nX, nY, _ = metadata['FOV'][i]['nXnYnZ']
+            NUM_BLOCKS = 50  # desired number of blocks in each dimension for motion correction
+            num_blocks_x = np.floor(nX / NUM_BLOCKS).astype(int)
+            num_blocks_y = np.floor(nY / NUM_BLOCKS).astype(int)
+            SUITE2P_OVERLAP = 0.05  # maximum rigid shift as a fraction of the frame size
+            max_rigid_shifts = (np.floor(nX * SUITE2P_OVERLAP).astype(int), np.floor(nY * SUITE2P_OVERLAP).astype(int))  # maximum allowed rigid shifts in pixels
+            motion_config = masknmf.PiecewiseRigidMotionCorrectionConfig(
+                num_blocks=(num_blocks_x, num_blocks_y),
+                overlaps=(5, 5),
+                max_rigid_shifts=max_rigid_shifts,  # around 25
+                max_deviation_rigid=(3, 3)
+            )
+
             pipeline = masknmf.TwoPhotonCalciumPipeline(
-                motion_correct_config="skip", 
+                motion_correct_config=motion_config,
                 compress_config=masknmf.CompressDenoiseConfig(block_sizes=(32, 32)),
-                frame_batch_size=300, 
-                load_into_ram = True,
+                frame_batch_size=300,
                 outpath_motion_correction=out_motion_corrected,  # This will eventually be removed,
                 outpath_compression=out_compressed,
                 outpath_demixing=out_demix_path)
             # Get the frame rate for the FOV
-            i = int(bin_file.parent.name.split('plane')[1])
             ts = np.load(self.session_path.joinpath(f'alf/FOV_{i:02d}/mpci.times.npy'))
             Fs = 1 / np.mean(np.diff(ts))
-            logger.info(f'Running masknmf on {bin_file} with frame rate {Fs:.2f} Hz')
-            demixing_results = pipeline.run(moco_data, 
-                                            Fs, 
+            logger.info(f'Running masknmf on FOV_{i:02d} with frame rate {Fs:.2f} Hz')
+            demixing_results = pipeline.run(frames,
+                                            Fs,
                                             exclude_border_radius=8,
-                                            remove_intermediates=True)
+                                            remove_intermediates=False)
 
-            logger.info(f'Saving results for FOV_{i:02}')
+            logger.info(f'Saving results for FOV_{i:02d}')
             F, Deconv_F, masks = self._format_to_mpci(demixing_results)
             np.save(out_fluorescence_traces, F)
             np.save(out_deconvolved_traces, Deconv_F)
