@@ -11,7 +11,7 @@ from pathlib import Path
 
 import masknmf
 import numpy as np
-from iblutil.util import flatten
+from iblutil.util import flatten, ensure_list
 from ibllib.oneibl.data_handlers import ExpectedDataset, dataset_from_name
 from mpci.suite2p.task import MesoscopePreprocess
 from mpci.alyx.tasks import MesoscopeTask
@@ -133,7 +133,7 @@ class MasknmfPreprocess(MesoscopeTask):
         signature['input_files'] = [
             I('_ibl_rawImagingData.meta.json', self.device_collection, True, unique=False),
             I('*.tif', self.device_collection, True, unique=False) | I('imaging.frames.tar.bz2', self.device_collection, True, unique=False),
-            I('mpci.times.npy', alf_collection, True, unique=False),]
+            I('mpci.times.npy', 'alf/FOV_??', True, unique=False),]
         signature['output_files'] = [
             O('demixing.hdf5', alf_collection, True, unique=False),
             O('mpciROIs.masks.sparse_npz', alf_collection, True, unique=False),
@@ -239,13 +239,14 @@ class MasknmfPreprocess(MesoscopeTask):
         spatial_footprints = spatial_footprints.asformat('gcxs')
         return fluorescence_traces.astype(np.float32), deconv_traces.astype(np.float32), spatial_footprints
 
-    def _run(self, roidetect=False, rename_files=True, load_into_ram=True, **kwargs):
+    def _run(self, load_into_ram=True, FOVs=None, **kwargs):
 
         out = []
         # Load and consolidate the image metadata from JSON files
         metadata, all_meta = self.load_meta_files()
         device_collections = sorted(self.session_path.glob(self.device_collection))
-        for i, fov in enumerate(metadata['FOV']):
+        FOVs = ensure_list(FOVs) if FOVs is not None else metadata['FOV']
+        for i, fov in enumerate(FOVs):
             # metadata_file = bin_file.with_name('ops.npy')
             # moco_data = MotionBinDataset(bin_file, metadata_file)
             (out_path := self.session_path.joinpath(f'alf/FOV_{i:02d}/masknmf')).mkdir(exist_ok=True)
@@ -268,7 +269,7 @@ class MasknmfPreprocess(MesoscopeTask):
                 logger.info(f'Removing existing demixing file at {out_demix_path}')
                 out_demix_path.unlink()
 
-            frames = get_frame_loader(device_collections=device_collections, fov=i, meta=metadata)
+            frames = get_frame_loader(device_collections, i, meta=metadata)
             if load_into_ram:
                 frames = frames[:]  # Load all frames into RAM
             nX, nY, _ = metadata['FOV'][i]['nXnYnZ']
@@ -277,7 +278,7 @@ class MasknmfPreprocess(MesoscopeTask):
             num_blocks_y = np.floor(nY / NUM_BLOCKS).astype(int)
             SUITE2P_OVERLAP = 0.05  # maximum rigid shift as a fraction of the frame size
             max_rigid_shifts = (np.floor(nX * SUITE2P_OVERLAP).astype(int), np.floor(nY * SUITE2P_OVERLAP).astype(int))  # maximum allowed rigid shifts in pixels
-            motion_config = masknmf.PiecewiseRigidRegistrationConfig(
+            motion_config = masknmf.PiecewiseRigidMotionCorrectionConfig(
                 num_blocks=(num_blocks_x, num_blocks_y),
                 overlaps=(5, 5),
                 max_rigid_shifts=max_rigid_shifts,  # around 25
