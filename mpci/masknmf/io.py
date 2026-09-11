@@ -36,7 +36,7 @@ from mpci.scanimage.io import patch_imaging_meta
 from masknmf.arrays.array_interfaces import LazyFrameLoader
 
 
-def read_fov_line_indices(meta_json_path: str, plane: int) -> list[int]:
+def read_fov_line_indices(meta_json, plane: int) -> list[int]:
     """
     Return 0-indexed row indices for *plane* from an IBL rawImagingData meta JSON.
 
@@ -45,8 +45,8 @@ def read_fov_line_indices(meta_json_path: str, plane: int) -> list[int]:
 
     Parameters
     ----------
-    meta_json_path:
-        Path to ``_ibl_rawImagingData.meta.json``.
+    meta_json:
+        Path to ``_ibl_rawImagingData.meta.json`` or the loaded JSON dict.
     plane:
         0-indexed plane number.
 
@@ -55,8 +55,11 @@ def read_fov_line_indices(meta_json_path: str, plane: int) -> list[int]:
     list[int]
         0-indexed row indices of this plane within each raw tiff frame.
     """
-    with open(meta_json_path) as f:
-        meta = patch_imaging_meta(json.load(f))
+    if isinstance(meta_json, dict):
+        meta = meta_json
+    else:
+        with open(meta_json) as f:
+            meta = patch_imaging_meta(json.load(f))
     fov_list = meta['FOV']
     if plane >= len(fov_list):
         raise ValueError(
@@ -323,7 +326,7 @@ def get_frame_loader(folders: list[Path], fov: int, meta=None, memmap: bool = Tr
     fov:
         Field of view index.
     meta:
-        Metadata file path.
+        Metadata file path or loaded meta dict.
     memmap:
         Whether to use memory mapping.
 
@@ -333,6 +336,8 @@ def get_frame_loader(folders: list[Path], fov: int, meta=None, memmap: bool = Tr
         A loader for the specified field of view.
     """
     fps = collect_tiff_paths(folders)
+    if meta is None:
+        meta = folders[0].joinpath('_ibl_rawImagingData.meta.json')
     lines = read_fov_line_indices(meta, fov)
     return ScanImageTiffSeriesLoader(fps, lines, memmap=memmap)
 
