@@ -3,6 +3,7 @@
 Two tasks are defined: the first ensures the motion corrected bin files are extracted,
 the second runs masknmf on the extracted files.
 """
+import gc
 import os
 from typing import *
 import logging
@@ -11,6 +12,7 @@ from pathlib import Path
 
 import masknmf
 import numpy as np
+import torch
 from iblutil.util import flatten, ensure_list
 from ibllib.oneibl.data_handlers import ExpectedDataset, dataset_from_name
 from mpci.suite2p.task import MesoscopePreprocess
@@ -140,6 +142,8 @@ class MasknmfPreprocess(MesoscopeTask):
             O('mpciROIs.stackPos.npy', alf_collection, True, unique=False),
             O('mpci.ROIActivityF.npy', alf_collection, True, unique=False),
             O('mpci.ROIActivityDeconvolved.npy', alf_collection, True, unique=False),
+            O('moco_shifts.hdf5', alf_collection, True, unique=False),
+            O('compressed.hdf5', alf_collection, True, unique=False)
             ]
         return signature
 
@@ -240,13 +244,24 @@ class MasknmfPreprocess(MesoscopeTask):
         return fluorescence_traces.astype(np.float32), deconv_traces.astype(np.float32), spatial_footprints
 
     def _run(self, load_into_ram=True, FOVs=None, **kwargs):
+        """
+        Run masknmf pipeline.
+
+        Parameters
+        ----------
+        load_into_ram: bool
+            If true, all frames are loaded into RAM when processing a given plane.
+            If enough RAM is available, this speeds up processing.
+        FOVs: list of int
+            One or more integers indicating the FOV number(s) to process.
+        """
 
         out = []
         # Load and consolidate the image metadata from JSON files
         metadata, all_meta = self.load_meta_files()
         device_collections = sorted(self.session_path.glob(self.device_collection))
-        FOVs = ensure_list(FOVs) if FOVs is not None else metadata['FOV']
-        for i, fov in enumerate(FOVs):
+        FOVs = list(range(len(metadata['FOV']))) if FOVs is None else ensure_list(FOVs)
+        for i in FOVs:
             # metadata_file = bin_file.with_name('ops.npy')
             # moco_data = MotionBinDataset(bin_file, metadata_file)
             (out_path := self.session_path.joinpath(f'alf/FOV_{i:02d}/masknmf')).mkdir(exist_ok=True)
@@ -255,9 +270,7 @@ class MasknmfPreprocess(MesoscopeTask):
             out_stack_pos = out_path / 'mpciROIs.stackPos.npy'
             out_fluorescence_traces = out_path / 'mpci.ROIActivityF.npy'
             out_deconvolved_traces = out_path / 'mpci.ROIActivityDeconvolved.npy'
-
-            # FIXME this is a hack
-            out_motion_corrected = out_demix_path.with_stem('moco_rewrite_masknmf')
+            out_motion_corrected = out_demix_path.with_stem('moco_shifts')
             if out_motion_corrected.exists():
                 logger.info(f'Removing existing motion correction file at {out_motion_corrected}')
                 out_motion_corrected.unlink()
@@ -284,11 +297,11 @@ class MasknmfPreprocess(MesoscopeTask):
                 max_rigid_shifts=max_rigid_shifts,  # around 25
                 max_deviation_rigid=(3, 3)
             )
-
+            FRAME_BATCH_SIZE = 2000
             pipeline = masknmf.TwoPhotonCalciumPipeline(
                 motion_correct_config=motion_config,
                 compress_config=masknmf.CompressDenoiseConfig(block_sizes=(32, 32)),
-                frame_batch_size=300,
+                frame_batch_size=FRAME_BATCH_SIZE,
                 outpath_motion_correction=out_motion_corrected,  # This will eventually be removed,
                 outpath_compression=out_compressed,
                 outpath_demixing=out_demix_path)
@@ -310,6 +323,13 @@ class MasknmfPreprocess(MesoscopeTask):
             xy_centers = demixing_results.ac_array.centers.cpu().numpy()  # shape (num_rois, 2) tensor
             np.save(out_stack_pos, np.c_[xy_centers, np.zeros(len(xy_centers))])
             out.extend([out_demix_path, out_fluorescence_traces, out_deconvolved_traces, out_roi_masks, out_stack_pos])
+
+            # Release this FOV's large arrays/tensors before moving to the next one, so
+            # memory doesn't build up across FOVs within this one process.
+            del frames, pipeline, demixing_results, F, Deconv_F, masks, xy_centers
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         return out
 
 
