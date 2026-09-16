@@ -277,10 +277,8 @@ class ScanImageTiffSeriesLoader(LazyFrameLoader):
         read_row = slice(None) if row_is_fancy else row_indexer
         read_col = slice(None) if col_is_fancy else col_indexer
 
-        chunks: list[np.ndarray] = []
-        insertion_order = np.zeros(len(rows), dtype=np.int64)
-
-        pos = 0
+        # Write directly into a preallocated, correctly-ordered output array
+        result: np.ndarray | None = None
         for file_id in np.unique(rows[:, 2]):
             mask = rows[:, 2] == file_id
             out_positions = np.where(mask)[0]
@@ -304,13 +302,11 @@ class ScanImageTiffSeriesLoader(LazyFrameLoader):
             if col_is_fancy:
                 raw = raw[..., col_indexer]
 
-            chunks.append(raw.astype(self._dtype, copy=False))
-            insertion_order[pos:pos + len(out_positions)] = out_positions
-            pos += len(out_positions)
+            if result is None:
+                result = np.empty((len(rows),) + raw.shape[1:], dtype=self._dtype)
+            result[out_positions] = raw
 
-        stacked = np.concatenate(chunks, axis=0)
-        perm = np.argsort(insertion_order)
-        return stacked[perm]
+        return result
 
 
 def get_frame_loader(folders: list[Path], fov: int, meta=None, memmap: bool = True) -> ScanImageTiffSeriesLoader:
