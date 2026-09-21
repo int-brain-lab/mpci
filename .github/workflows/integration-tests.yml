@@ -2,9 +2,11 @@ name: Integration Tests (Lightning)
 
 on:
   push:
-    branches: [main, ci]
+    branches: [ci]
+  pull_request:
+    branches: [ main, release/* ]
   workflow_dispatch:  # For manual triggering
-  
+
 # No top-level env: each step declares exactly what it consumes (explicit wiring).
 
 jobs:
