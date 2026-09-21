@@ -61,9 +61,23 @@ class MesoscopeCompress(MesoscopeTask):
             output_identifiers = [self.output_files[0].identifiers]
             assert self.output_files[0].operator is None, 'only one output file expected'
 
+        # Map each output identifier to its collection so folders are matched by name rather than
+        # position (`Path.glob` order need not match the alphabetical order `find_files` sorts by).
+        out_id_by_collection = {out_id[0]: out_id for out_id in output_identifiers}
+
+        # Pop this before the loop: `dict.pop` on each iteration would only apply the caller's
+        # value to the first collection, with the rest silently using the default.
+        min_size = kwargs.pop('verify_min_size', 1024)
+
         # A list of tifs, grouped by raw imaging data collection
         input_files = groupby(chain.from_iterable(all_tifs), key=lambda x: x.parent)
-        for (in_dir, infiles), out_id in zip(input_files, output_identifiers):
+        for in_dir, infiles in input_files:
+            collection = in_dir.relative_to(self.session_path).as_posix()
+            out_id = out_id_by_collection.get(collection)
+            if out_id is None:
+                raise ValueError(
+                    f'No output file signature found for collection "{collection}"; '
+                    f'expected one of {sorted(out_id_by_collection)}')
             infiles = list(infiles)
             outfile = self.session_path.joinpath(*filter(None, out_id))
             if outfile.exists() and not overwrite:
@@ -92,7 +106,6 @@ class MesoscopeCompress(MesoscopeTask):
                 assert outfile.exists(), 'output file missing'
                 outfiles.append(outfile)
                 compressed_size = outfile.stat().st_size
-                min_size = kwargs.pop('verify_min_size', 1024)
                 assert compressed_size > int(min_size), f'Compressed file < {min_size / 1024:.0f}KB'
                 _logger.info('Compression ratio = %.3f, saving %.2f pct (%.2f MB)',
                              uncompressed_size / compressed_size,

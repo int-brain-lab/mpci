@@ -5,6 +5,7 @@ import tarfile
 from pathlib import Path
 from copy import deepcopy
 from itertools import chain
+from unittest import mock
 
 import numpy as np
 from one.api import ONE
@@ -118,6 +119,68 @@ class TestMesoscopeCompress(IntegrationTestCase):
         self.assertFalse(any(x.exists() for x in tif_files), 'failed to remove tifs')
         tfile = tarfile.open(self.alf_path.joinpath('imaging.frames.tar.bz2'))
         self.assertEqual(set(tfile.getnames()), set(x.name for x in tif_files))
+
+
+class TestMesoscopeCompressMultiCollection(unittest.TestCase):
+    """Regression tests for MesoscopeCompress collection/output-file pairing.
+
+    `Path.glob` doesn't guarantee alphabetical order, but `find_files` always returns matches
+    sorted alphabetically for multi-collection datasets. `_run` used to pair the two lists by
+    position, so a non-alphabetical glob order silently mismatched collections to output files.
+    """
+
+    def setUp(self):
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        self.session_path = Path(tempdir.name, 'subject', '2023-03-03', '003')
+        self.collections = ['raw_imaging_data_00', 'raw_imaging_data_01', 'raw_imaging_data_02']
+        for i, collection in enumerate(self.collections):
+            folder = self.session_path / collection
+            folder.mkdir(parents=True)
+            with open(str(folder / f'2023-03-03_2_test_2P_{i:05}_00000.tif'), 'wb') as fp:
+                np.save(fp, np.zeros((8, 8, 2), dtype=np.int16))
+
+    def test_collections_out_of_order(self):
+        """Each collection's tifs should end up in that collection's own output file.
+
+        This should hold even when `Path.glob` doesn't return the raw_imaging_data folders in
+        alphabetical order.
+        """
+        task = MesoscopeCompress(self.session_path, one=None)
+        # Simulate a filesystem that doesn't return raw_imaging_data folders alphabetically
+        glob_order = [self.session_path / c for c in reversed(self.collections)]
+        with mock.patch.object(Path, 'glob', return_value=glob_order):
+            task.get_signatures()
+
+        outfiles = task._run(verify_min_size=False)
+
+        self.assertEqual(len(self.collections), len(outfiles))
+        for collection in self.collections:
+            outfile = self.session_path / collection / 'imaging.frames.tar.bz2'
+            self.assertIn(outfile, outfiles)
+            self.assertTrue(outfile.exists(), f'missing output file for {collection}')
+            with tarfile.open(outfile) as tfile:
+                names = set(tfile.getnames())
+            expected = {p.name for p in (self.session_path / collection).glob('*.tif')}
+            self.assertEqual(names, expected, f'{collection} tar file has unexpected contents')
+
+    def test_missing_collection_signature_raises(self):
+        """A discovered collection with no matching output signature should raise, not misfile."""
+        task = MesoscopeCompress(self.session_path, one=None)
+        task.get_signatures()
+        # Rename one output collection so it no longer matches any input folder. Patching the
+        # `identifiers` property (rather than `_identifiers`) sidesteps the binary-tree structure
+        # `ExpectedDataset` builds internally for >2 combined collections.
+        identifiers = tuple(
+            ('bogus_collection', rev, name) if collection == 'raw_imaging_data_01' else
+            (collection, rev, name)
+            for collection, rev, name in task.output_files[0].identifiers
+        )
+        target = type(task.output_files[0])
+        with mock.patch.object(target, 'identifiers', new_callable=mock.PropertyMock) as mock_ids:
+            mock_ids.return_value = identifiers
+            with self.assertRaises(ValueError):
+                task._run(verify_min_size=False)
 
 
 if __name__ == '__main__':
