@@ -70,6 +70,41 @@ class MesoscopeTask(DynamicTask):
         all_meta = list(map(patch_imaging_meta, raw_meta))
         return self._consolidate_metadata(all_meta) if len(all_meta) > 1 else all_meta[0], all_meta
 
+    @staticmethod
+    def _consolidate_metadata(meta_data_all: list) -> dict:
+        """
+        Check that the metadata is consistent across all raw imaging folders.
+
+        Parameters
+        ----------
+        meta_data_all: list of dicts
+            List of metadata dictionaries to be checked for consistency.
+
+        Returns
+        -------
+        dict
+            Single, consolidated dictionary containing metadata.
+        """
+        # Ignore the things we don't expect to match
+        ignore = ('acquisitionStartTime', 'nFrames')
+        ignore_sub = {'rawScanImageMeta': ('ImageDescription', 'Software')}
+
+        def equal_dicts(a, b, skip=None):
+            ka = set(a).difference(skip or ())
+            kb = set(b).difference(skip or ())
+            return ka == kb and all(a[key] == b[key] for key in ka)
+
+        # Compare each dict with the first one in the list
+        for meta in meta_data_all[1:]:
+            if meta != meta_data_all[0]:  # compare entire object first
+                for k, v in meta_data_all[0].items():  # check key by key
+                    if not (equal_dicts(v, meta[k], ignore_sub[k])  # compare sub-dicts...
+                            if k in ignore_sub else  # ... if we have keys to ignore in test
+                            not (k in ignore or v == meta[k])):
+                        _logger.warning(f'Mismatch in meta data between raw_imaging_data folders for key {k}. '
+                                        f'Using meta_data from first folder!')
+        return meta_data_all[0]
+
     def load_sync(self):
         """
         Load the sync and channel map.
