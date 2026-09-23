@@ -224,9 +224,9 @@ class MasknmfPreprocess(MesoscopeTask):
             deconvolved_traces (np.ndarray). Shape (num_frames, num_signals). The result of running oasis deconvolution on fluorescence_traces
             spatial_footprints (sparse.GCXS). Shape (num_signals, fov height, fov width)
         """
-        fluorescence_traces = np.ascontiguousarray(demixing_results.ac_array.export_c(), dtype=np.float64)
+        fluorescence_traces = np.ascontiguousarray(demixing_results.signals_array.export_temporal_demixed(), dtype=np.float64)
         deconv_traces = self.deconv_all_traces(fluorescence_traces)
-        spatial_sparse = demixing_results.ac_array.a
+        spatial_sparse = demixing_results.signals_array.spatial_demixed
         frames, height, width = demixing_results.shape
 
         ##Make the mpci masks
@@ -322,7 +322,7 @@ class MasknmfPreprocess(MesoscopeTask):
             np.save(out_deconvolved_traces, Deconv_F)
             with open(out_roi_masks, 'wb') as fp:
                 sparse.save_npz(fp, masks)
-            xy_centers = demixing_results.ac_array.centers.cpu().numpy()  # shape (num_rois, 2) tensor
+            xy_centers = demixing_results.signals_array.centers.cpu().numpy()  # shape (num_rois, 2) tensor
             np.save(out_stack_pos, np.c_[xy_centers, np.zeros(len(xy_centers))])
             out.extend([out_demix_path, out_fluorescence_traces, out_deconvolved_traces, out_roi_masks, out_stack_pos])
 
