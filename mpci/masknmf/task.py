@@ -136,6 +136,8 @@ class MasknmfPreprocess(MesoscopeTask):
             I('mpci.times.npy', 'alf/FOV_??', True, unique=False),]
         signature['output_files'] = [
             O('demixing.hdf5', alf_collection, True, unique=False),
+            O('compressed.hdf5', alf_collection, True, unique=False),
+            O('moco_shifts.hdf5', alf_collection, True, unique=False),
             O('mpciROIs.masks.sparse_npz', alf_collection, True, unique=False),
             O('mpciROIs.stackPos.npy', alf_collection, True, unique=False),
             O('mpci.ROIActivityF.npy', alf_collection, True, unique=False),
