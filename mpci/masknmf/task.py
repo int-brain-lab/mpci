@@ -144,8 +144,6 @@ class MasknmfPreprocess(MesoscopeTask):
             O('mpciROIs.stackPos.npy', alf_collection, True, unique=False),
             O('mpci.ROIActivityF.npy', alf_collection, True, unique=False),
             O('mpci.ROIActivityDeconvolved.npy', alf_collection, True, unique=False),
-            O('moco_shifts.hdf5', alf_collection, True, unique=False),
-            O('compressed.hdf5', alf_collection, True, unique=False)
             ]
         return signature
 
