@@ -286,13 +286,10 @@ class MasknmfPreprocess(MesoscopeTask):
             if load_into_ram:
                 frames = frames[:]  # Load all frames into RAM
             nX, nY, _ = metadata['FOV'][i]['nXnYnZ']
-            NUM_BLOCKS = 50  # desired number of blocks in each dimension for motion correction
-            num_blocks_x = np.floor(nX / NUM_BLOCKS).astype(int)
-            num_blocks_y = np.floor(nY / NUM_BLOCKS).astype(int)
             SUITE2P_OVERLAP = 0.05  # maximum rigid shift as a fraction of the frame size
             max_rigid_shifts = (np.floor(nX * SUITE2P_OVERLAP).astype(int), np.floor(nY * SUITE2P_OVERLAP).astype(int))  # maximum allowed rigid shifts in pixels
             motion_config = masknmf.PiecewiseRigidMotionCorrectionConfig(
-                num_blocks=(num_blocks_x, num_blocks_y),
+                minimum_patch_sizes=(50, 50),
                 overlaps=(5, 5),
                 max_rigid_shifts=max_rigid_shifts,  # around 25
                 max_deviation_rigid=(3, 3)
