@@ -41,8 +41,10 @@ def _(acquisition_description: dict, session_path=None, one=None, **kwargs):
     assert session_path is not None, 'a session_path must be provided'
     devices = acquisition_description.get('devices', {})
     *_, sync_kwargs = _get_sync_config(acquisition_description)
-    (_, mscope_kwargs), = devices['mesoscope'].items()
-    mscope_kwargs['device_collection'] = mscope_kwargs.pop('collection')
+    (_, mscope_info), = devices['mesoscope'].items()
+    # Rename the collection key without modifying the acquisition description
+    mscope_kwargs = {k: v for k, v in mscope_info.items() if k != 'collection'}
+    mscope_kwargs['device_collection'] = mscope_info['collection']
 
     tasks = OrderedDict()
     tasks['MesoscopeRegisterSnapshots'] = type('MesoscopeRegisterSnapshots', (MesoscopeRegisterSnapshots,), {})(
