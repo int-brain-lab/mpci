@@ -3,16 +3,17 @@ import importlib
 import inspect
 from itertools import chain
 import tempfile
+from copy import deepcopy
 import unittest
 from pathlib import Path
 
-from ibllib.io.session_params import write_params
+from ibllib.io.session_params import write_params, read_params
 from ibllib.pipes.tasks import Task
 from ibllib.pipes.routing import task_env
 from ibllib.pipes.plan import plan, to_specs
 
 import mpci
-from mpci.alyx.pipeline import plan as mpci_plan
+from mpci.alyx.pipeline import plan as mpci_plan, make_pipeline
 
 
 class TestTaskRouting(unittest.TestCase):
@@ -76,6 +77,17 @@ class TestPlan(unittest.TestCase):
         # Check the planner target in ibllib resolves to this function
         specs = plan('mpci.alyx.pipeline:plan', self.session_path)
         self.assertEqual(expected, [s.name for s in specs])
+
+    def test_make_pipeline(self):
+        """Test mpci.alyx.pipeline.make_pipeline doesn't modify the acquisition description."""
+        description = read_params(self.session_path)
+        expected = deepcopy(description)
+        for _ in range(2):  # previously raised a KeyError on the second call
+            pipe = make_pipeline(description, session_path=self.session_path)
+            self.assertEqual(expected, description)
+        task = pipe.tasks['MesoscopePreprocess']
+        expected = {'device_collection': 'raw_imaging_data*', 'sync_label': 'chrono'}
+        self.assertEqual(expected, task.kwargs)
 
 
 if __name__ == '__main__':
