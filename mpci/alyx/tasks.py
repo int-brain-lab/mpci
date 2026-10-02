@@ -1,3 +1,4 @@
+import enum
 import logging
 import importlib.metadata
 from itertools import chain
@@ -10,6 +11,13 @@ from ibllib.oneibl.data_handlers import ExpectedDataset, dataset_from_name
 import mpci
 
 _logger = logging.getLogger(__name__)
+
+Provenance = enum.Enum('Provenance', ['ESTIMATE', 'FUNCTIONAL', 'LANDMARK', 'HISTOLOGY'])
+"""How a set of coordinates was arrived at.
+
+Shared by the tasks that write coordinates and those that read them back, as it decides the
+suffix of the datasets on both sides.
+"""
 
 
 class MesoscopeTask(DynamicTask):

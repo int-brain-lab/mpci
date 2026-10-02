@@ -1,1 +1,2 @@
 graft mpci/chronic/registration/fixtures
+graft mpci/tests/fixtures
