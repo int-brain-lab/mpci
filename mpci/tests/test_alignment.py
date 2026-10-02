@@ -574,7 +574,7 @@ class TestProcessing(AlignmentTestCase):
             mock.patch.object(
                 task, "register_reference_stacks", return_value=EuclideanTransform(np.eye(3))
             ),
-            mock.patch.object(task, "update_surgery_json") as surgery_mock,
+            mock.patch.object(task, "register_brain_normal") as surgery_mock,
             mock.patch(
                 "mpci.alignment.task.projections.project_down_from_surface",
                 side_effect=lambda coords_on_surface, atlas, coords_depths: coords_on_surface,
@@ -844,7 +844,7 @@ class TestAlyx(AlignmentTestCase):
         self.assertEqual(craniotomy_resolved[0], ref_image_meta["centerMM"]["ML_resolved"])
         self.assertEqual(craniotomy_resolved[1], ref_image_meta["centerMM"]["AP_resolved"])
 
-    def test_update_surgery_json(self):
+    def test_register_brain_normal(self):
         """Test that the surface normal is added to the craniotomy the metadata center matches.
 
         Two craniotomies are offered, and the center in the metadata is given with a floating
@@ -865,7 +865,7 @@ class TestAlyx(AlignmentTestCase):
             mock.patch.object(task.one.alyx, "rest", return_value=[surgery, {}]),
             mock.patch.object(task.one.alyx, "json_field_update") as update_mock,
         ):
-            result = task.update_surgery_json(meta, normal_vector)
+            result = task.register_brain_normal(meta, normal_vector)
 
         expected = {
             "craniotomy_01": {
@@ -876,7 +876,7 @@ class TestAlyx(AlignmentTestCase):
         update_mock.assert_called_once_with("subjects", "SP000", data=expected)
         self.assertIs(update_mock.return_value, result["json"])
 
-    def test_update_surgery_json_no_matching_craniotomy(self):
+    def test_register_brain_normal_no_matching_craniotomy(self):
         """Test that a metadata center matching no craniotomy is reported and changes nothing."""
         task = self.make_task(register_data=True)
         surgery = {"json": {"craniotomy_00": {"center": [1.0, -3.0]}}}
@@ -887,7 +887,7 @@ class TestAlyx(AlignmentTestCase):
             mock.patch.object(task.one.alyx, "json_field_update") as update_mock,
             self.assertLogs("mpci.alignment.task", "ERROR"),
         ):
-            result = task.update_surgery_json(
+            result = task.register_brain_normal(
                 {"centerMM": {"ML": 0.0, "AP": 0.0}}, np.array([0.0, 0.0, 1.0])
             )
 
@@ -895,7 +895,7 @@ class TestAlyx(AlignmentTestCase):
         self.assertIs(surgery, result)
         update_mock.assert_not_called()
 
-    def test_update_surgery_json_no_surgeries(self):
+    def test_register_brain_normal_no_surgeries(self):
         """Test that a subject without a craniotomy surgery is reported and returns nothing."""
         task = self.make_task(register_data=True)
 
@@ -905,12 +905,12 @@ class TestAlyx(AlignmentTestCase):
             mock.patch.object(task.one.alyx, "json_field_update") as update_mock,
             self.assertLogs("mpci.alignment.task", "ERROR"),
         ):
-            result = task.update_surgery_json(raw_imaging_metadata(), np.array([0.0, 0.0, 1.0]))
+            result = task.register_brain_normal(raw_imaging_metadata(), np.array([0.0, 0.0, 1.0]))
 
         self.assertIsNone(result)
         update_mock.assert_not_called()
 
-    def test_update_surgery_json_offline(self):
+    def test_register_brain_normal_offline(self):
         """Test that an offline ONE is reported and Alyx is left alone."""
         task = self.make_task(register_data=True)
         # the constructor rejects an offline ONE, so it is only taken offline afterwards
@@ -920,7 +920,7 @@ class TestAlyx(AlignmentTestCase):
             mock.patch.object(task.one.alyx, "rest") as rest_mock,
             self.assertLogs("mpci.alignment.task", "WARNING"),
         ):
-            result = task.update_surgery_json(raw_imaging_metadata(), np.array([0.0, 0.0, 1.0]))
+            result = task.register_brain_normal(raw_imaging_metadata(), np.array([0.0, 0.0, 1.0]))
 
         self.assertIsNone(result)
         rest_mock.assert_not_called()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from itertools import product
@@ -11,6 +12,7 @@ from uuid import UUID, uuid4
 import shutil
 
 import numpy as np
+import pandas as pd
 from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import gaussian_filter
 
@@ -29,6 +31,14 @@ from ibllib.oneibl.data_handlers import (
 )
 from ibllib.oneibl.patcher import S3Patcher
 
+from mpci.alignment import brain_surface, reference_image_tools
+from mpci.alignment.stack_registration import (
+    apply_transform,
+    evaluate,
+    inspect_registration_delta,
+    plot_keypoints,
+    register_stacks,
+)
 from mpci.alyx.tasks import MesoscopeTask, Provenance
 from mpci.loaders.local import (
     HISTOLOGY_FILENAME,
@@ -43,20 +53,12 @@ from mpci.scanimage.io import (
 
 
 from iblatlas.atlas import MRITorontoAtlas
-from plane2brain.atlas import ProjectionAtlas
 
-from plane2brain import ibl, projections, scanimage
-from plane2brain.coordinate_systems import (
-    create_coordinate_system_for_image,
-    setup_coordinate_systems_3d,
-)
-from plane2brain.registration import (
-    apply_transform,
-    evaluate,
-    inspect_registration_delta,
-    plot_keypoints,
-    register_stacks,
-)
+from plane2brain import projections
+from plane2brain.atlas import ProjectionAtlas
+from plane2brain.scanimage import get_image_map, create_images_from_scanimage_meta
+from plane2brain.projections import Projection, project_down_from_surface, project_onto_surface
+from plane2brain.core import Orientation, Anchor, Plane, Image
 
 # ScanImage metadata stores dimensions in XY order by default, where X is the
 # resonant (fast-scan) axis; in our reference image that axis is the second one.
@@ -121,7 +123,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         projection_atlas_resolution: Literal[10, 25, 50] = 25,
         write_outputs: bool = False,  # for now safety first. FIXME change this eventually
         register_data: bool = False,  # for now safety first. FIXME change this eventually
-        debug: bool = True,
+        debug: bool = False,
         backup: bool = False,
         backup_folder: Path | None = None,
         **kwargs,
@@ -627,7 +629,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
     # ##     ##  #######  ##    ##
     #
 
-    def _run(self) -> list[Path]:
+    def _run(self, corrections: dict = None) -> list[Path]:
         """Align this session's FOVs to the atlas and write the mean-image datasets.
 
         The provenance is set from what could be loaded: HISTOLOGY if the reference session's
@@ -646,8 +648,9 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         _logger.info("Starting FOV alignment run for %s", self.session_path)
 
         # what the data supports decides both the corrections and the provenance: the FOVs are
-        # placed by geometry alone unless the histology can be looked up
-        corrections = self.infer_possible_corrections()
+        # placed by geometry alone unless histology data is available
+        corrections = corrections or self.infer_possible_corrections()
+
         self.provenance = (
             Provenance.HISTOLOGY if corrections["use_histology"] else Provenance.ESTIMATE
         )
@@ -658,26 +661,34 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         meta = self.data_loader.raw_imaging_metadata.load()
         _logger.debug("loaded raw imaging metadata from %d file(s)", len(meta_files))
 
+        # load reference image metadata, if possible
+        if self.data_loader.reference_stack_metadata.available():
+            ref_image_meta = self.data_loader.reference_stack_metadata.load()
+
+        # When histology can be loaded, update the craniotomy center with the values
+        # read from the histology session - this creates the _resolved entries
         if self.provenance is Provenance.HISTOLOGY:
             _logger.info("Extracting histology MLAPDV datasets")
 
             # Update the craniotomy center
-            ref_session_ref_image_mlapdv, _ = self.load_histology_mlapdv()
-            ref_image_meta = self.data_loader.reference_stack_metadata.load()
             if self.register_data:
+                ref_session_ref_image_mlapdv, _ = self.load_histology_mlapdv()
                 self.update_craniotomy_center(ref_image_meta, ref_session_ref_image_mlapdv)
 
+            # carry the informtion over from the reference session to this session
             # update the individual meta files; the write happens once, further below, after
             # the FOV locations have been added too
             meta["centerMM"] = ref_image_meta["centerMM"]
 
-            # Add reference meta data to meta_files list for registration
+            # Add reference meta data to meta_files list for registration on alyx
             meta_files.append(self.data_loader.reference_stack_metadata.path())
 
         # this encapsulates the entire alignment pipeline
         _logger.info("Running FOV alignment with corrections: %s", corrections)
-        self.fovs_coordinates = self.align_FOVs(**corrections, debug=self.debug)
-        _logger.info("Alignment computed coordinates for %d FOV(s)", len(self.fovs_coordinates))
+        self.projection = self.align_FOVs(**corrections, debug=self.debug)
+        _logger.info(
+            "Alignment computed coordinates for %d FOV(s)", len(self.projection.plane.images)
+        )
 
         # the metadata of the first imaging bout stands in for all of them, which only holds
         # if the scanimage content needed here is consistent across the files
@@ -691,33 +702,21 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         )
         mean_images_mlapdv = {}
         mean_images_ids = {}
-        for fov_name, fov_uuid in fov_map.items():
-            n_px_per_row = raw_imaging_meta["rawScanImageMeta"]["Width"]
-            if self.debug:
-                # stretch downsampled values to original size
-                old_len = self.fovs_coordinates[fov_uuid]["mlapdv"].shape[0]
-                target_len = n_px_per_row**2
-                values = self.fovs_coordinates[fov_uuid]["mlapdv"]
-                from scipy.interpolate import interp1d
+        # for fov_name, fov_uuid in zip(fov_map["fov_name"], fov_map["uuid"]):
+        for i, row in fov_map.iterrows():
+            fov_name = row["fov_name"]
+            fov_index = row["index"]
 
-                _logger.debug(
-                    "%s: stretching debug-downsampled coordinates from %d to %d points",
-                    fov_name,
-                    old_len,
-                    target_len,
-                )
-                fn = interp1d(
-                    np.linspace(0, 1, old_len),
-                    values,
-                    axis=0,
-                )
-                self.fovs_coordinates[fov_uuid]["mlapdv"] = fn(np.linspace(0, 1, target_len))
-
+            # reshape the projected coordinates into an image, sized by the image object rather
+            # than the metadata, so that coarsened debug images reshape too
+            # plane2brain could be a .as_image() function
+            size_px = self.projection.plane.images[fov_index].size_px
             mean_image_mlapdv = np.reshape(
-                self.fovs_coordinates[fov_uuid]["mlapdv"], (n_px_per_row, n_px_per_row, 3)
+                self.projection.coordinates["in_brain"][fov_index], (*size_px, 3)
             )
-            mean_images_mlapdv[fov_uuid] = mean_image_mlapdv
-            mean_images_ids[fov_uuid] = self.histology_atlas.get_labels(
+            mean_images_mlapdv[fov_name] = mean_image_mlapdv
+            # convert to IDs
+            mean_images_ids[fov_name] = self.histology_atlas.get_labels(
                 mean_image_mlapdv / 1e6, mode="clip"
             )
 
@@ -744,7 +743,9 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         # storing all outputs
         mean_image_files = []
 
-        for fov_name, fov_uuid in fov_map.items():
+        # for fov_name, fov_uuid in zip(fov_map["fov_name"], fov_map["uuid"]):
+        for i, row in fov_map.iterrows():
+            fov_name = row["fov_name"]
             alf_path = self.session_path.joinpath("alf", fov_name)
             alf_path.mkdir(parents=True, exist_ok=True)
 
@@ -759,7 +760,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             if self.write_outputs:
                 if filepath.exists() and self.backup:
                     self.backup_file(filepath)
-                np.save(filepath, mean_images_mlapdv[fov_uuid])
+                np.save(filepath, mean_images_mlapdv[fov_name])
                 _logger.info("wrote %s", filepath)
             else:
                 _logger.info("would have written %s", filepath)
@@ -775,7 +776,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             if self.write_outputs:
                 if filepath.exists() and self.backup:
                     self.backup_file(filepath)
-                np.save(filepath, mean_images_ids[fov_uuid])
+                np.save(filepath, mean_images_ids[fov_name])
                 _logger.info("wrote %s", filepath)
             else:
                 _logger.info("would have written %s", filepath)
@@ -838,6 +839,33 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         return ref_img_histo_mlapdv, ccf_idx
 
     @staticmethod
+    def coarsen_image(image: Image, n_px: int = 16) -> Image:
+        """Return a copy of an image with a coarse pixel grid of the same extent, for debugging.
+
+        The first and last pixel along each axis stay where they are in the original image,
+        so the corners of the projected image match those of a full run.
+
+        Parameters
+        ----------
+        image : plane2brain.core.Image
+            The full-resolution image, not yet added to a plane.
+        n_px : int
+            Number of pixels along each axis of the coarse grid. Default is 16.
+
+        Returns
+        -------
+        plane2brain.core.Image
+            The coarse image, with size (n_px, n_px) and no depth below surface assigned.
+        """
+        size_px = np.full(2, n_px)
+        coordinate_systems = copy.deepcopy(image.coordinate_systems)
+        # stretch the pixel axes so that the coarse grid spans the original first to last pixel
+        scale = (image.size_px - 1) / (size_px - 1)
+        pixel = coordinate_systems.get("pixel")
+        pixel.basis = pixel.basis @ np.diag(scale)
+        return Image(size_px, coordinate_systems)
+
+    @staticmethod
     def interpolate_histology(
         histo_mlapdv: np.ndarray,
         sigma: float | None = None,
@@ -888,7 +916,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         save_plots: bool = False,
         save_transform: bool = False,
     ) -> ProjectiveTransform:
-        """Find the image transform mapping this session's reference stack onto the reference session's.
+        """Find the image transform mapping this session's reference stack onto the reference session's .
 
         Note that this is *image* registration, not dataset registration to Alyx.
 
@@ -1117,7 +1145,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             plane and that surface causes. Without the points neither is defined, so this
             governs both.
         debug : bool
-            If True, downsample the pixel grid to speed up the run for debugging.
+            If True, project a coarse pixel grid of the same extent, see `coarsen_image`.
 
         Returns
         -------
@@ -1136,8 +1164,23 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             debug,
         )
         raw_imaging_meta = self.data_loader.raw_imaging_metadata.load()
+
+        atlas = ProjectionAtlas(res_um=self.projection_atlas_resolution)
+
+        # establish a mapping between index, fov_name, roi_uuid
+        # and depth (as read from the scanimage metadata)
         fov_map = self.get_fov_map(raw_imaging_meta)
-        _logger.debug("FOV map: %s", fov_map)
+
+        # creating the "images" - plane2brain container objects
+        # that link geometry to FOV
+        images = create_images_from_scanimage_meta(
+            raw_imaging_meta["rawScanImageMeta"],
+            dims=IBL_MESOSCOPE_DEFINITIONS["scanimage_dimensions"],
+        )
+        # debug runs project a coarse grid that spans the same extent as the full image
+        if debug:
+            images = [self.coarsen_image(image) for image in images]
+            _logger.debug("debug run: coarsened images to %s px", images[0].size_px.tolist())
 
         # the reference stack and its metadata anchor every path below, whichever corrections
         # are switched on, so they are inputs rather than optional extras
@@ -1145,57 +1188,31 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         ref_img_meta = self.data_loader.reference_stack_metadata.load()
         _logger.debug("loaded reference stack with shape %s", ref_img_stack.shape)
 
-        # coordinate systems
-        coordinate_systems_2d = scanimage.create_coordinate_systems_from_scanimage_meta(
-            raw_imaging_meta["rawScanImageMeta"],
-            fov_uuids=sorted(fov_map.values()),
-            dims=IBL_MESOSCOPE_DEFINITIONS["scanimage_dimensions"],
-        )
-
-        # the reference image stack is stored on disk in: dv,ml,ap
-        ref_img_size_px = np.array(ref_img_stack[0].shape)  # ml,ap
-
-        # image resolution and dimensions of the reference stack in um
-        um_per_px = scanimage.get_resolution_from_scanimage_meta(
+        # the uncorrected reference image, i.e. before any tilt or lateral-shift correction; the
+        # stack is stored on disk as (dv, ml, ap), so a plane's shape is its size in pixels
+        ref_image = reference_image_tools.create_reference_image(
             ref_img_meta["rawScanImageMeta"],
-            dims=IBL_MESOSCOPE_DEFINITIONS["scanimage_dimensions"],
-        )
-        ref_img_topleft_ref, ref_img_ref_per_px = ibl.infer_ref_stack_virtual_corner(
-            ref_img_meta["rawScanImageMeta"],
-            ref_img_size_px,
+            np.array(ref_img_stack[0].shape),
             dims=IBL_MESOSCOPE_DEFINITIONS["scanimage_dimensions"],
         )
 
-        # the uncorrected 2D coordinate system of the reference image, i.e. before any
-        # tilt or lateral-shift correction is applied
-        coordinate_systems_ref = create_coordinate_system_for_image(
-            ref_img_size_px,
-            um_per_px,
-            ref_img_ref_per_px,
-            ref_img_topleft_ref,
-        )
-
-        # populating the coordinates dictionary holding all coordinates of all FOVs
-        fovs_coordinates = {}
-        n_px_per_row = raw_imaging_meta["rawScanImageMeta"]["Width"]
-        # this step requires Width == Height
-        # cannot be asserted here because of the format of the FOVs being stitched
-        # together vertically (mesoscope specific)
-        pixel_indices = np.array(list(product(range(n_px_per_row), repeat=2)), dtype="float")
-
-        if debug:
-            pixel_indices = pixel_indices[::128]
-            _logger.debug("debug run: downsampled pixel grid to %d points", len(pixel_indices))
-
-        for fov_uuid in fov_map.values():
-            fovs_coordinates[fov_uuid] = {}
-            fovs_coordinates[fov_uuid]["pixel"] = pixel_indices
-            # convert pixel indices to global um
-            fovs_coordinates[fov_uuid]["um_global"] = coordinate_systems_2d[fov_uuid].transform(
-                pixel_indices,
-                "pixel",
-                "um_global",
+        # adding depth below surface information to the images, if possible
+        if self.data_loader.brain_surface_points.usable():
+            brain_surface_points = self.data_loader.brain_surface_points.load(prefer="metadata")
+            # this normal is expressed in the coordinate system of the reference stack
+            p_surface, n_surface, dv_avg = brain_surface.get_brain_surface_normal(
+                brain_surface_points,
+                ref_img_meta=ref_img_meta,
+                coordinate_systems_ref=ref_image.coordinate_systems,
             )
+            # dv_avg is negated stack z, while the FOVs' z is raw ScanImage z, which grows with
+            # depth: their sum is the depth below the (level) surface, positive below it
+            fov_map["depth_below_surface"] = fov_map["z"] + dv_avg
+
+            # additionally set this depth to the image objects
+            # for convenient use in projections later
+            for i, row in fov_map.iterrows():
+                images[row["index"]].depth_below_surface = row["depth_below_surface"]
 
         # the brain surface points are what depth below the surface is measured against, so
         # they resolve the depth and the tilt around it in one go
@@ -1203,37 +1220,26 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             _logger.info("Applying tilt correction from brain surface points")
             brain_surface_points = self.data_loader.brain_surface_points.load(prefer="metadata")
             # this normal is expressed in the coordinate system of the reference stack
-            p_surface, n_surface, dv_avg = projections.get_brain_surface_normal(
+            p_surface, n_surface, _ = brain_surface.get_brain_surface_normal(
                 brain_surface_points,
-                ref_img_meta,
-                coordinate_systems_ref,
-            )
-            _logger.debug(
-                "brain surface: %d point(s), average depth %.2f", len(brain_surface_points), dv_avg
+                ref_img_meta=ref_img_meta,
+                coordinate_systems_ref=ref_image.coordinate_systems,
             )
 
-            # extract depths from scanimage metadata
-            fov_depths = scanimage.extract_fov_depths_from_scanimage_meta(
-                scanimage_meta=raw_imaging_meta["rawScanImageMeta"],
-                scanimage_params=raw_imaging_meta["scanImageParams"],
-                fov_uuids=fov_map.values(),
-            )
-
-            for fov_uuid in fov_map.values():
-                n = fovs_coordinates[fov_uuid]["pixel"].shape[0]
-                fovs_coordinates[fov_uuid]["dv_below_surface"] = np.ones(n) * np.absolute(
-                    fov_depths[fov_uuid] - dv_avg
+            # correct each image for the tilt between the brain surface and the optical axis,
+            # which shifts its pixels in x/y and refines their depth below the surface
+            for _, row in fov_map.iterrows():
+                image = images[row["index"]]
+                um_global = image.coordinate_systems.transform(
+                    image.pixel_indices, "pixel", "um_global"
                 )
-
-            # this adds to the fovs_coordinates dictionary:
-            # 'um_corrected' - for apparent xy shift based on tilt
-            # 'dv_below_surface_corrected'  - for apparent z shift based on tilt
-            fovs_coordinates = projections.correct_coords_for_tilt_2d(
-                fovs_coordinates,
-                fov_depths,
-                p_surface,
-                n_surface,
-            )
+                # the surface plane lives in dv, which is negated raw z: the image is placed at
+                # its own dv, not at its depth below the surface
+                um_corrected, depth_below_surface = projections.correct_coords_for_tilt_2d(
+                    um_global, -row["z"], p_surface, n_surface
+                )
+                image.depth_below_surface = depth_below_surface
+                image.coordinates["um_corrected"] = um_corrected
 
         if lateral_correct:
             _logger.info("Applying lateral correction by registering reference stacks")
@@ -1255,20 +1261,57 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         else:
             _logger.info("Projecting onto atlas surface along the brain normal (no histology)")
 
-        # this is the atlas to project onto
-        atlas = ProjectionAtlas(res_um=self.projection_atlas_resolution)
+        # setting up the projection instance
 
-        for uuid in fov_map.values():
+        # define the orientation and anchor point, add images
+        microscope_orientation = Orientation(
+            rotation_degrees=IBL_MESOSCOPE_DEFINITIONS["scanner_orientation"]["rotation"],
+            invert_axis=IBL_MESOSCOPE_DEFINITIONS["scanner_orientation"]["invert_axis"],
+        )
+        # get the center of the craniotomy from the metadata in mlapdv
+        craniotomy_center = reference_image_tools.load_reference_points_from_meta(ref_img_meta)
+        suffix = "_resolved" if use_histology else ""
+        center_mlapdv = atlas.get_dv_for_mlap(craniotomy_center[f"mlap{suffix}"][np.newaxis, :])[0]
+        # and get the brain normal
+        brain_normal = atlas.get_plane_at_point_mlap(*center_mlapdv[:-1]).normal
+        # updating the brain normal on alyx
+        if self.register_data:
+            self.register_brain_normal(raw_imaging_meta, brain_normal)
+
+        # on a per session basis, the user marks the center of the craniotomy center
+        # in scanimage with a circle (in the reference image)
+        craniotomy_center_um = reference_image_tools.get_circle_offset(
+            ref_img_meta["rawScanImageMeta"],
+            dims=IBL_MESOSCOPE_DEFINITIONS["scanimage_dimensions"],
+        )
+
+        # combining this gives the anchor point where the plane sits in space
+        anchor = Anchor(center_mlapdv, "um_global", craniotomy_center_um)
+        imaging_plane = Plane(center_mlapdv, brain_normal)
+        imaging_plane.add_images(
+            images,
+            orientation=microscope_orientation,
+            anchor=anchor,
+        )
+
+        projection = Projection(atlas, imaging_plane)
+
+        # iterate and project
+        for _, row in fov_map.iterrows():
+            image_ix = row["index"]
+            image = images[image_ix]
             if tilt_correct:
                 # use the tilt-corrected um coordinates to transform back to reference-image px
-                px = coordinate_systems_ref.transform(
-                    fovs_coordinates[uuid]["um_corrected"], "um_global", "pixel"
+                px = ref_image.coordinate_systems.transform(
+                    image.coordinates["um_corrected"], "um_global", "pixel"
                 )
             else:
-                # otherwise, convert the FOV pixel directly to (fractional) reference-image px
-                px = fovs_coordinates[uuid]["pixel"]
-                coords_um_global = coordinate_systems_2d[uuid].transform(px, "pixel", "um_global")
-                px = coordinate_systems_ref.transform(coords_um_global, "um_global", "pixel")
+                # otherwise, convert the pixle indices directly to (fractional) reference-image px
+                # px = image.coordinates["pixel"]
+                # should be the same thing as
+                px = image.pixel_indices
+                coords_um_global = image.coordinate_systems.transform(px, "pixel", "um_global")
+                px = ref_image.coordinate_systems.transform(coords_um_global, "um_global", "pixel")
 
             # apply session to session correction
             # (that is defined in pixel space)
@@ -1279,62 +1322,38 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             if use_histology:
                 mlap_interp = histo_interp_fn(px)
                 # find point on surface
-                fovs_coordinates[uuid]["mlapdv_on_surface"] = atlas.get_dv_for_mlap(
-                    mlap_interp  # + 1e-6
-                )  # TODO trace back what those were for - I think not necessary since we are extrapolating now
-
-                # register the brain normal
-                ref_image_meta = self.data_loader.reference_stack_metadata.load()
-                _, brain_normal = atlas.get_plane_at_point_mlap(
-                    ref_image_meta["centerMM"]["ML_resolved"],
-                    ref_image_meta["centerMM"]["AP_resolved"],
+                on_surface = atlas.get_dv_for_mlap(mlap_interp)
+                # and project down into the brain
+                in_brain = project_down_from_surface(
+                    on_surface,
+                    atlas,
+                    image.depth_below_surface,
                 )
-                if self.register_data:
-                    self.update_surgery_json(raw_imaging_meta, brain_normal)
-
             else:
-                # if no histology is present - do the vanilla projection along the brain normal
-                # this assumes the optical axis and the brain normal are in alignment
+                # if no histology is present - project based on geometry
+                um_global = ref_image.coordinate_systems.transform(px, "pixel", "um_global")
+                on_plane = imaging_plane.coordinate_systems_3d.transform(
+                    np.column_stack([um_global, np.zeros(len(um_global))]), "um_global", "mlapdv"
+                )
 
-                # get the center of the craniotomy
-                center_mlapdv = atlas.get_dv_for_mlap(
-                    ibl.load_reference_points_from_meta(ref_img_meta)["mlap"][np.newaxis, :]
-                )[0]
-                # and it's brain normal
-                _, brain_normal = atlas.get_plane_at_point_mlap(*center_mlapdv[:-1])
-                # register the brain normal on alyx
-                if self.register_data:
-                    self.update_surgery_json(raw_imaging_meta, brain_normal)
-                # setup the projection
-                coordinate_systems_3d = setup_coordinate_systems_3d(
-                    center_mlapdv,
+                on_surface = project_onto_surface(
+                    on_plane,
+                    atlas,
                     brain_normal,
-                    rotate_by=IBL_MESOSCOPE_DEFINITIONS["scanner_orientation"]["rotation"],
-                    invert_dims=IBL_MESOSCOPE_DEFINITIONS["scanner_orientation"]["invert_axis"],
                 )
-                fovs_coordinates[uuid]["mlapdv_on_surface"] = (
-                    projections.project_coords_onto_atlas_surface(
-                        fovs_coordinates[uuid]["um_global"],
-                        coordinate_systems_3d=coordinate_systems_3d,
-                        atlas=atlas,
-                        projection_vector=brain_normal,
-                    )
+                # and project down into the brain
+                in_brain = project_down_from_surface(
+                    on_surface,
+                    atlas,
+                    image.depth_below_surface,
                 )
 
-            # project down into the brain; skipped entirely without the brain surface points,
-            # since depth below the surface is undefined without them
-            if tilt_correct:
-                fovs_coordinates[uuid]["mlapdv"] = projections.project_down_from_surface(
-                    coords_on_surface=fovs_coordinates[uuid]["mlapdv_on_surface"],
-                    atlas=atlas,
-                    coords_depths=fovs_coordinates[uuid]["dv_below_surface_corrected"],
-                )
-            _logger.debug("FOV %s: atlas coordinates resolved", uuid)
+            # storing the results
+            projection.coordinates["on_surface"][image_ix] = on_surface
+            projection.coordinates["in_brain"][image_ix] = in_brain
 
-        _logger.info(
-            "Finished aligning %d FOV(s) for %s", len(fovs_coordinates), self.session_path
-        )
-        return fovs_coordinates
+        _logger.info("Finished aligning %d FOV(s) for %s", fov_map.shape[0], self.session_path)
+        return projection
 
     #
     #    ###    ##       ##    ## ##     ##
@@ -1346,6 +1365,9 @@ class MesoscopeFOVAlignment(MesoscopeTask):
     # ##     ## ########    ##    ##     ##
     #
 
+    # TODO this function should be logically split into two - one function that retrieves the
+    # center value from the ref_session_ref_stack_mlapdv array, and one function that takes
+    # the extracted values and takes care of writing it in the correct locations in the metadata
     def update_craniotomy_center(
         self,
         ref_image_meta: dict,
@@ -1391,7 +1413,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         _logger.debug("Craniotomy pixel coordinates: (%d, %d)", *craniotomy_pixel)
 
         # This doesn't work in python 3.10, numpy 2.24
-        # craniotomy_resolved = referenceImage['mlapdv'][craniotomy_pixel] / 1e3  # py 3.11 # ML AP DV, μm -> mm
+        # craniotomy_resolved = referenceImage['mlapdv'][craniotomy_pixel] / 1e3  # py 3.11
+        # ML AP DV, μm -> mm
         craniotomy_resolved = (
             ref_session_ref_stack_mlapdv[craniotomy_pixel[0], craniotomy_pixel[1]] / 1e3
         )
@@ -1431,8 +1454,10 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         )
         return craniotomy_resolved
 
-    def update_surgery_json(self, meta: dict, normal_vector: np.ndarray) -> dict | None:
-        """Update surgery JSON with surface normal vector.
+    def register_brain_normal(self, meta: dict, normal_vector: np.ndarray) -> dict | None:
+        """Register the brain surface normal at the craniotomy center in the surgery JSON.
+
+        Formerly called `update_surgery_json`. Note that it does not update the surgery.
 
         Adds the key 'surface_normal_unit_vector' to the most recent surgery JSON, containing the
         provided three element vector.  The recorded craniotomy center must match the coordinates
@@ -1476,8 +1501,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             surgery["json"] = self.one.alyx.json_field_update("subjects", subject, data=data)
         return surgery
 
-    def get_fov_map(self, raw_imaging_meta: dict) -> dict:
-        """Map this session's FOV names onto their ScanImage ROI UUIDs.
+    def get_fov_map(self, raw_imaging_meta: dict) -> pd.DataFrame:
+        """Map this session's FOVs onto the ScanImage Roi and slice each was imaged at.
 
         Parameters
         ----------
@@ -1486,11 +1511,14 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
         Returns
         -------
-        dict
-            Map of FOV name, e.g. 'FOV_00', to the ScanImage ROI UUID of that FOV, named
-            after the order in which the FOVs appear in the metadata.
+        pandas.DataFrame
+            One row per FOV, in the order of the IBL FOV numbering, with the columns "index"
+            (image id), "z" (raw ScanImage z in µm), "uuid" (ScanImage Roi uuid) and
+            "fov_name" (e.g. 'FOV_00').
         """
-        return {f"FOV_{i:02}": fov["roiUUID"] for i, fov in enumerate(raw_imaging_meta["FOV"])}
+        fov_map = get_image_map(raw_imaging_meta["rawScanImageMeta"])
+        fov_map["fov_name"] = [f"FOV_{i:02}" for i in fov_map["index"]]
+        return fov_map
 
     def update_metadata_locations(
         self,
@@ -1526,9 +1554,13 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             If a FOV UUID is not found in the metadata, or is found more than once.
         """
         provenance = self.provenance.name.lower()
-        for fov_uuid, mlapdv in mean_images_mlapdv.items():
-            ids = mean_images_ids[fov_uuid]
-            (fov,) = [fov for fov in meta["FOV"] if fov["roiUUID"] == fov_uuid]
+        fov_map = self.get_fov_map(meta)
+        for fov_name, mlapdv in mean_images_mlapdv.items():
+            ids = mean_images_ids[fov_name]
+
+            # not pretty but should be robust
+            ix = fov_map.set_index("fov_name").loc[fov_name, "index"]
+            fov = meta["FOV"][ix]
 
             # the locations go under the current provenance, so their dict has to exist first.
             # `setdefault` keeps a rerun additive: assigning `{}` would drop the other
@@ -1554,7 +1586,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                 "bottomRight": int(ids[-1, -1]),
                 "center": int(ids[center_row, center_column]),
             }
-            _logger.debug("%s: %s locations added to the metadata", fov_uuid, provenance)
+            _logger.debug("%s: %s locations added to the metadata", fov_name, provenance)
 
     def delete_registered_fovs(self):
         """Delete this session's FOVs of the current provenance from Alyx.
@@ -1594,7 +1626,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             The provenance of the FOV location.
         check_integrity : bool
             Whether to check that the number of FOVs in Alyx matches the number in the meta data.
-            A previous issue with multidepth recordings caused more FOVs to be registered than expected.
+            A previous issue with multidepth recordings caused more FOVs to be registered than
+            expected.
             This check marks extraneous FOVs in Alyx with a data integrity error timestamp
             in the JSON field. Only runs when `register_data` is set.
 
@@ -1605,7 +1638,8 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
         """
         alyx_fovs = []
-        # Count the number of slices per stack ID: only register stacks that contain more than one slice.
+        # Count the number of slices per stack ID: only register stacks that contain more than one
+        # slice.
         slice_counts = Counter(f["roiUUID"] for f in meta.get("FOV", []))
         # Create a new stack in Alyx for all stacks containing more than one slice.
         # Map of ScanImage ROI UUID to Alyx ImageStack UUID.

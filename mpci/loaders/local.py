@@ -424,7 +424,10 @@ class RawImagingMetadataLoader(DataLoader):
         self.validate_across_bouts()
 
     def validate_across_bouts(self, metadata_per_bout: list[dict] | None = None) -> None:
-        """Check that the metadata of every imaging bout agrees on the FOV geometry.
+        """Check that the metadata of every imaging bout agrees on the Roi geometry.
+
+        Only the enabled Rois are compared, as only they are imaged; a Roi enabled in one bout
+        but not in another fails the check.
 
         Parameters
         ----------
@@ -436,23 +439,34 @@ class RawImagingMetadataLoader(DataLoader):
         FileNotFoundError
             If no imaging bout has a metadata file and none was given.
         AssertionError
-            If the FOV UUIDs, or a FOV's size or center, differ between imaging bouts.
+            If the enabled Roi UUIDs, or the number, size or center of a Roi's scanfields,
+            differ between imaging bouts.
         """
         metadata_all = metadata_per_bout or self.load_per_bout()
 
         # the pipeline assumes that the scanimage related information regarding
-        # FOV location and size is consistent across all imaging bouts
+        # Roi location and size is consistent across all imaging bouts
         # assert this here
         for metadata in metadata_all:
-            # all have the same roi UUIDs
-            fov_uuids = scanimage._get_fov_uuids(metadata["rawScanImageMeta"])
-            assert fov_uuids == scanimage._get_fov_uuids(metadata_all[0]["rawScanImageMeta"])
-            for fov_uuid in fov_uuids:
-                fov_meta = scanimage.get_fov_meta(metadata["rawScanImageMeta"], fov_uuid)
-                _fov_meta = scanimage.get_fov_meta(metadata_all[0]["rawScanImageMeta"], fov_uuid)
-                keys = ["sizeXY", "centerXY"]
-                for key in keys:
-                    assert fov_meta["scanfields"][key] == _fov_meta["scanfields"][key]
+            # all have the same enabled roi UUIDs
+            roi_uuids = scanimage._get_uuids(metadata["rawScanImageMeta"], enabled_only=True)
+            assert roi_uuids == scanimage._get_uuids(
+                metadata_all[0]["rawScanImageMeta"], enabled_only=True
+            )
+            for roi_uuid in roi_uuids:
+                roi_meta = scanimage.get_roi_meta(metadata["rawScanImageMeta"], roi_uuid)
+                _roi_meta = scanimage.get_roi_meta(metadata_all[0]["rawScanImageMeta"], roi_uuid)
+                # a Roi holds one scanfield, or a list of them where it changes across z
+                scanfields, _scanfields = (
+                    meta["scanfields"]
+                    if isinstance(meta["scanfields"], list)
+                    else [meta["scanfields"]]
+                    for meta in (roi_meta, _roi_meta)
+                )
+                assert len(scanfields) == len(_scanfields)
+                for scanfield, _scanfield in zip(scanfields, _scanfields):
+                    for key in ("sizeXY", "centerXY"):
+                        assert scanfield[key] == _scanfield[key]
 
 
 class ReferenceStackLoader(DataLoader):
