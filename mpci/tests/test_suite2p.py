@@ -17,6 +17,7 @@ import sparse
 
 from mpci.tests import TEST_DB, IntegrationTestCase
 from mpci.suite2p.task import MesoscopePreprocess
+from mpci.suite2p.qc import get_neural_quality_metrics
 
 # Mock suit2p which is imported in MesoscopePreprocess
 attrs = {'default_ops.return_value': {}}
@@ -370,6 +371,27 @@ class TestMesoscopePreprocess(IntegrationTestCase):
             p.joinpath(f'plane{i}').mkdir()
             np.save(p.joinpath(f'plane{i}', 'ops.npy'), ops)
         return ops
+
+
+class TestQM(unittest.TestCase):
+    """Test for get_neural_quality_metrics function."""
+    def setUp(self):
+        self.session_path = self.default_data_root().joinpath('mesoscope', 'SP037', '2023-03-23', '002')
+        self.alf_path = self.session_path.joinpath('suite2p', 'plane2')
+
+    def test_neural_qm(self):
+        F = np.load(self.alf_path / 'F.npy').T
+        Fneu = np.load(self.alf_path / 'Fneu.npy').T
+        iscell = np.load(self.alf_path / 'iscell.npy')
+        neural_metrics, fov_metrics = get_neural_quality_metrics(F, Fneu, iscell=iscell[:, 0].astype(bool))
+        expected = {'noise_level', 'mean', 'std', 'skew'}
+        self.assertCountEqual(expected, neural_metrics)
+        np.testing.assert_approx_equal(neural_metrics['noise_level'], 3.8925, significant=5)
+        np.testing.assert_approx_equal(neural_metrics['mean'], 983.0024)
+        np.testing.assert_approx_equal(neural_metrics['std'], 120.6435)
+        np.testing.assert_approx_equal(neural_metrics['skew'], 1.0478, significant=5)
+        self.assertCountEqual(expected, fov_metrics.dtype.names)
+        self.assertTrue(all(fov_metrics[x].size == F.shape[1] for x in expected))
 
 
 if __name__ == '__main__':
