@@ -171,6 +171,7 @@ class MasknmfPreprocess(MesoscopeTask):
             return False  # Compressed files missing; return
         files = flatten(files)
         logger.info('Decompressing %i file(s)', len(files))
+        keep_decompressed = kwargs.get('keep_decompressed', False)
         for file in files:
             cmd = 'tar -xvjf "{input}"'.format(input=file.name)
             logger.debug(cmd)
@@ -180,7 +181,8 @@ class MasknmfPreprocess(MesoscopeTask):
             tifs = [file.parent.joinpath(x.split()[-1]) for x in stdout.decode().splitlines() if x.endswith('.tif')]
             assert process.returncode == 0 and len(tifs) > 0
             assert all(map(Path.exists, tifs))
-            self._teardown_files.extend(tifs)
+            if not keep_decompressed:
+                self._teardown_files.extend(tifs)
         return all_files_present
 
     def tearDown(self):
