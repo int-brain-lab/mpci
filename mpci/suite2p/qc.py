@@ -10,6 +10,7 @@ from pathlib import PurePosixPath
 from functools import wraps
 
 import numpy as np
+import scipy.signal
 import scipy.stats
 from one.alf import spec
 from one.alf.spec import is_uuid
@@ -110,6 +111,115 @@ def get_neural_quality_metrics(F, Fneu, badframes=None, iscell=None, F0_percenti
     # return all the FOV-wide mean quality metrics in a struct
     neural_metrics = {k: np.nanmean(v[iscell]) for k, v in metrics.items()}
     return neural_metrics, fov_metrics
+
+
+def multitaper_psd(x, fs, time_bandwidth=6):
+    """Multitaper power spectral density estimate using Thomson's adaptive weighting.
+
+    This is a port of MATLAB's `pmtm` with default options, i.e. `2 * time_bandwidth - 1`
+    DPSS tapers (last taper dropped), `nfft = max(256, 2 ** nextpow2(N))` and adaptive
+    weighting of the eigenspectra. The mean is removed before estimating the spectrum.
+
+    Parameters
+    ----------
+    x : numpy.array
+        A 1D timeseries. Non-finite samples are removed.
+    fs : float
+        The sampling rate of the timeseries in Hz.
+    time_bandwidth : float
+        The time-bandwidth product (NW) of the DPSS tapers (default = 6).
+
+    Returns
+    -------
+    numpy.array
+        One-sided power spectral density estimate (power / Hz).
+    numpy.array
+        The frequency of each spectral bin in Hz.
+    """
+    x = np.asarray(x, dtype=float).ravel()
+    x = x[np.isfinite(x)]
+    if x.size < 2:
+        raise ValueError('timeseries must contain at least two finite samples')
+    if fs <= 0:
+        raise ValueError('fs must be positive')
+    x = x - x.mean()
+    N = x.size
+    nfft = max(256, 2 ** int(np.ceil(np.log2(N))))
+    k = max(min(round(2 * time_bandwidth), N) - 1, 1)
+    tapers, V = scipy.signal.windows.dpss(N, time_bandwidth, Kmax=k, return_ratios=True)
+    Sk = np.abs(np.fft.fft(tapers * x, n=nfft, axis=-1)) ** 2  # k x nfft eigenspectra
+
+    if k == 1:
+        S = Sk[0]
+    else:
+        # Thomson's adaptive weighting (Percival & Walden 1993, p. 368)
+        sig2 = x @ x / N
+        S = Sk[:2].mean(axis=0)
+        S1 = np.zeros(nfft)
+        tol = .0005 * sig2 / nfft
+        a = sig2 * (1 - V)
+        while np.sum(np.abs(S - S1)) / nfft > tol:
+            b = S[:, np.newaxis] / (S[:, np.newaxis] * V + a)
+            wk = b ** 2 * V
+            S, S1 = np.sum(wk * Sk.T, axis=1) / np.sum(wk, axis=1), S
+
+    # Convert to one-sided PSD
+    n_freq = nfft // 2 + 1
+    psd = S[:n_freq] / fs
+    psd[1:n_freq - (nfft % 2 == 0)] *= 2  # don't double DC or Nyquist
+    freq = np.arange(n_freq) * fs / nfft
+    return psd, freq
+
+
+def get_low_freq_power_fraction(tPC, fs, n_frames, low_freq_cutoff=.01, n_pcs=30,
+                                time_bandwidth=6):
+    """Compute the fraction of power at low frequencies for each registration PC.
+
+    Suite2p computes the PCs of a subsample of registered frames (ops['tPC']). Slow Z drift
+    causes these PCs to be dominated by slow, low frequency changes. For each PC timecourse,
+    the multitaper power spectrum is computed and the power below `low_freq_cutoff` is
+    returned as a fraction of the total power (excluding DC).
+
+    Parameters
+    ----------
+    tPC : numpy.array
+        The PC timecourses (nSamples by nPCs), i.e. ops['tPC'].
+    fs : float
+        The imaging frame rate in Hz, i.e. ops['fs'].
+    n_frames : int
+        The total number of imaging frames from which the tPC samples were drawn, i.e.
+        ops['nframes']. The samples are assumed to be evenly spaced across the recording.
+    low_freq_cutoff : float
+        The upper frequency in Hz defining the low frequency band (default = 0.01).
+    n_pcs : int
+        The maximum number of PCs to compute the metric for (default = 30).
+    time_bandwidth : float
+        The time-bandwidth product of the multitaper spectral estimate (default = 6).
+
+    Returns
+    -------
+    numpy.array
+        The low frequency power fraction for each PC, between 0 and 1. NaN where the total
+        power is zero or no frequencies fall within the low frequency band.
+    """
+    tPC = np.asarray(tPC)
+    if tPC.ndim != 2:
+        raise ValueError('tPC must be a 2D array of samples by PCs')
+    n_samples = tPC.shape[0]
+    recording_duration = n_frames / fs
+    tPC_sample_rate = n_samples / recording_duration
+
+    n_pcs = min(n_pcs, tPC.shape[1])
+    low_freq_fraction = np.full(n_pcs, np.nan)
+    for i in range(n_pcs):
+        psd, freq = multitaper_psd(tPC[:, i], tPC_sample_rate, time_bandwidth=time_bandwidth)
+        valid = (freq > 0) & np.isfinite(psd)  # ignore DC
+        psd, freq = psd[valid], freq[valid]
+        low = freq <= low_freq_cutoff
+        total_power = np.trapezoid(psd, freq)
+        if total_power > 0 and np.any(low):
+            low_freq_fraction[i] = np.trapezoid(psd[low], freq[low]) / total_power
+    return low_freq_fraction
 
 
 def return_qc_datasets(datasets):
@@ -218,8 +328,8 @@ class MesoscopeQC(base.QC):
             self.data['F'] = np.load(alf_path.joinpath('F.npy'))
             self.data['Fneu'] = np.load(alf_path.joinpath('Fneu.npy'))
             self.data['iscell'] = np.load(alf_path.joinpath('iscell.npy'))
-            self.data['badframes'] = np.load(alf_path.joinpath('mpci.badFrames.npy.npy'))
             self.data['ops'] = np.load(alf_path.joinpath('ops.npy'), allow_pickle=True).item()
+            self.data['badframes'] = np.asarray(self.data['ops']['badframes'], dtype=bool)
             self.data['times'] = None
         else:
             raise ValueError(f'Invalid session identifier: {self.eid}')
@@ -232,6 +342,40 @@ class MesoscopeQC(base.QC):
 
         # TODO Apply thresholds
         return spec.QC.NOT_SET, neural_metrics  # Don't return fov_metric as this is one per cell which is large
+
+    @return_qc_datasets(['mpci.ROIActivityF.npy', 'mpci.ROINeuropilActivityF.npy',
+                         'mpci.ROIActivityDeconvolved.npy'])
+    def check_z_drift(self, threshold=.5, **kwargs):
+        """Check for slow Z drift using the low frequency power of the registration PCs.
+
+        In a session with slow Z drift, all registration PCs are dominated by low frequency
+        changes. The check fails if the low frequency power fraction of every PC exceeds
+        the threshold.
+
+        Parameters
+        ----------
+        threshold : float
+            The low frequency power fraction above which all PCs must be for the check to fail.
+        **kwargs
+            Optional keyword arguments passed to `get_low_freq_power_fraction`.
+
+        Returns
+        -------
+        one.alf.spec.QC
+            The QC outcome.
+        list of float
+            The low frequency power fraction for each PC.
+        """
+        ops = self.data['ops']
+        if 'tPC' not in ops:
+            _log.warning('ops does not contain registration PCs; skipping Z drift check')
+            return spec.QC.NOT_SET
+        n_frames = ops.get('nframes', self.data['badframes'].size)
+        fraction = get_low_freq_power_fraction(ops['tPC'], ops['fs'], n_frames, **kwargs)
+        if np.all(np.isnan(fraction)):
+            return spec.QC.NOT_SET, fraction.tolist()
+        outcome = spec.QC.FAIL if np.nanmin(fraction) > threshold else spec.QC.PASS
+        return outcome, fraction.tolist()
 
     @return_qc_datasets(['mpci.times.npy'])
     def check_timestamps_consistency(self, **kwargs):
