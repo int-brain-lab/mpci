@@ -17,7 +17,9 @@ import sparse
 
 from mpci.tests import TEST_DB, IntegrationTestCase
 from mpci.suite2p.task import MesoscopePreprocess
-from mpci.suite2p.qc import get_neural_quality_metrics
+from one.alf import spec
+from mpci.suite2p.qc import (
+    get_neural_quality_metrics, multitaper_psd, get_low_freq_power_fraction, MesoscopeQC)
 
 # Mock suit2p which is imported in MesoscopePreprocess
 attrs = {'default_ops.return_value': {}}
@@ -373,7 +375,7 @@ class TestMesoscopePreprocess(IntegrationTestCase):
         return ops
 
 
-class TestQM(unittest.TestCase):
+class TestQM(IntegrationTestCase):
     """Test for get_neural_quality_metrics function."""
     def setUp(self):
         self.session_path = self.default_data_root().joinpath('mesoscope', 'SP037', '2023-03-23', '002')
@@ -392,6 +394,58 @@ class TestQM(unittest.TestCase):
         np.testing.assert_approx_equal(neural_metrics['skew'], 1.0478, significant=5)
         self.assertCountEqual(expected, fov_metrics.dtype.names)
         self.assertTrue(all(fov_metrics[x].size == F.shape[1] for x in expected))
+
+
+class TestZDrift(unittest.TestCase):
+    """Test for Z drift QC metric based on the registration PCs."""
+
+    def setUp(self):
+        self.rng = np.random.default_rng(0)
+        self.fs, self.n_frames = 5., 5 * 3600  # 1 hour at 5 Hz
+
+    def test_multitaper_psd(self):
+        x = self.rng.standard_normal(2000)
+        psd, freq = multitaper_psd(x, .5)
+        self.assertEqual(1025, psd.size)  # nfft = 2048
+        self.assertEqual(.25, freq[-1])
+        # Total power should equal the variance (Parseval)
+        self.assertAlmostEqual(x.var(), np.trapezoid(psd, freq), places=2)
+        # Peak should be at the frequency of a sinusoid
+        t = np.arange(2000) / .5
+        psd, freq = multitaper_psd(np.sin(2 * np.pi * .05 * t), .5)
+        self.assertAlmostEqual(.05, freq[np.argmax(psd)], delta=freq[1] * 3)
+        self.assertRaises(ValueError, multitaper_psd, [1., np.nan], .5)
+
+    def test_get_low_freq_power_fraction(self):
+        # White noise power should be evenly distributed across frequencies
+        tPC = self.rng.standard_normal((2000, 40))
+        fraction = get_low_freq_power_fraction(tPC, self.fs, self.n_frames)
+        self.assertEqual(30, fraction.size)
+        nyquist = 2000 / (self.n_frames / self.fs) / 2
+        np.testing.assert_allclose(fraction, .01 / nyquist, atol=.02)
+        # Drifting PCs should be dominated by low frequencies
+        fraction = get_low_freq_power_fraction(np.cumsum(tPC, axis=0), self.fs, self.n_frames)
+        self.assertTrue(np.all(fraction > .9))
+        # A flat PC has no power
+        tPC[:, 0] = 1
+        fraction = get_low_freq_power_fraction(tPC, self.fs, self.n_frames, n_pcs=2)
+        self.assertTrue(np.isnan(fraction[0]))
+        self.assertFalse(np.isnan(fraction[1]))
+
+    def test_check_z_drift(self):
+        ops = {'fs': self.fs, 'nframes': self.n_frames}
+        qc = mock.Mock(data={'ops': ops, 'badframes': np.zeros(10)})
+        self.assertIs(MesoscopeQC.check_z_drift(qc), spec.QC.NOT_SET)
+        qc.data['ops']['tPC'] = np.cumsum(self.rng.standard_normal((2000, 30)), axis=0)
+        outcome, fraction = MesoscopeQC.check_z_drift(qc)
+        self.assertIs(outcome, spec.QC.FAIL)
+        self.assertEqual(30, len(fraction))
+        qc.data['ops']['tPC'][:, -1] = self.rng.standard_normal(2000)
+        outcome, _ = MesoscopeQC.check_z_drift(qc)
+        self.assertIs(outcome, spec.QC.PASS)
+        expected = ['mpci.ROIActivityF.npy', 'mpci.ROINeuropilActivityF.npy',
+                    'mpci.ROIActivityDeconvolved.npy']
+        self.assertEqual(expected, MesoscopeQC.check_z_drift(qc, only_dsets=True))
 
 
 if __name__ == '__main__':
