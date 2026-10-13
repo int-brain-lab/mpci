@@ -171,7 +171,7 @@ class MasknmfPreprocess(MesoscopeTask):
             return False  # Compressed files missing; return
         files = flatten(files)
         logger.info('Decompressing %i file(s)', len(files))
-        keep_decompressed = kwargs.get('keep_decompressed', False)
+        keep_decompressed = kwargs.pop('keep_decompressed', False)
         for file in files:
             cmd = 'tar -xvjf "{input}"'.format(input=file.name)
             logger.debug(cmd)
