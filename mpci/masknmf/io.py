@@ -169,7 +169,7 @@ class ScanImageTiffSeriesLoader(LazyFrameLoader):
             self._memmaps: list[np.ndarray | None] = []
             for fp in file_paths:
                 try:
-                    self._memmaps.append(tifffile.memmap(fp))
+                    self._memmaps.append(tifffile.memmap(fp, mode='r'))
                 except (ValueError, tifffile.TiffFileError):
                     self._memmaps.append(None)
 
