@@ -34,7 +34,8 @@ class TestTaskRouting(unittest.TestCase):
             except ImportError:  # optional dependencies not installed in this environment
                 continue
             for name, cls in inspect.getmembers(module, inspect.isclass):
-                if issubclass(cls, Task) and cls.__module__ == module.__name__:
+                # Abstract base classes (e.g. SubjectAggregateTask) are never run so aren't routed
+                if issubclass(cls, Task) and cls.__module__ == module.__name__ and not inspect.isabstract(cls):
                     executable = f'{cls.__module__}.{name}'
                     with self.subTest(executable=executable):
                         self.assertEqual(cls.env, task_env(executable))
