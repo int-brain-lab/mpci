@@ -16,7 +16,7 @@ uv venv --python "${PY_VERSION}" /workspace/venv
 source /workspace/venv/bin/activate
 
 echo "Installing project + coverage tooling"
-uv pip install -e .
+uv pip install -e ".[masknmf]"
 uv pip install coverage coveralls
 
 echo "Env ready ($(python --version))"
