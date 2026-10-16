@@ -284,7 +284,7 @@ class MasknmfPreprocess(MesoscopeTask):
                 max_rigid_shifts=max_rigid_shifts,  # around 25
                 max_deviation_rigid=(3, 3)
             )
-            FRAME_BATCH_SIZE = 2000
+            FRAME_BATCH_SIZE = 300 ## Optimized for a 24GB card here
             pipeline = masknmf.TwoPhotonCalciumPipeline(
                 motion_correct_config=motion_config,
                 compress_config=masknmf.CompressDenoiseConfig(block_sizes=(32, 32)),
