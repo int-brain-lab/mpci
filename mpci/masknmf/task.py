@@ -267,22 +267,10 @@ class MasknmfPreprocess(MesoscopeTask):
             # metadata_file = bin_file.with_name('ops.npy')
             # moco_data = MotionBinDataset(bin_file, metadata_file)
             (out_path := self.session_path.joinpath(f'alf/FOV_{i:02d}/masknmf')).mkdir(exist_ok=True)
-            out_demix_path = out_path / 'demixing.hdf5'
             out_roi_masks = out_path / 'mpciROIs.masks.sparse_npz'
             out_stack_pos = out_path / 'mpciROIs.stackPos.npy'
             out_fluorescence_traces = out_path / 'mpci.ROIActivityF.npy'
             out_deconvolved_traces = out_path / 'mpci.ROIActivityDeconvolved.npy'
-            out_motion_corrected = out_demix_path.with_stem('moco_shifts')
-            if out_motion_corrected.exists():
-                logger.info(f'Removing existing motion correction file at {out_motion_corrected}')
-                out_motion_corrected.unlink()
-            out_compressed = out_demix_path.with_stem('compressed')
-            if out_compressed.exists():
-                logger.info(f'Removing existing compressed file at {out_compressed}')
-                out_compressed.unlink()
-            if out_demix_path.exists():
-                logger.info(f'Removing existing demixing file at {out_demix_path}')
-                out_demix_path.unlink()
 
             frames = get_frame_loader(device_collections, i, meta=metadata)
             if load_into_ram:
@@ -301,18 +289,17 @@ class MasknmfPreprocess(MesoscopeTask):
                 motion_correct_config=motion_config,
                 compress_config=masknmf.CompressDenoiseConfig(block_sizes=(32, 32)),
                 frame_batch_size=FRAME_BATCH_SIZE,
-                outpath_motion_correction=out_motion_corrected,  # This will eventually be removed,
-                outpath_compression=out_compressed,
-                outpath_demixing=out_demix_path)
+                output_folder=out_path)
             # Get the frame rate for the FOV
             ts = np.load(self.session_path.joinpath(f'alf/FOV_{i:02d}/mpci.times.npy'))
             Fs = 1 / np.mean(np.diff(ts))
             logger.info(f'Running masknmf on FOV_{i:02d} with frame rate {Fs:.2f} Hz')
-            demixing_results = pipeline.run(frames,
+            results_folder = pipeline.run(frames,
                                             Fs,
                                             exclude_border_radius=8,
                                             remove_intermediates=False)
-
+            out_demix_path = Path(results_folder) / "results.hdf5"
+            demixing_results = masknmf.DemixingResults.from_hdf5(out_demix_path)
             logger.info(f'Saving results for FOV_{i:02d}')
             F, Deconv_F, masks = self._format_to_mpci(demixing_results)
             np.save(out_fluorescence_traces, F)
