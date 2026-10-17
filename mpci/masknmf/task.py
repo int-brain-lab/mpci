@@ -294,7 +294,7 @@ class MasknmfPreprocess(MesoscopeTask):
             ts = np.load(self.session_path.joinpath(f'alf/FOV_{i:02d}/mpci.times.npy'))
             Fs = 1 / np.mean(np.diff(ts))
             logger.info(f'Running masknmf on FOV_{i:02d} with frame rate {Fs:.2f} Hz')
-            demixing_results = pipeline.run(frames,
+            results_folder = pipeline.run(frames,
                                             Fs,
                                             exclude_border_radius=8,
                                             remove_intermediates=False)
