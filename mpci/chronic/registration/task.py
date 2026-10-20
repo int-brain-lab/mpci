@@ -43,17 +43,56 @@ class MesoscopeFOV(MesoscopeTask):
 
     priority = 40
     job_size = 'small'
+    roi_algorithms = ('suite2p', 'masknmf')
+    """tuple of str: The supported ROI extraction algorithms, i.e. the ROI subcollection names."""
+
+    def __init__(self, session_path, roi_algorithm='suite2p', **kwargs):
+        """
+        Parameters
+        ----------
+        session_path : str, pathlib.Path
+            The session path.
+        roi_algorithm : {'suite2p', 'masknmf'}
+            The algorithm that extracted the ROIs. The ROI datasets are loaded from and saved to the
+            'alf/FOV_??/<roi_algorithm>' collection, while the mean image datasets are in 'alf/FOV_??'.
+        """
+        if roi_algorithm not in self.roi_algorithms:
+            raise ValueError(f'roi_algorithm must be one of {self.roi_algorithms}, not "{roi_algorithm}"')
+        self.roi_algorithm = roi_algorithm
+        # NB: Passed to the superclass so that it's stored in the task arguments
+        super().__init__(session_path, roi_algorithm=roi_algorithm, **kwargs)
+
+    @property
+    def roi_collection(self):
+        """str: The collection pattern of the ROI datasets."""
+        return f'alf/FOV_??/{self.roi_algorithm}'
+
+    def roi_path(self, n):
+        """
+        Return the location of the ROI datasets for a given field of view.
+
+        Parameters
+        ----------
+        n : int
+            The field of view number.
+
+        Returns
+        -------
+        pathlib.Path
+            The ROI dataset folder, i.e. session_path/alf/FOV_<n>/<roi_algorithm>.
+        """
+        return self.session_path.joinpath('alf', f'FOV_{n:02}', self.roi_algorithm)
 
     @property
     def signature(self):
         I = dh.ExpectedDataset.input  # noqa
         signature = {
             'input_files': [I('_ibl_rawImagingData.meta.json', self.device_collection, True),
-                            I('mpciROIs.stackPos.npy', 'alf/FOV*', True)],
+                            I('mpciROIs.stackPos.npy', self.roi_collection, True, unique=False)],
             'output_files': [('mpciMeanImage.brainLocationIds*.npy', 'alf/FOV_*', True),
                              ('mpciMeanImage.mlapdv*.npy', 'alf/FOV_*', True),
-                             ('mpciROIs.mlapdv*.npy', 'alf/FOV_*', True),
-                             ('mpciROIs.brainLocationIds*.npy', 'alf/FOV_*', True),
+                             ('mpciROIs.mlapdv*.npy', self.roi_collection, True),
+                             ('mpciROIs.brainLocationIds*.npy', self.roi_collection, True),
                              ('_ibl_rawImagingData.meta.json', self.device_collection, True)]
         }
         return signature
@@ -121,10 +160,10 @@ class MesoscopeFOV(MesoscopeTask):
         roi_files = []
         assert set(roi_mlapdv.keys()) == set(roi_brain_ids.keys()) and len(roi_mlapdv) == nFOV
         for i in range(nFOV):
-            alf_path = self.session_path.joinpath('alf', f'FOV_{i:02}')
+            roi_path = self.roi_path(i)
             for attr, arr, sfx in (('mlapdv', roi_mlapdv[i], suffix),
                                    ('brainLocationIds', roi_brain_ids[i], ('ccf', '2017', suffix))):
-                roi_files.append(alf_path / to_alf('mpciROIs', attr, 'npy', timescale=sfx))
+                roi_files.append(roi_path / to_alf('mpciROIs', attr, 'npy', timescale=sfx))
                 np.save(roi_files[-1], arr)
 
         # Register FOVs in Alyx
@@ -200,9 +239,9 @@ class MesoscopeFOV(MesoscopeTask):
             alf_path = self.session_path.joinpath('alf', f'FOV_{n:02}')
 
             # Load neuron centroids in pixel space
-            stack_pos_file = next(alf_path.glob('mpciROIs.stackPos*'), None)
+            stack_pos_file = next(self.roi_path(n).glob('mpciROIs.stackPos*'), None)
             if not stack_pos_file:
-                raise FileNotFoundError(alf_path / 'mpci.stackPos*')
+                raise FileNotFoundError(self.roi_path(n) / 'mpciROIs.stackPos*')
             stack_pos = alfio.load_file_content(stack_pos_file)
 
             # Load MLAPDV + brain location ID maps of pixels
@@ -592,7 +631,7 @@ class MesoscopeFOVHistology(MesoscopeFOV):
         I = dh.ExpectedDataset.input  # noqa
         signature = {
             'input_files': [I('_ibl_rawImagingData.meta.json', self.device_collection, True),
-                            I('mpciROIs.stackPos.npy', 'alf/FOV*', True),
+                            I('mpciROIs.stackPos.npy', self.roi_collection, True, unique=False),
                             # New additions  # FIXME should be self.device_collection (may require patching exp desc files)
                             I('referenceImage.stack.tif', 'raw_imaging_data_??/reference', True, unique=True),
                             I('referenceImage.meta.json', 'raw_imaging_data_??/reference', True, unique=True),
@@ -601,8 +640,8 @@ class MesoscopeFOVHistology(MesoscopeFOV):
                             ],
             'output_files': [('mpciMeanImage.brainLocationIds.npy', 'alf/FOV_*', True),
                              ('mpciMeanImage.mlapdv.npy', 'alf/FOV_*', True),
-                             ('mpciROIs.mlapdv.npy', 'alf/FOV_*', True),
-                             ('mpciROIs.brainLocationIds.npy', 'alf/FOV_*', True),
+                             ('mpciROIs.mlapdv.npy', self.roi_collection, True),
+                             ('mpciROIs.brainLocationIds.npy', self.roi_collection, True),
                              ('_ibl_rawImagingData.meta.json', self.device_collection, True),
                              ('referenceImage.meta.json', 'raw_imaging_data_??/reference', True)]
         }
@@ -693,10 +732,10 @@ class MesoscopeFOVHistology(MesoscopeFOV):
         roi_files = []
         assert set(roi_mlapdv.keys()) == set(roi_brain_ids.keys()) and len(roi_mlapdv) == nFOV
         for i in range(nFOV):
-            alf_path = self.session_path.joinpath('alf', f'FOV_{i:02}')
+            roi_path = self.roi_path(i)
             for attr, arr, sfx in (('mlapdv', roi_mlapdv[i], suffix),
                                    ('brainLocationIds', roi_brain_ids[i], ('ccf', '2017', suffix))):
-                roi_files.append(alf_path / to_alf('mpciROIs', attr, 'npy', timescale=sfx))
+                roi_files.append(roi_path / to_alf('mpciROIs', attr, 'npy', timescale=sfx))
                 np.save(roi_files[-1], arr)
 
         if display:
@@ -878,7 +917,7 @@ class MesoscopeFOVHistology(MesoscopeFOV):
             ax.add_patch(rect)
 
             # Plot the mean image for the FOV
-            img_path = self.session_path.joinpath('alf', f'FOV_{i:02}', 'mpciMeanImage.images.npy')
+            img_path = self.roi_path(i) / 'mpciMeanImage.images.npy'
             if img_path.exists():
                 img = np.load(img_path)
                 img = cv2.normalize(img, img, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)

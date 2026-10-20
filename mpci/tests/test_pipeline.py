@@ -71,6 +71,7 @@ class TestPlan(unittest.TestCase):
         executable = specs['MesoscopePreprocess'].executable
         self.assertEqual('mpci.suite2p.task.MesoscopePreprocess', executable)
         self.assertEqual(['MesoscopePreprocess'], specs['MesoscopeFOV'].parents)
+        self.assertEqual('suite2p', specs['MesoscopeFOV'].arguments['roi_algorithm'])
         arguments = specs['MesoscopeSync'].arguments
         self.assertEqual('raw_imaging_data*', arguments['device_collection'])
         self.assertEqual('timeline', arguments['sync_namespace'])

@@ -193,7 +193,7 @@ class MesoscopePreprocess(MesoscopeTask):
                 bin_file.rename(plane_dir.joinpath('imaging.frames_motionRegistered.bin'))
             # Archive the raw suite2p output before renaming
             n = int(plane_dir.name.split('plane')[1])
-            fov_dir = self.session_path.joinpath('alf', f'FOV_{n:02}')
+            fov_dir = self.session_path.joinpath('alf', f'FOV_{n:02}', 'suite2p')
             if fov_dir.exists():
                 for f in filter(Path.exists, map(fov_dir.joinpath, fov_dsets)):
                     _logger.debug('Removing old file %s', f.relative_to(self.session_path))
@@ -237,7 +237,7 @@ class MesoscopePreprocess(MesoscopeTask):
                 if path.name != 'ops.npy' and path.suffix != '.bin':
                     path.unlink() if path.is_file() else path.rmdir()
         # Collect all files in those directories
-        datasets = self.session_path.joinpath('alf').rglob('FOV_??/*.*.*')
+        datasets = self.session_path.joinpath('alf').rglob('FOV_??/suite2p/*.*.*')
         return sorted(x for x in datasets if x.name in fov_dsets)
 
     @staticmethod

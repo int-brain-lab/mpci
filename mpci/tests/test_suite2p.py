@@ -233,6 +233,8 @@ class TestMesoscopePreprocessRename(IntegrationTestCase):
         task = MesoscopePreprocess(session_path, one=self.one)
         files = task._rename_outputs(self.suite2pdir.parent, None, None)
         self.assertTrue(all(map(Path.exists, files)))
+        # Check files saved to the output signature collection
+        self.assertEqual({'alf/FOV_02/suite2p'}, {f.relative_to(session_path).parent.as_posix() for f in files})
         self.assertTrue(self.suite2pdir.exists())
         # Check that other files were removed (note: there's no bin file in this test)
         self.assertEqual({'ops.npy'}, set(x.name for x in self.suite2pdir.rglob('*.*')))
@@ -271,11 +273,12 @@ class TestMesoscopePreprocessRename(IntegrationTestCase):
         """
         # Create an old FOV folder for it to remove
         session_path = get_session_path(self.suite2pdir)
-        (fov_folder := session_path.joinpath('alf', 'FOV_02')).mkdir(parents=True)
+        (fov_folder := session_path.joinpath('alf', 'FOV_02', 'suite2p')).mkdir(parents=True)
         for name in self.rename_dict.values():
             fov_folder.joinpath(name).touch()
-        # Should not delete other files from this folder
+        # Should not delete other files from this folder or the parent FOV folder
         fov_folder.joinpath('mpci.times.npy').touch()
+        fov_folder.parent.joinpath('mpci.times.npy').touch()
 
         # Create binary data files
         self.suite2pdir.joinpath('data.bin').touch()
@@ -292,6 +295,7 @@ class TestMesoscopePreprocessRename(IntegrationTestCase):
         self.assertEqual(len(self.rename_dict), len(log_messages))
         self.assertNotIn('mpci.times.npy', ' '.join(log_messages))
         self.assertTrue(fov_folder.joinpath('mpci.times.npy').exists())
+        self.assertTrue(fov_folder.parent.joinpath('mpci.times.npy').exists())
         # Check frameQC is saved
         self.assertIn(files[0].with_name('mpciFrameQC.names.tsv'), files)
         self.assertIn(files[0].with_name('mpci.mpciFrameQC.npy'), files)
