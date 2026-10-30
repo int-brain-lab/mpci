@@ -87,9 +87,14 @@ class MesoscopeTask(DynamicTask):
         """
         # Ignore the things we don't expect to match
         ignore = ('acquisitionStartTime', 'nFrames')
-        ignore_sub = {'rawScanImageMeta': ('ImageDescription', 'Software')}
+        # NB: The FOV location fields are only filled in for the first imaging bout
+        ignore_sub = {'rawScanImageMeta': ('ImageDescription', 'Software'),
+                      'FOV': ('MLAPDV', 'brainLocationIds')}
 
         def equal_dicts(a, b, skip=None):
+            if isinstance(a, list):  # compare lists of dicts, e.g. FOVs, element-wise
+                return (isinstance(b, list) and len(a) == len(b) and
+                        all(equal_dicts(x, y, skip) for x, y in zip(a, b)))
             ka = set(a).difference(skip or ())
             kb = set(b).difference(skip or ())
             return ka == kb and all(a[key] == b[key] for key in ka)
@@ -98,9 +103,15 @@ class MesoscopeTask(DynamicTask):
         for meta in meta_data_all[1:]:
             if meta != meta_data_all[0]:  # compare entire object first
                 for k, v in meta_data_all[0].items():  # check key by key
-                    if not (equal_dicts(v, meta[k], ignore_sub[k])  # compare sub-dicts...
-                            if k in ignore_sub else  # ... if we have keys to ignore in test
-                            not (k in ignore or v == meta[k])):
+                    if k in ignore:
+                        continue
+                    elif k not in meta:
+                        equal = False
+                    elif k in ignore_sub:  # compare sub-dicts, skipping keys expected to differ
+                        equal = equal_dicts(v, meta[k], ignore_sub[k])
+                    else:
+                        equal = v == meta[k]
+                    if not equal:
                         _logger.warning(f'Mismatch in meta data between raw_imaging_data folders for key {k}. '
                                         f'Using meta_data from first folder!')
         return meta_data_all[0]
