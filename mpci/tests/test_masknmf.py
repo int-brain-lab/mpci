@@ -11,12 +11,15 @@ from uuid import UUID
 import numpy as np
 import pandas as pd
 import sparse
+import torch
+from scipy import ndimage
 from scipy.io import savemat
 from ibllib.oneibl.data_handlers import dataset_from_name
 
 import masknmf
 from masknmf import TwoPhotonCalciumPipeline
 from masknmf.arrays.array_interfaces import ArrayLike
+from masknmf.compression import CompressionArray
 from mpci.masknmf.io import ScanImageTiffSeriesLoader, read_fov_line_indices, collect_tiff_paths
 from mpci.masknmf.task import MasknmfPreprocess
 from mpci.tests import IntegrationTestCase
@@ -161,12 +164,18 @@ class MasknmfRunMixin:
         masks = sparse.GCXS.from_numpy(np.ones((self.n_rois, 4, 4)))
         F = np.zeros((n_frames, self.n_rois), dtype=np.float32)
         formatted = (F, F.copy(), masks)
+        # NB: The neuropil methods are tested separately
+        neuropil_masks = masks.astype(bool)
         with mock.patch.object(masknmf, 'TwoPhotonCalciumPipeline', side_effect=make_pipeline), \
              mock.patch.object(masknmf.DemixingResults, 'from_hdf5') as from_hdf5, \
              mock.patch('mpci.masknmf.task.get_frame_loader', return_value=frames), \
-             mock.patch.object(MasknmfPreprocess, '_format_to_mpci', return_value=formatted):
+             mock.patch.object(MasknmfPreprocess, '_format_to_mpci', return_value=formatted), \
+             mock.patch.object(MasknmfPreprocess, '_neuropil_masks', return_value=neuropil_masks), \
+             mock.patch.object(MasknmfPreprocess, '_neuropil_traces', return_value=F + 1):
             centers = from_hdf5.return_value.signals_array.centers
             centers.cpu.return_value.numpy.return_value = np.zeros((self.n_rois, 2))
+            mean_image = from_hdf5.return_value.mean_image.cpu.return_value.numpy
+            mean_image.return_value = np.ones((4, 4), dtype=np.float32)
             out = task._run(**kwargs)
         return task, out, pipelines
 
@@ -336,6 +345,26 @@ class TestMasknmfPreprocessRun(MasknmfRunMixin, unittest.TestCase):
                     '20261029T120000_two-photon-calcium_1/foo.bar']
         self.assertEqual(expected, files)
 
+    def test_roi_outputs(self):
+        """Test the ROI type, mean image and neuropil outputs."""
+        task, out, _ = self.run_task(self.session_path, FOVs=[0])
+        out_path = self.session_path.joinpath('alf', 'FOV_00', 'masknmf')
+        # All ROIs should be labelled as cells
+        roi_types = np.load(out_path / 'mpciROIs.mpciROITypes.npy')
+        self.assertEqual(np.int16, roi_types.dtype)
+        np.testing.assert_array_equal(np.ones(self.n_rois), roi_types)
+        roi_type_names = pd.read_csv(out_path / 'mpciROITypes.names.tsv', sep='\t')
+        expected = pd.DataFrame([(0, 'no cell'), (1, 'cell')], columns=['roi_values', 'roi_labels'])
+        pd.testing.assert_frame_equal(expected, roi_type_names)
+        mean_image = np.load(out_path / 'mpciMeanImage.images.npy')
+        self.assertEqual(np.float64, mean_image.dtype)
+        np.testing.assert_array_equal(np.ones((4, 4)), mean_image)
+        neuropil_masks = sparse.load_npz(out_path / 'mpciROIs.neuropilMasks.sparse_npz')
+        self.assertEqual((self.n_rois, 4, 4), neuropil_masks.shape)
+        neuropil = np.load(out_path / 'mpci.ROINeuropilActivityF.npy')
+        self.assertEqual((sum(self.n_frames), self.n_rois), neuropil.shape)
+        self.assert_outputs_match_signature(task, out)
+
     def test_uuids(self):
         """Test mpciROIs.uuids.csv contains one unique UUID per ROI."""
         task, out, _ = self.run_task(self.session_path, FOVs=[1])
@@ -357,6 +386,66 @@ class TestMasknmfPreprocessRun(MasknmfRunMixin, unittest.TestCase):
         self.run_task(self.session_path, FOVs=[1])
         new_uuids = pd.read_csv(uuids_file)['uuids'].apply(UUID)
         self.assertFalse(set(uuids) & set(new_uuids))
+
+
+class TestNeuropil(unittest.TestCase):
+    """Test the suite2p-style neuropil methods of MasknmfPreprocess."""
+
+    def test_neuropil_masks(self):
+        """Test MasknmfPreprocess._neuropil_masks surrounds each ROI, excluding all ROI pixels."""
+        yy, xx = np.mgrid[:64, :48]
+        centres = [(20, 20), (24, 26), (2, 45)]  # NB: the last ROI is at the edge of the FOV
+        dist = np.stack([(yy - y) ** 2 + (xx - x) ** 2 for y, x in centres])
+        footprints = np.exp(-dist / 8) * (dist <= 9)
+        masks = sparse.GCXS.from_numpy(footprints.astype(np.float32))
+        neuropil_masks = MasknmfPreprocess._neuropil_masks(masks)
+        self.assertIsInstance(neuropil_masks, sparse.GCXS)
+        self.assertEqual(masks.shape, neuropil_masks.shape)
+        self.assertEqual(np.bool_, neuropil_masks.dtype)
+        neuropil_masks = neuropil_masks.todense()
+        roi_pixels = footprints > 0
+        # No neuropil pixels should be within any ROI
+        self.assertFalse(np.any(neuropil_masks & roi_pixels.any(axis=0)))
+        for roi, neuropil in zip(roi_pixels, neuropil_masks):
+            self.assertGreater(neuropil.sum(), 350)
+            # There should be a 2 pixel gap between each ROI and its neuropil
+            self.assertFalse(np.any(neuropil & ndimage.binary_dilation(roi, iterations=2)))
+        # The neuropil should surround the ROI
+        y, x = centres[0]
+        neuropil = neuropil_masks[0]
+        self.assertTrue(all(map(np.any, (neuropil[:y], neuropil[y:], neuropil[:, :x], neuropil[:, x:]))))
+
+    def test_neuropil_traces(self):
+        """Test MasknmfPreprocess._neuropil_traces is the mean of the compressed movie."""
+        rng = np.random.default_rng(0)
+        n_frames, height, width, rank, n_rois = 50, 16, 12, 6, 4
+        n_pixels = height * width
+
+        def tensor(*shape, density=1.):
+            return torch.from_numpy(rng.random(shape) * (rng.random(shape) < density)).float()
+        results = masknmf.DemixingResults(
+            shape=(n_frames, height, width),
+            spatial_compressed=tensor(n_pixels, rank, density=.3).to_sparse_coo(),
+            temporal_compressed=tensor(rank, n_frames) - .5,
+            spatial_demixed=tensor(n_pixels, n_rois, density=.2).to_sparse_coo(),
+            temporal_demixed=tensor(n_frames, n_rois),
+            mean_image=tensor(height, width) * 100,
+            noise_variance_image=tensor(height, width) + .5,
+            spatial_trend_basis=tensor(n_pixels, 3),
+            temporal_trend_basis=tensor(3, n_frames) - .5,
+            static_baseline=torch.zeros(n_pixels))
+        neuropil_masks = rng.random((n_rois, height, width)) > .6
+        neuropil_masks[-1] = False  # an empty neuropil mask
+        traces = MasknmfPreprocess._neuropil_traces(results, sparse.GCXS.from_numpy(neuropil_masks))
+        self.assertEqual((n_frames, n_rois), traces.shape)
+        self.assertEqual(np.float32, traces.dtype)
+        # Compare with the mean of the movie in raw units, as reconstructed by masknmf
+        movie = CompressionArray.from_flyweight(
+            results.shape, results.flyweight, rescale=True, include_trend=True)[:].numpy()
+        expected = np.stack([movie[:, mask].mean(axis=1) for mask in neuropil_masks[:-1]], axis=1)
+        np.testing.assert_allclose(expected, traces[:, :-1], rtol=1e-5)
+        # As in suite2p, the trace of an empty mask should be NaN
+        self.assertTrue(np.all(np.isnan(traces[:, -1])))
 
 
 class TestMasknmfPreprocessFrameQC(MasknmfRunMixin, IntegrationTestCase):
