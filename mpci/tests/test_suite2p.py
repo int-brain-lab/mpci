@@ -189,6 +189,40 @@ class TestMesoscopePreprocess(unittest.TestCase):
         motion_reg_mock.assert_called_once_with(
             {'foo': 'bar', 'do_registration': True, 'do_regmetrics': True, 'roidetect': False})
 
+    def test_image_motion_registration_bad_frames(self):
+        """Test that bad frames are excluded from the motion registration reference image."""
+        suite2p = mock.MagicMock()
+        suite2p.default_ops.return_value = {'do_bidiphase': False, 'keep_movie_raw': False,
+                                            'functional_chan': 1, 'align_by_chan': 1}
+        movie = np.arange(20)[:, np.newaxis, np.newaxis] * np.ones((20, 4, 5))  # value == index
+        suite2p.io.BinaryFile.return_value.__enter__.return_value = movie
+        suite2p.registration.register.compute_reference.return_value = ref = np.ones((4, 5))
+        suite2p.run_plane.return_value = {}
+        np.save(self.img_path.joinpath('bad_frames.npy'), np.arange(3, 11))
+        self.img_path.joinpath('data_raw.bin').touch()
+        ops = {'data_path': [str(self.img_path)], 'nframes': 20, 'Ly': 4, 'Lx': 5, 'nimg_init': 5,
+               'reg_file': 'data.bin', 'reg_file_chan2': 'data_chan2.bin',
+               'raw_file': str(self.img_path.joinpath('data_raw.bin'))}
+        with mock.patch.dict(sys.modules, suite2p=suite2p):
+            self.task.image_motion_registration(ops.copy())
+            # Check frames evenly sampled from good frames only
+            (frames,), _ = suite2p.registration.register.compute_reference.call_args
+            np.testing.assert_array_equal([0, 2, 12, 15, 17], frames[:, 0, 0])
+            suite2p.io.BinaryFile.assert_called_once_with(Ly=4, Lx=5, filename='data.bin')
+            (ops_out,), _ = suite2p.run_plane.call_args
+            self.assertIs(ops_out['refImg'], ref)
+            self.assertTrue(ops_out['force_refImg'])
+            # Check reads from the same binary file as suite2p
+            for kwargs, expected in [({'keep_movie_raw': True}, ops['raw_file']),
+                                     ({'align_by_chan': 2}, 'data_chan2.bin')]:
+                self.task.image_motion_registration({**ops, **kwargs})
+                self.assertEqual(expected, suite2p.io.BinaryFile.call_args.kwargs['filename'])
+            # Should raise if bidiphase estimate required as suite2p skips it when passed refImg
+            suite2p.run_plane.reset_mock()
+            with self.assertRaises(AssertionError):
+                self.task.image_motion_registration({**ops, 'do_bidiphase': True})
+            suite2p.run_plane.assert_not_called()
+
     def test_get_plane_paths(self):
         """Test _get_plane_paths method."""
         path = self.session_path.joinpath('suite2p')
@@ -301,7 +335,7 @@ class TestMesoscopePreprocessRename(IntegrationTestCase):
         self.assertEqual(expected, set(x.name for x in self.suite2pdir.rglob('*.*')))
 
 
-class TestMesoscopePreprocess(IntegrationTestCase):
+class TestMesoscopePreprocessRun(IntegrationTestCase):
     session_path = None
     required_files = ['mesoscope/SP053/2024-02-07/001', 'mesoscope/SP037/2023-03-23/002/suite2p/plane2/ops.npy']
 

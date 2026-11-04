@@ -458,8 +458,46 @@ class MesoscopePreprocess(MesoscopeTask):
 
         return planes, ret
 
+    @staticmethod
+    def compute_reference_image(ops, bad_frames):
+        """Compute the motion registration reference image, excluding bad frames.
+
+        Frames are sampled in the same way as
+        suite2p.registration.register.compute_reference_and_register_frames.
+
+        Parameters
+        ----------
+        ops : dict
+            A dict of suite2p options.
+        bad_frames : numpy.array
+            The indices of frames to exclude.
+
+        Returns
+        -------
+        numpy.array
+            The reference image of shape (Ly, Lx).
+        """
+        import suite2p
+        ops = {**suite2p.default_ops(), **ops}
+        # suite2p skips the bidiphase estimate when passed a reference image
+        assert not ops['do_bidiphase'], 'bidiphase estimate unsupported when excluding bad frames'
+        good_frames = np.setdiff1d(np.arange(ops['nframes']), bad_frames)
+        n_frames = min(ops['nimg_init'], good_frames.size)
+        frame_idx = good_frames[np.linspace(0, good_frames.size, n_frames + 1, dtype=int)[:-1]]
+        # Read from the same file that suite2p.run_plane aligns
+        raw = ops['keep_movie_raw'] and 'raw_file' in ops and Path(ops['raw_file']).is_file()
+        key = 'raw_file' if raw else 'reg_file'
+        if ops['functional_chan'] != ops['align_by_chan']:
+            key += '_chan2'
+        with suite2p.io.BinaryFile(Ly=ops['Ly'], Lx=ops['Lx'], filename=ops[key]) as f:
+            frames = f[frame_idx]
+        return suite2p.registration.register.compute_reference(frames, ops=ops)
+
     def image_motion_registration(self, ops):
         """Perform motion registration.
+
+        If there is a bad_frames.npy file in the first data path, these frames are excluded from
+        the reference image. NB: suite2p itself only uses this file after registration.
 
         Parameters
         ----------
@@ -480,6 +518,11 @@ class MesoscopePreprocess(MesoscopeTask):
         ops['do_registration'] = True
         ops['do_regmetrics'] = True
         ops['roidetect'] = False
+        data_path = ops.get('data_path')
+        if data_path and (bad_frames_file := Path(data_path[0], 'bad_frames.npy')).exists():
+            _logger.info('Computing reference image excluding bad frames')
+            ops['refImg'] = self.compute_reference_image(ops, np.load(bad_frames_file))
+            ops['force_refImg'] = True
         ret = suite2p.run_plane(ops)
         metrics = {k: ret.get(k, None) for k in ('regDX', 'regPC', 'tPC')}
         has_metrics = ops['do_regmetrics'] and metrics['regDX'] is not None
