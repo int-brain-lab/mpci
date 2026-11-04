@@ -15,6 +15,7 @@ import masknmf
 import numpy as np
 import pandas as pd
 import torch
+import scipy.sparse
 from scipy.io import loadmat
 from iblutil.util import flatten, ensure_list
 from ibllib.oneibl.data_handlers import ExpectedDataset, dataset_from_name
@@ -147,6 +148,11 @@ class MasknmfPreprocess(MesoscopeTask):
             O('mpci.ROIActivityF.npy', alf_collection, True, unique=False),
             O('mpci.ROIActivityDeconvolved.npy', alf_collection, True, unique=False),
             O('mpciROIs.uuids.csv', alf_collection, True, unique=False),
+            O('mpci.ROINeuropilActivityF.npy', alf_collection, True, unique=False),
+            O('mpciROIs.neuropilMasks.sparse_npz', alf_collection, True, unique=False),
+            O('mpciMeanImage.images.npy', alf_collection, True, unique=False),
+            O('mpciROIs.mpciROITypes.npy', alf_collection, True, unique=False),
+            O('mpciROITypes.names.tsv', alf_collection, True, unique=False),
             O('mpci.badFrames.npy', alf_collection, True, unique=False),
             O('mpci.mpciFrameQC.npy', alf_collection, False, unique=False),
             O('mpciFrameQC.names.tsv', alf_collection, False, unique=False),
@@ -250,6 +256,99 @@ class MasknmfPreprocess(MesoscopeTask):
         spatial_footprints = sparse.COO(final_ind, values, shape=(num_neurons, height, width))
         spatial_footprints = spatial_footprints.asformat('gcxs')
         return fluorescence_traces.astype(np.float32), deconv_traces.astype(np.float32), spatial_footprints
+
+    @staticmethod
+    def _neuropil_masks(masks, inner_neuropil_radius=2, min_neuropil_pixels=350):
+        """
+        Create suite2p-style neuropil masks surrounding each ROI.
+
+        The suite2p algorithm is used: each ROI is first extended by `inner_neuropil_radius`
+        pixels, then a box around it is expanded until it contains more than
+        `min_neuropil_pixels` pixels outside of the extended ROI and any other ROI. Unlike
+        suite2p, which allows the lower weighted pixels of ROIs to be included, all pixels within
+        any ROI footprint are excluded from the neuropil masks.
+
+        Parameters
+        ----------
+        masks : sparse.GCXS
+            The ROI masks, shape (n_rois, height, width).
+        inner_neuropil_radius : int
+            The number of pixels to keep between each ROI and its neuropil mask.
+        min_neuropil_pixels : int
+            The minimum number of pixels in each neuropil mask.
+
+        Returns
+        -------
+        sparse.GCXS
+            The boolean neuropil masks, shape (n_rois, height, width).
+        """
+        from suite2p.extraction.masks import create_neuropil_masks
+        n_rois, height, width = masks.shape
+        coo = masks.tocoo()
+        roi, ypix, xpix = coo.coords[:, coo.data != 0]
+        cell_pix = np.zeros((height, width), dtype=bool)
+        cell_pix[ypix, xpix] = True
+        # Group the ROI pixels by ROI
+        order = np.argsort(roi, kind='stable')
+        split = np.cumsum(np.bincount(roi, minlength=n_rois))[:-1]
+        ypixs, xpixs = np.split(ypix[order], split), np.split(xpix[order], split)
+        neuropil_ipix = create_neuropil_masks(
+            ypixs, xpixs, cell_pix, inner_neuropil_radius, min_neuropil_pixels)
+        roi = np.repeat(np.arange(n_rois), list(map(len, neuropil_ipix)))
+        ipix = np.concatenate([[], *neuropil_ipix]).astype(int)
+        ypix, xpix = np.unravel_index(ipix, (height, width))
+        return sparse.COO([roi, ypix, xpix], True, shape=masks.shape).asformat('gcxs')
+
+    @staticmethod
+    def _neuropil_traces(demixing_results, neuropil_masks):
+        """
+        Compute the mean of the compressed (PMD) movie within each neuropil mask.
+
+        The movie is in raw units, i.e. rescaled and with the mean image and trend added back, as
+        returned by a masknmf CompressionArray with rescale=True and include_trend=True. As in
+        suite2p, the trace of an empty neuropil mask is NaN. The trace of each bad frame is the
+        mean of the mean image within each mask, as the compressed movie is zero on these frames.
+
+        NB: Unlike suite2p, the masknmf fluorescence traces already exclude the background, so
+        these traces should not be subtracted from the ROI traces.
+
+        Parameters
+        ----------
+        demixing_results : masknmf.DemixingResults
+            The masknmf demixing results.
+        neuropil_masks : sparse.GCXS
+            The boolean neuropil masks, shape (n_rois, height, width).
+
+        Returns
+        -------
+        numpy.array
+            The neuropil fluorescence traces, shape (n_frames, n_rois).
+        """
+        _, height, width = map(int, demixing_results.shape)
+        n_rois = neuropil_masks.shape[0]
+        masks = neuropil_masks.reshape((n_rois, height * width)).to_scipy_sparse()
+        masks = scipy.sparse.csr_array(masks, dtype=np.float32)
+        npix = masks.sum(axis=1)
+        with np.errstate(divide='ignore'):
+            mean_operator = scipy.sparse.diags_array(1 / npix) @ masks  # (n_rois, n_pixels)
+        # The movie is (spatial_compressed @ temporal_compressed) * noise_std + mean_image + trend
+        # NB: The noise_variance_image is the pixelwise noise standard deviation
+        spatial = demixing_results.spatial_compressed.coalesce()
+        (rows, cols), values = spatial.indices().cpu().numpy(), spatial.values().cpu().numpy()
+        noise_std = demixing_results.noise_variance_image.flatten().cpu().numpy()
+        spatial = scipy.sparse.csr_array(
+            (values * noise_std[rows], (rows, cols)), shape=tuple(spatial.shape))
+        temporal = demixing_results.temporal_compressed.cpu().float()
+        traces = torch.from_numpy((mean_operator @ spatial).toarray()) @ temporal
+        mean_image = demixing_results.mean_image.flatten().cpu().numpy().astype(np.float32)
+        traces += torch.from_numpy(mean_operator @ mean_image)[:, None]
+        spatial_trend = demixing_results.spatial_trend_basis
+        temporal_trend = demixing_results.temporal_trend_basis
+        if spatial_trend is not None and temporal_trend is not None:
+            spatial_trend = mean_operator @ spatial_trend.cpu().numpy().astype(np.float32)
+            traces += torch.from_numpy(spatial_trend) @ temporal_trend.cpu().float()
+        traces[npix == 0] = np.nan
+        return traces.T.numpy()
 
     def load_frame_qc(self, all_meta, fov_path=None, overwrite=False):
         """
@@ -425,18 +524,31 @@ class MasknmfPreprocess(MesoscopeTask):
                 fid.write('\n'.join(uuid_list))
             out.append(out_path.joinpath('mpciROIs.uuids.csv'))
 
-            """ Outputs still missing:
-                ('mpci.ROINeuropilActivityF.npy', alf_collection, True),
-                ('mpciMeanImage.images.npy', alf_collection, True),
-                ('mpciROIs.mpciROITypes.npy', alf_collection, True),
-                ('mpciROIs.cellClassifier.npy', alf_collection, True),
-                ('mpciROITypes.names.tsv', alf_collection, True),
-                ('mpciROIs.neuropilMasks.sparse_npz', alf_collection, True),
-            """
+            # The mean image of the registered movie (NB: unlike suite2p, this excludes bad frames)
+            mean_image = np.asarray(demixing_results.mean_image.cpu().numpy(), dtype=float)
+            np.save(out_mean_image := out_path / 'mpciMeanImage.images.npy', mean_image)
+            # All ROIs found by masknmf are considered cells
+            roi_types = np.ones(masks.shape[0], dtype=np.int16)
+            np.save(out_roi_types := out_path / 'mpciROIs.mpciROITypes.npy', roi_types)
+            out_roi_type_names = out_path / 'mpciROITypes.names.tsv'
+            (pd.DataFrame([(0, 'no cell'), (1, 'cell')], columns=['roi_values', 'roi_labels'])
+             .to_csv(out_roi_type_names, sep='\t', index=False))
+            # suite2p-style neuropil masks and the mean of the compressed movie within them
+            neuropil_masks = self._neuropil_masks(masks)
+            out_neuropil_masks = out_path / 'mpciROIs.neuropilMasks.sparse_npz'
+            with open(out_neuropil_masks, 'wb') as fp:
+                sparse.save_npz(fp, neuropil_masks)
+            Fneu = self._neuropil_traces(demixing_results, neuropil_masks)
+            np.save(out_neuropil_traces := out_path / 'mpci.ROINeuropilActivityF.npy', Fneu)
+            out.extend([out_mean_image, out_roi_types, out_roi_type_names,
+                        out_neuropil_masks, out_neuropil_traces])
+
+            # TODO Output mpciROIs.cellClassifier.npy, e.g. using a trained ROICaT classifier
 
             # Release this FOV's large arrays/tensors before moving to the next one, so
             # memory doesn't build up across FOVs within this one process.
             del frames, pipeline, demixing_results, F, Deconv_F, masks, xy_centers
+            del mean_image, neuropil_masks, Fneu
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

@@ -18,15 +18,35 @@ import sparse
 from mpci.tests import TEST_DB, IntegrationTestCase
 from mpci.suite2p.task import MesoscopePreprocess
 
-# Mock suit2p which is imported in MesoscopePreprocess
-attrs = {'default_ops.return_value': {}}
-sys.modules['suite2p'] = mock.MagicMock(**attrs)
+
+def mock_suite2p(test_case, **attrs):
+    """Mock suite2p, which is imported in MesoscopePreprocess, for the duration of a test.
+
+    NB: The modules are restored after the test so as not to affect other tests that use suite2p.
+
+    Returns
+    -------
+    unittest.mock.MagicMock
+        The mock suite2p module.
+    """
+    suite2p = mock.MagicMock(**attrs)
+    modules = {'suite2p': suite2p, 'suite2p.io': suite2p.io}
+    original = {name: sys.modules[name] for name in modules if name in sys.modules}
+    sys.modules.update(modules)
+
+    def restore():
+        for name in modules:
+            sys.modules.pop(name, None)
+        sys.modules.update(original)
+    test_case.addCleanup(restore)
+    return suite2p
 
 
 class TestMesoscopePreprocess(unittest.TestCase):
     """Test for MesoscopePreprocess task."""
 
     def setUp(self) -> None:
+        mock_suite2p(self, **{'default_ops.return_value': {}})
         self.td = tempfile.TemporaryDirectory()
         self.session_path = Path(self.td.name).joinpath('subject', '2020-01-01', '001')
         self.img_path = self.session_path.joinpath('raw_imaging_data_00')
@@ -345,10 +365,7 @@ class TestMesoscopePreprocessRun(IntegrationTestCase):
         # Copy files to temp dir
         # NB: suite2p dir now in session_path, not alf folder. This shouldn't affect these tests
         self.one = ONE(**TEST_DB)
-        # Mock suite2p
-        self.suite2p_mock = mock.MagicMock()
-        sys.modules['suite2p'] = self.suite2p_mock
-        sys.modules['suite2p.io'] = self.suite2p_mock.io
+        self.suite2p_mock = mock_suite2p(self)
 
     @mock.patch.object(MesoscopePreprocess, 'image_motion_registration', autospec=True)
     @mock.patch.object(MesoscopePreprocess, 'roi_detection', autospec=True)
