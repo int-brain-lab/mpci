@@ -1,12 +1,46 @@
+import unittest
 from itertools import chain
 from unittest.mock import patch
 from collections import OrderedDict
+from copy import deepcopy
 
 from one.api import ONE
 from ibllib.pipes.dynamic_pipeline import make_pipeline_dict, load_pipeline_dict
-from mpci.alyx.tasks import MesoscopeRegisterSnapshots
+from mpci.alyx.tasks import MesoscopeTask, MesoscopeRegisterSnapshots
 from mpci.alyx.pipeline import make_pipeline
 from mpci.tests import TEST_DB, IntegrationTestCase
+
+
+class TestMesoscopeTask(unittest.TestCase):
+
+    def test_consolidate_metadata(self):
+        """Test MesoscopeTask._consolidate_metadata warns about inconsistent metadata."""
+        meta = {'nFrames': 10, 'acquisitionStartTime': [2023, 3, 3, 12], 'channelSaved': [1, 2],
+                'rawScanImageMeta': {'ImageDescription': 'a', 'Software': 'b', 'Artist': 'c'},
+                'FOV': [{'nXnYnZ': [512, 512, 1], 'MLAPDV': {'center': [1, 2, 3]},
+                         'brainLocationIds': {'center': 442}}]}
+        # Keys we don't expect to match should be ignored
+        other = deepcopy(meta)
+        other.update(nFrames=20, acquisitionStartTime=[2023, 3, 3, 13])
+        other['rawScanImageMeta'].update(ImageDescription='baz', Software='qux')
+        other['FOV'][0].update(MLAPDV=None, brainLocationIds=None)
+        with self.assertNoLogs('mpci.alyx.tasks', 'WARNING'):
+            consolidated = MesoscopeTask._consolidate_metadata([meta, other])
+        self.assertIs(meta, consolidated)  # should return the first
+
+        # Keys that differ, or are missing, should be logged
+        other['channelSaved'] = [1]
+        other['rawScanImageMeta']['Artist'] = 'qux'
+        other['FOV'][0]['nXnYnZ'] = [256, 256, 1]
+        missing = deepcopy(meta)
+        del missing['channelSaved']
+        missing['FOV'].append(missing['FOV'][0])
+        with self.assertLogs('mpci.alyx.tasks', 'WARNING') as log:
+            consolidated = MesoscopeTask._consolidate_metadata([meta, other, missing])
+        self.assertIs(meta, consolidated)
+        keys = [r.getMessage().split('for key ')[1].split('.')[0] for r in log.records]
+        expected = ['channelSaved', 'rawScanImageMeta', 'FOV', 'channelSaved', 'FOV']
+        self.assertEqual(expected, keys)
 
 
 class TestMesoscopeRegisterSnapshots(IntegrationTestCase):
@@ -81,5 +115,4 @@ class TestStandardPipelines(IntegrationTestCase):
 
 
 if __name__ == '__main__':
-    import unittest
     unittest.main()

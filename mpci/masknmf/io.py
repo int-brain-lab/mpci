@@ -224,6 +224,21 @@ class ScanImageTiffSeriesLoader(LazyFrameLoader):
             return np.where(arr < 0, arr + size, arr)
         raise IndexError(f"Invalid spatial index: {indexer!r}")
 
+    def _parse_indices(self, item):
+        """Parse the frame indexer, allowing more than one axis to be indexed with a list or array.
+
+        The base class raises an IndexError when more than one axis is indexed with a list or
+        array, as numpy would pair these up pointwise. Here each axis is instead treated as an
+        independent selection (the outer product), as applied by ``_compute_at_indices``.
+        """
+        if isinstance(item, tuple) and item and item[-1] is Ellipsis:
+            item = item[:-1]
+        if not isinstance(item, tuple) or len(item) > self.ndim:
+            return super()._parse_indices(item)
+        # Only validate the frame indexer; the spatial indexers are resolved in __getitem__
+        frame_indexer, _ = super()._parse_indices((item[0], *[slice(None)] * (len(item) - 1)))
+        return frame_indexer, item
+
     def _shift_row_indexer(self, row_indexer):
         """Shift a plane-local row indexer (0..height) to an absolute row in the raw frame."""
         if isinstance(row_indexer, int):
@@ -271,10 +286,15 @@ class ScanImageTiffSeriesLoader(LazyFrameLoader):
 
         # Advanced (array) indexing on more than one axis pairs elements instead of
         # taking the outer product. The frame axis is always advanced here (`local_idx`
-        # below), so a fancy row/col index is read in full then applied as its own pass.
+        # below), so a fancy row/col index is read as a slice then applied as its own pass.
         row_is_fancy = isinstance(row_indexer, np.ndarray)
         col_is_fancy = isinstance(col_indexer, np.ndarray)
-        read_row = slice(None) if row_is_fancy else row_indexer
+        read_row = row_indexer
+        if row_is_fancy:
+            # Read only this plane's band of rows, rather than the full raw frame height (i.e.
+            # all planes), and select the rows relative to the start of the band
+            read_row = slice(self._row_start, self._row_end, 1)
+            row_indexer = row_indexer - self._row_start
         read_col = slice(None) if col_is_fancy else col_indexer
 
         # Write directly into a preallocated, correctly-ordered output array
