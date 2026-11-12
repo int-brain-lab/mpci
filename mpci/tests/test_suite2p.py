@@ -107,6 +107,24 @@ class TestMesoscopePreprocess(unittest.TestCase):
             ops = self.task._meta2ops(metadata)
         self.assertDictEqual(ops, expected)
 
+    def test_bin_per_plane(self):
+        """Test that all suite2p options are passed to mesoscan_to_binary."""
+        suite2p = mock.MagicMock()
+        suite2p.io.mesoscan_to_binary.side_effect = TestMesoscopePreprocessRun._create_planes
+        meta_ops = {'nplanes': 1, 'fs': 4.9, 'tau': .7, 'maxregshift': .05, 'nimg_init': 400,
+                    'denoise': 1}
+        with mock.patch.dict(sys.modules, {'suite2p': suite2p, 'suite2p.io': suite2p.io}), \
+             mock.patch.object(self.task, '_meta2ops', return_value=meta_ops.copy()):
+            planes, _ = self.task.bin_per_plane(
+                {}, save_folder='suite2p', save_path0=self.session_path, tau=1.5)
+        expected = {**meta_ops, 'tau': 1.5, 'force_sktiff': False, 'do_registration': True,
+                    'save_folder': 'suite2p', 'save_path0': str(self.session_path)}
+        suite2p.io.mesoscan_to_binary.assert_called_once_with(expected)
+        self.assertEqual([self.session_path.joinpath('suite2p', 'plane0')], planes)
+        # Check options saved to ops.npy, which is passed to suite2p.run_plane
+        ops = np.load(planes[0].joinpath('ops.npy'), allow_pickle=True).item()
+        self.assertDictEqual(expected, ops)
+
     def test_get_default_tau(self):
         """Test for MesoscopePreprocess.get_default_tau method."""
         subject_detail = {'genotype': [{'allele': 'Cdh23', 'zygosity': 1},
