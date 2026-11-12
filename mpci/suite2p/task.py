@@ -436,13 +436,10 @@ class MesoscopePreprocess(MesoscopeTask):
         """
         import suite2p.io
 
-        options = ('nplanes', 'data_path', 'save_path0', 'save_folder', 'fast_disk', 'batch_size',
-                   'nchannels', 'keep_movie_raw', 'look_one_level_down', 'lines', 'dx', 'dy', 'force_sktiff',
-                   'do_registration', 'slices')
+        # NB: All options are saved to each plane's ops.npy, which is passed to suite2p.run_plane
         ops = self._meta2ops(metadata)
         ops['force_sktiff'] = False
         ops['do_registration'] = True
-        ops = {k: v for k, v in ops.items() if k in options}
         ops.update(kwargs)
         ops['save_path0'] = str(ops['save_path0'])  # Path objs must be str for suite2p
         # Update the task kwargs attribute as it will be stored in the arguments json field in alyx
