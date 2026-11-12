@@ -371,7 +371,13 @@ class MesoscopeQC(base.QC):
             _log.warning('ops does not contain registration PCs; skipping Z drift check')
             return spec.QC.NOT_SET
         n_frames = ops.get('nframes', self.data['badframes'].size)
-        fraction = get_low_freq_power_fraction(ops['tPC'], ops['fs'], n_frames, **kwargs)
+        # ops['fs'] may not be the true frame rate so prefer inferring it from the frame times
+        if (times := self.data.get('times')) is not None:
+            frame_rate = 1 / np.median(np.diff(times))
+        else:
+            frame_rate = ops['fs']
+            _log.warning('No frame times; assuming frame rate of %.2f Hz from ops', frame_rate)
+        fraction = get_low_freq_power_fraction(ops['tPC'], frame_rate, n_frames, **kwargs)
         if np.all(np.isnan(fraction)):
             return spec.QC.NOT_SET, fraction.tolist()
         outcome = spec.QC.FAIL if np.nanmin(fraction) > threshold else spec.QC.PASS

@@ -478,6 +478,12 @@ class TestZDrift(unittest.TestCase):
         qc.data['ops']['tPC'][:, -1] = self.rng.standard_normal(2000)
         outcome, _ = MesoscopeQC.check_z_drift(qc)
         self.assertIs(outcome, spec.QC.PASS)
+        # Frame rate should be inferred from frame times when available, rather than ops['fs']
+        with mock.patch('mpci.suite2p.qc.get_low_freq_power_fraction',
+                        return_value=np.ones(30)) as get_fraction:
+            qc.data['times'] = np.arange(self.n_frames) / 4.
+            MesoscopeQC.check_z_drift(qc)
+            self.assertEqual(4., get_fraction.call_args.args[1])
         expected = ['mpci.ROIActivityF.npy', 'mpci.ROINeuropilActivityF.npy',
                     'mpci.ROIActivityDeconvolved.npy']
         self.assertEqual(expected, MesoscopeQC.check_z_drift(qc, only_dsets=True))
