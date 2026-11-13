@@ -15,11 +15,11 @@ import numpy as np
 import pandas as pd
 import sparse
 
+from ibllib.oneibl.data_handlers import dataset_from_name, OptionalOutput
+
 from mpci.tests import TEST_DB, IntegrationTestCase
 from mpci.suite2p.task import MesoscopePreprocess
-from one.alf import spec
-from mpci.suite2p.qc import (
-    get_neural_quality_metrics, multitaper_psd, get_low_freq_power_fraction, MesoscopeQC)
+from mpci.qc.registration import REGISTRATION_PCS
 
 
 def mock_suite2p(test_case, **attrs):
@@ -248,6 +248,54 @@ class TestMesoscopePreprocess(unittest.TestCase):
         self.td.cleanup()
 
 
+class TestMesoscopePreprocessRegistrationQC(unittest.TestCase):
+    """Test for MesoscopePreprocess.compute_registration_qc method."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.session_path = Path(tmp.name).joinpath('subject', '2020-01-01', '001')
+        self.plane_path = self.session_path.joinpath('suite2p', 'plane1')
+        self.plane_path.mkdir(parents=True)
+        self.task = MesoscopePreprocess(self.session_path, one=mock.MagicMock(offline=True))
+
+    def test_signature(self):
+        """Test the registration PCs are an optional output that is not registered."""
+        self.task.get_signatures()
+        dset, = dataset_from_name(REGISTRATION_PCS, self.task.output_files)
+        self.assertIsInstance(dset, OptionalOutput)
+        self.assertFalse(dset.register)
+        self.assertEqual('alf/FOV_??/suite2p', dset.identifiers[0])
+
+    def test_compute_registration_qc(self):
+        n_frames, Ly, Lx = 100, 12, 10
+        movie = np.random.default_rng(0).integers(0, 100, (n_frames, Ly, Lx), dtype=np.int16)
+        movie.tofile(self.plane_path / 'data.bin')
+        badframes = np.zeros(n_frames, dtype=bool)
+        badframes[:5] = True
+        ops = {'nframes': n_frames, 'Ly': Ly, 'Lx': Lx, 'badframes': badframes,
+               'yrange': [1, 11], 'xrange': [2, 9]}
+        np.save(self.plane_path / 'ops.npy', ops)
+        tPC = np.ones((n_frames - 5, 3))
+        with mock.patch('mpci.qc.registration.compute_registration_pcs',
+                        return_value=(tPC, np.ones(3))) as compute:
+            out_file = self.task.compute_registration_qc(self.plane_path, bin_factor=2)
+        expected = self.session_path.joinpath('alf', 'FOV_01', 'suite2p', REGISTRATION_PCS)
+        self.assertEqual(expected, out_file)
+        np.testing.assert_array_equal(tPC, np.load(out_file))
+        (frames, actual_badframes), kwargs = compute.call_args
+        self.assertEqual(movie.shape, frames.shape)
+        np.testing.assert_array_equal(badframes, actual_badframes)
+        self.assertEqual({'crop': (slice(1, 11), slice(2, 9)), 'bin_factor': 2}, kwargs)
+        # Without overwrite, the PCs should not be recomputed
+        with mock.patch('mpci.qc.registration.compute_registration_pcs',
+                        return_value=(tPC, np.ones(3))) as compute:
+            self.assertEqual(expected, self.task.compute_registration_qc(self.plane_path))
+            compute.assert_not_called()
+            self.task.compute_registration_qc(self.plane_path, overwrite=True)
+            compute.assert_called_once()
+
+
 class TestMesoscopePreprocessRename(IntegrationTestCase):
     session_path = None
 
@@ -274,6 +322,8 @@ class TestMesoscopePreprocessRename(IntegrationTestCase):
         task = MesoscopePreprocess(session_path, one=self.one)
         files = task._rename_outputs(self.suite2pdir.parent, None, None)
         self.assertTrue(all(map(Path.exists, files)))
+        # The outputs should be saved to the FOV's suite2p folder
+        self.assertEqual({session_path / 'alf' / 'FOV_02' / 'suite2p'}, {f.parent for f in files})
         self.assertTrue(self.suite2pdir.exists())
         # Check that other files were removed (note: there's no bin file in this test)
         self.assertEqual({'ops.npy'}, set(x.name for x in self.suite2pdir.rglob('*.*')))
@@ -312,11 +362,13 @@ class TestMesoscopePreprocessRename(IntegrationTestCase):
         """
         # Create an old FOV folder for it to remove
         session_path = get_session_path(self.suite2pdir)
-        (fov_folder := session_path.joinpath('alf', 'FOV_02')).mkdir(parents=True)
+        (fov_folder := session_path.joinpath('alf', 'FOV_02', 'suite2p')).mkdir(parents=True)
         for name in self.rename_dict.values():
             fov_folder.joinpath(name).touch()
-        # Should not delete other files from this folder
-        fov_folder.joinpath('mpci.times.npy').touch()
+        # Should not delete other files from these folders, including the registration QC PCs,
+        # which are computed before renaming
+        fov_folder.parent.joinpath('mpci.times.npy').touch()
+        fov_folder.joinpath(REGISTRATION_PCS).touch()
 
         # Create binary data files
         self.suite2pdir.joinpath('data.bin').touch()
@@ -332,7 +384,9 @@ class TestMesoscopePreprocessRename(IntegrationTestCase):
         log_messages = [x for x in log_messages if x.startswith('Removing old file')]
         self.assertEqual(len(self.rename_dict), len(log_messages))
         self.assertNotIn('mpci.times.npy', ' '.join(log_messages))
-        self.assertTrue(fov_folder.joinpath('mpci.times.npy').exists())
+        self.assertTrue(fov_folder.parent.joinpath('mpci.times.npy').exists())
+        self.assertTrue(fov_folder.joinpath(REGISTRATION_PCS).exists())
+        self.assertNotIn(fov_folder.joinpath(REGISTRATION_PCS), files)
         # Check frameQC is saved
         self.assertIn(files[0].with_name('mpciFrameQC.names.tsv'), files)
         self.assertIn(files[0].with_name('mpci.mpciFrameQC.npy'), files)
@@ -408,85 +462,6 @@ class TestMesoscopePreprocessRun(IntegrationTestCase):
             p.joinpath(f'plane{i}').mkdir()
             np.save(p.joinpath(f'plane{i}', 'ops.npy'), ops)
         return ops
-
-
-class TestQM(IntegrationTestCase):
-    """Test for get_neural_quality_metrics function."""
-    def setUp(self):
-        self.session_path = self.default_data_root().joinpath('mesoscope', 'SP037', '2023-03-23', '002')
-        self.alf_path = self.session_path.joinpath('suite2p', 'plane2')
-
-    def test_neural_qm(self):
-        F = np.load(self.alf_path / 'F.npy').T
-        Fneu = np.load(self.alf_path / 'Fneu.npy').T
-        iscell = np.load(self.alf_path / 'iscell.npy')
-        neural_metrics, fov_metrics = get_neural_quality_metrics(F, Fneu, iscell=iscell[:, 0].astype(bool))
-        expected = {'noise_level', 'mean', 'std', 'skew'}
-        self.assertCountEqual(expected, neural_metrics)
-        np.testing.assert_approx_equal(neural_metrics['noise_level'], 3.8925, significant=5)
-        np.testing.assert_approx_equal(neural_metrics['mean'], 983.0024)
-        np.testing.assert_approx_equal(neural_metrics['std'], 120.6435)
-        np.testing.assert_approx_equal(neural_metrics['skew'], 1.0478, significant=5)
-        self.assertCountEqual(expected, fov_metrics.dtype.names)
-        self.assertTrue(all(fov_metrics[x].size == F.shape[1] for x in expected))
-
-
-class TestZDrift(unittest.TestCase):
-    """Test for Z drift QC metric based on the registration PCs."""
-
-    def setUp(self):
-        self.rng = np.random.default_rng(0)
-        self.fs, self.n_frames = 5., 5 * 3600  # 1 hour at 5 Hz
-
-    def test_multitaper_psd(self):
-        x = self.rng.standard_normal(2000)
-        psd, freq = multitaper_psd(x, .5)
-        self.assertEqual(1025, psd.size)  # nfft = 2048
-        self.assertEqual(.25, freq[-1])
-        # Total power should equal the variance (Parseval)
-        self.assertAlmostEqual(x.var(), np.trapezoid(psd, freq), places=2)
-        # Peak should be at the frequency of a sinusoid
-        t = np.arange(2000) / .5
-        psd, freq = multitaper_psd(np.sin(2 * np.pi * .05 * t), .5)
-        self.assertAlmostEqual(.05, freq[np.argmax(psd)], delta=freq[1] * 3)
-        self.assertRaises(ValueError, multitaper_psd, [1., np.nan], .5)
-
-    def test_get_low_freq_power_fraction(self):
-        # White noise power should be evenly distributed across frequencies
-        tPC = self.rng.standard_normal((2000, 40))
-        fraction = get_low_freq_power_fraction(tPC, self.fs, self.n_frames)
-        self.assertEqual(30, fraction.size)
-        nyquist = 2000 / (self.n_frames / self.fs) / 2
-        np.testing.assert_allclose(fraction, .01 / nyquist, atol=.02)
-        # Drifting PCs should be dominated by low frequencies
-        fraction = get_low_freq_power_fraction(np.cumsum(tPC, axis=0), self.fs, self.n_frames)
-        self.assertTrue(np.all(fraction > .9))
-        # A flat PC has no power
-        tPC[:, 0] = 1
-        fraction = get_low_freq_power_fraction(tPC, self.fs, self.n_frames, n_pcs=2)
-        self.assertTrue(np.isnan(fraction[0]))
-        self.assertFalse(np.isnan(fraction[1]))
-
-    def test_check_z_drift(self):
-        ops = {'fs': self.fs, 'nframes': self.n_frames}
-        qc = mock.Mock(data={'ops': ops, 'badframes': np.zeros(10)})
-        self.assertIs(MesoscopeQC.check_z_drift(qc), spec.QC.NOT_SET)
-        qc.data['ops']['tPC'] = np.cumsum(self.rng.standard_normal((2000, 30)), axis=0)
-        outcome, fraction = MesoscopeQC.check_z_drift(qc)
-        self.assertIs(outcome, spec.QC.FAIL)
-        self.assertEqual(30, len(fraction))
-        qc.data['ops']['tPC'][:, -1] = self.rng.standard_normal(2000)
-        outcome, _ = MesoscopeQC.check_z_drift(qc)
-        self.assertIs(outcome, spec.QC.PASS)
-        # Frame rate should be inferred from frame times when available, rather than ops['fs']
-        with mock.patch('mpci.suite2p.qc.get_low_freq_power_fraction',
-                        return_value=np.ones(30)) as get_fraction:
-            qc.data['times'] = np.arange(self.n_frames) / 4.
-            MesoscopeQC.check_z_drift(qc)
-            self.assertEqual(4., get_fraction.call_args.args[1])
-        expected = ['mpci.ROIActivityF.npy', 'mpci.ROINeuropilActivityF.npy',
-                    'mpci.ROIActivityDeconvolved.npy']
-        self.assertEqual(expected, MesoscopeQC.check_z_drift(qc, only_dsets=True))
 
 
 if __name__ == '__main__':

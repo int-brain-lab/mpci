@@ -1,14 +1,16 @@
 """WIP ROICaT processing task for MPCI data."""
 import uuid
+import pickle
 import logging
 import shutil
 import tempfile
-from itertools import groupby
+from pathlib import Path
 from collections import Counter
 
 from scipy.cluster.hierarchy import linkage, fcluster
 import numpy as np
 import pandas as pd
+import sparse
 import matplotlib.pyplot as plt
 from one.alf.path import ALFPath
 from one.api import ONE
@@ -20,6 +22,8 @@ from ibllib.pipes.tasks import Task
 from ibllib.pipes.base_tasks import RegisterRawDataTask
 from ibllib.oneibl.data_handlers import ExpectedDataset
 from typing import *
+
+from mpci.alyx.tasks import ALGORITHMS
 import scipy
 import scipy.sparse
 import torch
@@ -128,6 +132,31 @@ def extract_suite2p_mean_img(ops: dict) -> np.ndarray:
     return mean_img
 
 
+def load_spatial_footprints(masks_file) -> scipy.sparse.csr_matrix:
+    """Load the ROI masks of any ROI extraction algorithm as spatial footprints for ROICaT.
+
+    As with `extract_suite2p_spatial_footprints`, the weights of each ROI are normalized to sum
+    to 1.
+
+    Parameters
+    ----------
+    masks_file : pathlib.Path
+        An mpciROIs.masks.sparse_npz file containing a pydata sparse array of shape
+        (n_rois, height, width).
+
+    Returns
+    -------
+    scipy.sparse.csr_matrix
+        The spatial footprints with shape (n_rois, height * width).
+    """
+    masks = sparse.load_npz(masks_file)
+    n_rois = masks.shape[0]
+    footprints = masks.reshape((n_rois, -1)).to_scipy_sparse().tocsr().astype(np.float32)
+    sums = np.asarray(footprints.sum(axis=1)).ravel()
+    sums[sums == 0] = 1  # avoid dividing by zero for empty masks
+    return scipy.sparse.csr_matrix(scipy.sparse.diags(1 / sums) @ footprints)
+
+
 class DemixingRoicat(Data_roicat):
 
     _notes = "um per pixel always 1.2 for IBL 2p mesoscope data"
@@ -219,6 +248,9 @@ class ROICaTTask(SubjectAggregateTask):
     job_size = 'large'  # either 'small' or 'large', defines whether task should be run as part of the large or small job services
     env = 'roicat'  # the environment name within which to run the task (NB: the env is not activated automatically!)
 
+    ROI_DATASETS = ('mpciROIs.masks.sparse_npz', 'mpciMeanImage.images.npy', 'mpciROIs.uuids.csv')
+    """tuple of str: The ROI datasets loaded from the algorithm's FOV folder."""
+
     def __init__(self, subject_path, select_RFM_days_only=False, **kwargs):
         """A task for running ROICaT accross a subject's imaging sessions.
 
@@ -228,9 +260,16 @@ class ROICaTTask(SubjectAggregateTask):
             The root subject path containing the sessions to process.
         select_RFM_days_only : bool, optional
             Whether to only select days with Receptive Field Mapping data, by default False.
+        algorithm : str
+            The ROI extraction algorithm whose ROIs to track, i.e. 'suite2p' (default) or
+            'masknmf'. The ROI datasets are loaded from alf/FOV_??/<algorithm>.
         """
         super().__init__(subject_path, **kwargs)
         self.select_RFM_days_only = select_RFM_days_only
+        # NB: Not popped so that it is stored in the task arguments
+        self.algorithm = kwargs.get('algorithm', 'suite2p')
+        if self.algorithm not in ALGORITHMS:
+            raise ValueError(f'algorithm must be one of {ALGORITHMS}')
 
     @property
     def signature(self):
@@ -238,7 +277,8 @@ class ROICaTTask(SubjectAggregateTask):
         I = ExpectedDataset.input  # noqa
         # TODO Handle mlapdv provenance properly
         inputs = I('mpciMeanImage.mlapdv_estimate.npy', '????-??-??/???/alf/FOV_??', True, unique=False)
-        inputs &= I('_suite2p_ROIData.raw.zip', '????-??-??/???/alf/FOV_??', True, unique=False)
+        for name in self.ROI_DATASETS:
+            inputs &= I(name, f'????-??-??/???/alf/FOV_??/{self.algorithm}', True, unique=False)
         if self.select_RFM_days_only:
             raise NotImplementedError('AND with aggregates not implemented yet')
             # FIXME may be in 'alf/' if only one protocol run that session
@@ -284,7 +324,8 @@ class ROICaTTask(SubjectAggregateTask):
                 if kwargs.get('display_processed_images', True):
                     mean_images = self.load_data(paths).FOV_images
                 else:
-                    mean_images = [np.load(path / 'mpciMeanImage.images.npy') for path in paths]
+                    mean_images = [np.load(path / self.algorithm / 'mpciMeanImage.images.npy')
+                                   for path in paths]
                 # Create a figure with as many subplots as paths in the cluster
                 fig, axs = plt.subplots(1, len(paths), figsize=(5 * len(paths), 5))
                 fig.suptitle(f'FOV group {gID}', fontsize=16)
@@ -348,7 +389,7 @@ class ROICaTTask(SubjectAggregateTask):
             # Load the ROI UUIDs from each session into a table
             dfs = []
             for path in paths:
-                df = pd.read_csv(path / 'mpciROIs.uuids.csv', names=['roi_id'], header=0)
+                df = pd.read_csv(path / self.algorithm / 'mpciROIs.uuids.csv', names=['roi_id'], header=0)
                 df['FOV_path'] = path.name
                 df['session_path'] = path.session_path_short()
                 df['eid'] = self.one.path2eid(path.session_path()) if self.one else None
@@ -388,7 +429,8 @@ class ROICaTTask(SubjectAggregateTask):
         """
         Load the data for ROICaT processing.
         Args:
-            paths: List of paths, one to each of the suite2p_ROIData.raw.zip files
+            paths: List of FOV paths (alf/FOV_??), whose algorithm subfolder contains the ROI masks
+                and mean image.
 
         """
 
@@ -396,12 +438,9 @@ class ROICaTTask(SubjectAggregateTask):
         mean_images = []
         footprints = []
         for filepath in paths:
-            zip_path = filepath / '_suite2p_ROIData.raw.zip'
-            zip = np.load(zip_path, allow_pickle=True)
-            curr_ops = zip['ops'].item()
-            curr_stat = zip['stat']
-            footprints.append(extract_suite2p_spatial_footprints(curr_ops, curr_stat))
-            mean_images.append(extract_suite2p_mean_img(curr_ops))
+            roi_path = filepath / self.algorithm
+            footprints.append(load_spatial_footprints(roi_path / 'mpciROIs.masks.sparse_npz'))
+            mean_images.append(np.load(roi_path / 'mpciMeanImage.images.npy'))
 
 
         data = DemixingRoicat(mean_images,
@@ -419,11 +458,12 @@ class ROICaTTask(SubjectAggregateTask):
                 assert self.one and not self.one.offline, 'Remote data handling requires an active One instance'
                 eids = self.one.search(subject=self.subject_path.name, datasets=['_ibl_mpciMeanImage.mlapdv_estimate.npy'])
                 raise NotImplementedError('Remote data handling not implemented yet')
-        # Find ordered list of
+        # Find ordered list of FOV folders
         success, files, _ = self.input_files[0].find_files(self.subject_path)
-        # Filter sessions with both meanimage and raw zip present
-        files_grouped = groupby(sorted(files, key=lambda x: x.parent), key=lambda x: x.parent)
-        alf_paths = [ALFPath(k) for k, g in files_grouped if len(list(g)) == 2]  # both files present
+        fov_paths = sorted({ALFPath(f.parent) for f in files if f.parent.name.startswith('FOV_')})
+        # Filter FOVs with both the mean image MLAPDV and the algorithm's ROI datasets present
+        alf_paths = [p for p in fov_paths
+                     if all(p.joinpath(self.algorithm, name).exists() for name in self.ROI_DATASETS)]
 
         if sessions_to_exclude:
             alf_paths = [path for path in alf_paths if path.session_path_short() not in sessions_to_exclude]
@@ -575,7 +615,6 @@ def validate_sessions_list(paths):
 
 
 if __name__ == '__main__':
-    from pathlib import Path
     ROOT = Path('/mnt/whiterussian/Subjects')
     subject = 'SP072'
     subject_path = ROOT / subject

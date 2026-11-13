@@ -14,6 +14,13 @@ from mpci.scanimage.io import patch_imaging_meta
 
 _logger = logging.getLogger(__name__)
 
+ALGORITHMS = ('suite2p', 'masknmf')
+"""tuple of str: The supported motion correction and ROI extraction algorithms.
+
+The outputs of each algorithm are saved in a subfolder of the FOV collection with this name, e.g.
+alf/FOV_00/suite2p.
+"""
+
 
 class MesoscopeTask(DynamicTask):
 

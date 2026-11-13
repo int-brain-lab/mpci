@@ -4,7 +4,6 @@ Two tasks are defined: the first ensures the motion corrected bin files are extr
 the second runs masknmf on the extracted files.
 """
 import gc
-import os
 import uuid
 from typing import *
 import logging
@@ -20,75 +19,14 @@ from scipy.io import loadmat
 from iblutil.util import flatten, ensure_list
 from ibllib.oneibl.data_handlers import ExpectedDataset, dataset_from_name
 from mpci.suite2p.task import MesoscopePreprocess
+from mpci.suite2p.io import MotionBinDataset  # noqa: F401
 from mpci.alyx.tasks import MesoscopeTask
 from mpci.masknmf.io import get_frame_loader
+from mpci.qc.registration import (
+    REGISTRATION_PCS, compute_registration_pcs, masknmf_registered_frames)
 import sparse
 
 logger = logging.getLogger('ibllib.' + __name__)
-
-
-class MotionBinDataset:
-    """Load a suite2p data.bin imaging registration file."""
-
-    def __init__(self,
-                 data_path: Union[str, Path],
-                 metadata_path: Union[str, Path]):
-        """
-        Load a suite2p data.bin imaging registration file.
-
-        Parameters
-        ----------
-        data_path (str, pathlib.Path): The session path containing preprocessed data.
-        metadata_path (str, pathlib.Path): The metadata_path to load.
-        """
-        self.bin_path = Path(data_path)
-        self.ops_path = Path(metadata_path)
-        self._dtype = np.int16
-        self._shape = self._compute_shape()
-        self.data = np.memmap(self.bin_path, mode='r', dtype=self.dtype, shape=self.shape)
-
-    @property
-    def dtype(self) -> np.dtype:
-        return self._dtype
-
-    @property
-    def shape(self):
-        """
-        This property should return the shape of the dataset, in the form: (d1, d2, T) where d1
-        and d2 are the field of view dimensions and T is the number of frames.
-
-        Returns
-        -------
-        (int, int, int)
-            The number of y pixels, number of x pixels, number of frames.
-        """
-        return self._shape
-
-    @property
-    def ndim(self):
-        return len(self.shape)
-
-    def _compute_shape(self):
-        """
-        Loads the suite2p ops file to retrieve the dimensions of the data.bin file. This is now lazily loaded from a
-        zip file
-
-        Returns
-        -------
-        (int, int, int)
-            number of frames, number of y pixels, number of x pixels.
-        """
-        _, ext_path = os.path.splitext(self.ops_path)
-        if ext_path == ".zip":
-            s2p_ops = np.load(self.ops_path, allow_pickle = True)['ops'].item()
-        elif ext_path == ".npy":
-            s2p_ops = np.load(self.ops_path, allow_pickle = True).item()
-        else:
-            raise ValueError("The file name should either be zip or npy")
-        return s2p_ops['nframes'], s2p_ops['Ly'], s2p_ops['Lx']
-
-    def __getitem__(self, item: Union[int, list, np.ndarray, Tuple[Union[int, np.ndarray, slice, range]]]):
-        return self.data[item].copy()
 
 
 class Suite2pMotionCorrection(MesoscopePreprocess):
@@ -156,6 +94,8 @@ class MasknmfPreprocess(MesoscopeTask):
             O('mpci.badFrames.npy', alf_collection, True, unique=False),
             O('mpci.mpciFrameQC.npy', alf_collection, False, unique=False),
             O('mpciFrameQC.names.tsv', alf_collection, False, unique=False),
+            # Intermediate QC file used by the MesoscopeRegistrationQC task (not registered)
+            O(REGISTRATION_PCS, alf_collection, False, register=False, unique=False),
             ]
         return signature
 
@@ -350,6 +290,37 @@ class MasknmfPreprocess(MesoscopeTask):
         traces[npix == 0] = np.nan
         return traces.T.numpy()
 
+    def compute_registration_qc(self, frames, results_path, badframes, **kwargs):
+        """Compute the registration PCs of a FOV for the registration QC.
+
+        The PCs are computed from every good frame of the movie with masknmf's motion correction
+        applied, and saved to the folder of the results file, to be used by the
+        MesoscopeRegistrationQC task. This file is not registered to Alyx.
+
+        Parameters
+        ----------
+        frames : array-like
+            The raw movie of the FOV with shape (n_frames, height, width).
+        results_path : pathlib.Path
+            The masknmf results file containing the motion correction, i.e.
+            _masknmf_ROIData.raw.hdf5.
+        badframes : numpy.array
+            A boolean array of length n_frames, where True indicates a frame to exclude.
+        **kwargs
+            Keyword arguments passed to `mpci.qc.registration.compute_registration_pcs`, e.g.
+            bin_factor.
+
+        Returns
+        -------
+        pathlib.Path
+            The saved registration PCs file.
+        """
+        registered, crop = masknmf_registered_frames(results_path, frames)
+        logger.info('Computing registration PCs for %s', Path(results_path).parent.parent.name)
+        tPC, _ = compute_registration_pcs(registered, badframes, crop=crop, **kwargs)
+        np.save(out_file := Path(results_path).with_name(REGISTRATION_PCS), tPC)
+        return out_file
+
     def load_frame_qc(self, all_meta, fov_path=None, overwrite=False):
         """
         Load the experimenter frame QC and bad frames.
@@ -426,7 +397,7 @@ class MasknmfPreprocess(MesoscopeTask):
             badframes = np.zeros(total_frames, dtype=bool)
         return frameQC, frameQC_names, badframes
 
-    def _run(self, load_into_ram=True, FOVs=None, overwrite=False, **kwargs):
+    def _run(self, load_into_ram=True, FOVs=None, overwrite=False, registration_qc=True, **kwargs):
         """
         Run masknmf pipeline.
 
@@ -441,6 +412,10 @@ class MasknmfPreprocess(MesoscopeTask):
             If true, any intermediate files from a previous run are ignored, namely the bad
             frames used when no badframes.mat files are present, and the config and log files
             of previous masknmf runs are removed.
+        registration_qc : bool, dict
+            Whether to compute the registration PCs for the registration QC (see
+            `compute_registration_qc`). May be a dict of keyword arguments for
+            `mpci.qc.registration.compute_registration_pcs`, e.g. {'bin_factor': 2}.
         """
 
         out = []
@@ -506,6 +481,16 @@ class MasknmfPreprocess(MesoscopeTask):
             # Rename the results.hdf5 file to _masknmf_ROIData.raw.hdf5 to match the expected output signature
             out_demix_path = results_folder.joinpath('results.hdf5').rename(
                 out_path / '_masknmf_ROIData.raw.hdf5')
+
+            # Compute the registration PCs for the registration QC
+            # NB: A failure to compute the PCs should not cause the task to fail
+            if registration_qc:
+                qc_kwargs = registration_qc if isinstance(registration_qc, dict) else {}
+                try:
+                    self.compute_registration_qc(frames, out_demix_path, badframes, **qc_kwargs)
+                except Exception:
+                    logger.exception('Failed to compute registration QC for FOV_%02i', i)
+                gc.collect()
 
             logger.info(f'Saving results for FOV_{i:02d}')
             demixing_results = masknmf.DemixingResults.from_hdf5(out_demix_path)
