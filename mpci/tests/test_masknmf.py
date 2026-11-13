@@ -22,6 +22,7 @@ from masknmf.arrays.array_interfaces import ArrayLike
 from masknmf.compression import CompressionArray
 from mpci.masknmf.io import ScanImageTiffSeriesLoader, read_fov_line_indices, collect_tiff_paths
 from mpci.masknmf.task import MasknmfPreprocess
+from mpci.qc.registration import REGISTRATION_PCS
 from mpci.tests import IntegrationTestCase
 
 
@@ -171,18 +172,20 @@ class MasknmfRunMixin:
              mock.patch('mpci.masknmf.task.get_frame_loader', return_value=frames), \
              mock.patch.object(MasknmfPreprocess, '_format_to_mpci', return_value=formatted), \
              mock.patch.object(MasknmfPreprocess, '_neuropil_masks', return_value=neuropil_masks), \
-             mock.patch.object(MasknmfPreprocess, '_neuropil_traces', return_value=F + 1):
+             mock.patch.object(MasknmfPreprocess, '_neuropil_traces', return_value=F + 1), \
+             mock.patch.object(MasknmfPreprocess, 'compute_registration_qc') as registration_qc:
             centers = from_hdf5.return_value.signals_array.centers
             centers.cpu.return_value.numpy.return_value = np.zeros((self.n_rois, 2))
             mean_image = from_hdf5.return_value.mean_image.cpu.return_value.numpy
             mean_image.return_value = np.ones((4, 4), dtype=np.float32)
             out = task._run(**kwargs)
+        self.registration_qc = registration_qc  # NB: tested separately
         return task, out, pipelines
 
     def assert_outputs_match_signature(self, task, out):
-        """Assert that the returned files are exactly those matching the output signature."""
+        """Assert that the returned files are exactly those to be registered in the output signature."""
         expected = chain.from_iterable(
-            d.find_files(task.session_path)[1] for d in task.output_files)
+            d.find_files(task.session_path, register=True)[1] for d in task.output_files)
         self.assertCountEqual(set(expected), out)
         self.assertTrue(task.assert_expected(task.output_files)[0])
 
@@ -293,6 +296,27 @@ class TestMasknmfPreprocessRun(MasknmfRunMixin, unittest.TestCase):
             np.testing.assert_array_equal(~bad_frames, good_frames)
         self.assert_outputs_match_signature(task, out)
 
+    def test_registration_qc(self):
+        """Test the registration PCs are computed for each FOV."""
+        expected_bad = self._save_frame_qc()
+        task, out, _ = self.run_task(self.session_path)
+        self.assertEqual(2, self.registration_qc.call_count)
+        for i, call in enumerate(self.registration_qc.call_args_list):
+            frames, results_path, bad_frames = call.args
+            out_path = self.session_path.joinpath('alf', f'FOV_{i:02}', 'masknmf')
+            self.assertEqual(out_path / '_masknmf_ROIData.raw.hdf5', results_path)
+            self.assertEqual(sum(self.n_frames), frames.shape[0])
+            np.testing.assert_array_equal(expected_bad, np.where(bad_frames)[0])
+            self.assertEqual({}, call.kwargs)
+        # The PCs file should be an optional output that is not registered
+        dset, = dataset_from_name(REGISTRATION_PCS, task.output_files)
+        self.assertFalse(dset.register)
+        # Keyword arguments may be passed to compute the PCs, or the QC skipped
+        self.run_task(self.session_path, FOVs=[0], registration_qc={'bin_factor': 2})
+        self.assertEqual({'bin_factor': 2}, self.registration_qc.call_args.kwargs)
+        self.run_task(self.session_path, FOVs=[0], registration_qc=False)
+        self.registration_qc.assert_not_called()
+
     def test_no_frame_qc(self):
         """Test behaviour when there are no exptQC.mat or badframes.mat files."""
         with self.assertLogs('ibllib.mpci.masknmf.task', 'WARNING'):
@@ -386,6 +410,37 @@ class TestMasknmfPreprocessRun(MasknmfRunMixin, unittest.TestCase):
         self.run_task(self.session_path, FOVs=[1])
         new_uuids = pd.read_csv(uuids_file)['uuids'].apply(UUID)
         self.assertFalse(set(uuids) & set(new_uuids))
+
+
+class TestMasknmfRegistrationQC(unittest.TestCase):
+    """Test for MasknmfPreprocess.compute_registration_qc method."""
+
+    def test_compute_registration_qc(self):
+        from masknmf.motion_correction import RigidRegistrationArray
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        session_path = Path(tmp.name).joinpath('subject', '2020-01-01', '001')
+        (out_path := session_path.joinpath('alf', 'FOV_00', 'masknmf')).mkdir(parents=True)
+        n_frames = 50
+        movie = np.random.default_rng(0).standard_normal((n_frames, 30, 24)).astype(np.float32)
+        results_path = out_path / '_masknmf_ROIData.raw.hdf5'
+        RigidRegistrationArray(movie, torch.zeros(n_frames, 2)).export(results_path)
+        badframes = np.zeros(n_frames, dtype=bool)
+        badframes[:5] = True
+        task = MasknmfPreprocess(session_path)
+        tPC = np.ones((n_frames - 5, 3))
+        with mock.patch('mpci.masknmf.task.compute_registration_pcs',
+                        return_value=(tPC, np.ones(3))) as compute:
+            out_file = task.compute_registration_qc(movie, results_path, badframes, bin_factor=2)
+        self.assertEqual(out_path / REGISTRATION_PCS, out_file)
+        np.testing.assert_array_equal(tPC, np.load(out_file))
+        (frames, actual_badframes), kwargs = compute.call_args
+        # The PCs should be computed from the movie with masknmf's motion correction applied
+        self.assertIsInstance(frames, RigidRegistrationArray)
+        self.assertIs(movie, frames.input_movie)
+        np.testing.assert_array_equal(badframes, actual_badframes)
+        # The pixels at the edges should be excluded
+        self.assertEqual({'crop': (slice(8, 22), slice(8, 16)), 'bin_factor': 2}, kwargs)
 
 
 class TestNeuropil(unittest.TestCase):

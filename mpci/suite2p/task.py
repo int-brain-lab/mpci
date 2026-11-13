@@ -16,6 +16,7 @@ from iblutil.util import flatten, ensure_list
 from ibllib.oneibl.data_handlers import ExpectedDataset, dataset_from_name
 
 from mpci.alyx.tasks import MesoscopeTask
+from mpci.qc.registration import REGISTRATION_PCS
 
 _logger = logging.getLogger(__name__)
 
@@ -111,7 +112,9 @@ class MesoscopePreprocess(MesoscopeTask):
                              ('mpciROIs.masks.sparse_npz', alf_collection, True),
                              ('mpciROIs.neuropilMasks.sparse_npz', alf_collection, True),
                              ('_suite2p_ROIData.raw.zip', alf_collection, False),
-                             ('imaging.frames_motionRegistered.bin', 'suite2p/plane*', False)]
+                             ('imaging.frames_motionRegistered.bin', 'suite2p/plane*', False),
+                             # Intermediate QC file used by the registration QC (not registered)
+                             (REGISTRATION_PCS, alf_collection, False, False)]
         }
         if not self.overwrite:  # If not forcing re-registration, check whether bin files already exist on disk
             # Including the data.bin in the expected signature ensures raw data files are not needlessly re-downloaded
@@ -178,7 +181,7 @@ class MesoscopePreprocess(MesoscopeTask):
         Returns
         -------
         list of pathlib.Path
-            All paths found in FOV folders.
+            All paths found in the FOV suite2p folders (alf/FOV_??/suite2p).
         """
         if rename_dict is None:
             rename_dict = {
@@ -186,14 +189,17 @@ class MesoscopePreprocess(MesoscopeTask):
                 'spks.npy': 'mpci.ROIActivityDeconvolved.npy',
                 'Fneu.npy': 'mpci.ROINeuropilActivityF.npy'
             }
-        fov_dsets = [d[0] for d in self.signature['output_files'] if d[1].startswith('alf/FOV')]
+        # NB: Exclude the outputs that are not registered, e.g. the registration QC PCs, which are
+        # saved to the FOV folder before renaming
+        fov_dsets = [d[0] for d in self.signature['output_files']
+                     if d[1].startswith('alf/FOV') and (len(d) < 4 or d[3])]
         for plane_dir in self._get_plane_paths(suite2p_dir):
             # Rename the registered bin file
             if (bin_file := plane_dir.joinpath('data.bin')).exists():
                 bin_file.rename(plane_dir.joinpath('imaging.frames_motionRegistered.bin'))
             # Archive the raw suite2p output before renaming
             n = int(plane_dir.name.split('plane')[1])
-            fov_dir = self.session_path.joinpath('alf', f'FOV_{n:02}')
+            fov_dir = self.session_path.joinpath('alf', f'FOV_{n:02}', 'suite2p')
             if fov_dir.exists():
                 for f in filter(Path.exists, map(fov_dir.joinpath, fov_dsets)):
                     _logger.debug('Removing old file %s', f.relative_to(self.session_path))
@@ -237,7 +243,7 @@ class MesoscopePreprocess(MesoscopeTask):
                 if path.name != 'ops.npy' and path.suffix != '.bin':
                     path.unlink() if path.is_file() else path.rmdir()
         # Collect all files in those directories
-        datasets = self.session_path.joinpath('alf').rglob('FOV_??/*.*.*')
+        datasets = self.session_path.joinpath('alf').glob('FOV_??/suite2p/*.*.*')
         return sorted(x for x in datasets if x.name in fov_dsets)
 
     @staticmethod
@@ -546,7 +552,43 @@ class MesoscopePreprocess(MesoscopeTask):
         ret = suite2p.run_plane(ops)
         return ret
 
-    def _run(self, rename_files=True, use_badframes=True, **kwargs):
+    def compute_registration_qc(self, plane_path, overwrite=False, **kwargs):
+        """Compute the registration PCs of a plane for the registration QC.
+
+        The PCs are computed from every good frame of suite2p's registered bin file and saved to
+        the FOV's suite2p collection, to be used by the MesoscopeRegistrationQC task. This file is
+        not registered to Alyx.
+
+        Parameters
+        ----------
+        plane_path : pathlib.Path
+            The suite2p plane folder containing the registered bin file and ops.
+        overwrite : bool
+            If false and the PCs were previously saved, they are not recomputed.
+        **kwargs
+            Keyword arguments passed to `mpci.qc.registration.compute_registration_pcs`, e.g.
+            bin_factor.
+
+        Returns
+        -------
+        pathlib.Path
+            The saved registration PCs file.
+        """
+        from mpci.qc.registration import compute_registration_pcs, suite2p_registered_frames
+        n = int(plane_path.name.split('plane')[1])
+        out_file = self.session_path.joinpath('alf', f'FOV_{n:02}', 'suite2p', REGISTRATION_PCS)
+        if out_file.exists() and not overwrite:
+            _logger.debug('%s already exists', out_file.relative_to(self.session_path))
+            return out_file
+        frames, crop, ops = suite2p_registered_frames(plane_path)
+        badframes = np.asarray(ops['badframes'], dtype=bool)  # NB: saved as mpci.badFrames.npy
+        _logger.info('Computing registration PCs for %s', plane_path.name)
+        tPC, _ = compute_registration_pcs(frames, badframes, crop=crop, **kwargs)
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        np.save(out_file, tPC)
+        return out_file
+
+    def _run(self, rename_files=True, use_badframes=True, registration_qc=True, **kwargs):
         """
         Process inputs, run suite2p and make outputs alf compatible.
 
@@ -560,6 +602,10 @@ class MesoscopePreprocess(MesoscopeTask):
             Whether to rename and reorganize the suite2p outputs to be alf compatible. Defaults is True.
         use_badframes: bool
             Whether to exclude bad frames indicated by the experimenter in badframes.mat.
+        registration_qc : bool, dict
+            Whether to compute the registration PCs for the registration QC (see
+            `compute_registration_qc`). May be a dict of keyword arguments for
+            `mpci.qc.registration.compute_registration_pcs`, e.g. {'bin_factor': 2}.
         overwrite : bool
             Whether to re-perform extraction and motion registration.
         do_registration : bool
@@ -641,14 +687,26 @@ class MesoscopePreprocess(MesoscopeTask):
         self.session_path.joinpath('alf').mkdir(exist_ok=True)
 
         # Perform registration
-        if kwargs.get('do_registration', True):
+        if do_registration := kwargs.get('do_registration', True):
             _logger.info('Performing registration')
             for plane in plane_folders:
                 ops = np.load(plane.joinpath('ops.npy'), allow_pickle=True).item()
                 ops.update(kwargs)
                 # (ops['do_registration'], ops['reg_file'], ops['meanImg'])
                 _ = self.image_motion_registration(ops)
-                # TODO Handle metrics and QC here
+
+        # Compute the registration PCs for the registration QC, which require masknmf
+        # NB: A failure to compute the PCs should not cause the task to fail
+        if registration_qc:
+            qc_kwargs = registration_qc if isinstance(registration_qc, dict) else {}
+            for plane in plane_folders:
+                try:
+                    self.compute_registration_qc(plane, overwrite=do_registration, **qc_kwargs)
+                except ImportError as ex:
+                    _logger.warning('Skipping registration QC: %s', ex)
+                    break
+                except Exception:
+                    _logger.exception('Failed to compute registration QC for %s', plane.name)
 
         # ROI detection
         if kwargs.get('roidetect', True):
@@ -663,7 +721,8 @@ class MesoscopePreprocess(MesoscopeTask):
         if rename_files:
             self._rename_outputs(save_path, frameQC_names, frameQC)
             # Only return output file that are in the signature (for registration)
-            out_files = chain.from_iterable(map(lambda x: x.find_files(self.session_path)[1], self.output_files))
+            out_files = chain.from_iterable(
+                x.find_files(self.session_path, register=True)[1] for x in self.output_files)
         else:
             out_files = save_path.rglob('*.*')  # Output all files in suite2p folder
 

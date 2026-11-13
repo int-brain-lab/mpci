@@ -15,8 +15,11 @@ import numpy as np
 import pandas as pd
 import sparse
 
+from ibllib.oneibl.data_handlers import dataset_from_name, OptionalOutput
+
 from mpci.tests import TEST_DB, IntegrationTestCase
 from mpci.suite2p.task import MesoscopePreprocess
+from mpci.qc.registration import REGISTRATION_PCS
 
 
 def mock_suite2p(test_case, **attrs):
@@ -279,6 +282,54 @@ class TestMesoscopePreprocess(unittest.TestCase):
         self.td.cleanup()
 
 
+class TestMesoscopePreprocessRegistrationQC(unittest.TestCase):
+    """Test for MesoscopePreprocess.compute_registration_qc method."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.session_path = Path(tmp.name).joinpath('subject', '2020-01-01', '001')
+        self.plane_path = self.session_path.joinpath('suite2p', 'plane1')
+        self.plane_path.mkdir(parents=True)
+        self.task = MesoscopePreprocess(self.session_path, one=mock.MagicMock(offline=True))
+
+    def test_signature(self):
+        """Test the registration PCs are an optional output that is not registered."""
+        self.task.get_signatures()
+        dset, = dataset_from_name(REGISTRATION_PCS, self.task.output_files)
+        self.assertIsInstance(dset, OptionalOutput)
+        self.assertFalse(dset.register)
+        self.assertEqual('alf/FOV_??/suite2p', dset.identifiers[0])
+
+    def test_compute_registration_qc(self):
+        n_frames, Ly, Lx = 100, 12, 10
+        movie = np.random.default_rng(0).integers(0, 100, (n_frames, Ly, Lx), dtype=np.int16)
+        movie.tofile(self.plane_path / 'data.bin')
+        badframes = np.zeros(n_frames, dtype=bool)
+        badframes[:5] = True
+        ops = {'nframes': n_frames, 'Ly': Ly, 'Lx': Lx, 'badframes': badframes,
+               'yrange': [1, 11], 'xrange': [2, 9]}
+        np.save(self.plane_path / 'ops.npy', ops)
+        tPC = np.ones((n_frames - 5, 3))
+        with mock.patch('mpci.qc.registration.compute_registration_pcs',
+                        return_value=(tPC, np.ones(3))) as compute:
+            out_file = self.task.compute_registration_qc(self.plane_path, bin_factor=2)
+        expected = self.session_path.joinpath('alf', 'FOV_01', 'suite2p', REGISTRATION_PCS)
+        self.assertEqual(expected, out_file)
+        np.testing.assert_array_equal(tPC, np.load(out_file))
+        (frames, actual_badframes), kwargs = compute.call_args
+        self.assertEqual(movie.shape, frames.shape)
+        np.testing.assert_array_equal(badframes, actual_badframes)
+        self.assertEqual({'crop': (slice(1, 11), slice(2, 9)), 'bin_factor': 2}, kwargs)
+        # Without overwrite, the PCs should not be recomputed
+        with mock.patch('mpci.qc.registration.compute_registration_pcs',
+                        return_value=(tPC, np.ones(3))) as compute:
+            self.assertEqual(expected, self.task.compute_registration_qc(self.plane_path))
+            compute.assert_not_called()
+            self.task.compute_registration_qc(self.plane_path, overwrite=True)
+            compute.assert_called_once()
+
+
 class TestMesoscopePreprocessRename(IntegrationTestCase):
     session_path = None
 
@@ -305,6 +356,8 @@ class TestMesoscopePreprocessRename(IntegrationTestCase):
         task = MesoscopePreprocess(session_path, one=self.one)
         files = task._rename_outputs(self.suite2pdir.parent, None, None)
         self.assertTrue(all(map(Path.exists, files)))
+        # The outputs should be saved to the FOV's suite2p folder
+        self.assertEqual({session_path / 'alf' / 'FOV_02' / 'suite2p'}, {f.parent for f in files})
         self.assertTrue(self.suite2pdir.exists())
         # Check that other files were removed (note: there's no bin file in this test)
         self.assertEqual({'ops.npy'}, set(x.name for x in self.suite2pdir.rglob('*.*')))
@@ -343,11 +396,13 @@ class TestMesoscopePreprocessRename(IntegrationTestCase):
         """
         # Create an old FOV folder for it to remove
         session_path = get_session_path(self.suite2pdir)
-        (fov_folder := session_path.joinpath('alf', 'FOV_02')).mkdir(parents=True)
+        (fov_folder := session_path.joinpath('alf', 'FOV_02', 'suite2p')).mkdir(parents=True)
         for name in self.rename_dict.values():
             fov_folder.joinpath(name).touch()
-        # Should not delete other files from this folder
-        fov_folder.joinpath('mpci.times.npy').touch()
+        # Should not delete other files from these folders, including the registration QC PCs,
+        # which are computed before renaming
+        fov_folder.parent.joinpath('mpci.times.npy').touch()
+        fov_folder.joinpath(REGISTRATION_PCS).touch()
 
         # Create binary data files
         self.suite2pdir.joinpath('data.bin').touch()
@@ -363,7 +418,9 @@ class TestMesoscopePreprocessRename(IntegrationTestCase):
         log_messages = [x for x in log_messages if x.startswith('Removing old file')]
         self.assertEqual(len(self.rename_dict), len(log_messages))
         self.assertNotIn('mpci.times.npy', ' '.join(log_messages))
-        self.assertTrue(fov_folder.joinpath('mpci.times.npy').exists())
+        self.assertTrue(fov_folder.parent.joinpath('mpci.times.npy').exists())
+        self.assertTrue(fov_folder.joinpath(REGISTRATION_PCS).exists())
+        self.assertNotIn(fov_folder.joinpath(REGISTRATION_PCS), files)
         # Check frameQC is saved
         self.assertIn(files[0].with_name('mpciFrameQC.names.tsv'), files)
         self.assertIn(files[0].with_name('mpci.mpciFrameQC.npy'), files)

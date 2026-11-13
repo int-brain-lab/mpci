@@ -208,7 +208,9 @@ class TestMesoscopeFOVOutput(IntegrationTestCase):
             v = np.linspace(0, self.n_pixels - 1, n_roi).astype(int)
             roi_mlapdv = np.vstack([v, v, np.zeros_like(v)]).T
             self.expected_roi_mlapdv[i] = np.c_[roi_mlapdv[:, :2] + self.offset, roi_mlapdv[:, 2]]
-            np.save(alf_path / 'mpciROIs.stackPos.npy', roi_mlapdv)
+            # The ROI datasets are in the algorithm's folder
+            (roi_path := alf_path / 'suite2p').mkdir()
+            np.save(roi_path / 'mpciROIs.stackPos.npy', roi_mlapdv)
         # For now the meta only contains number of FOVs
         alf_path = self.session_path.joinpath('raw_imaging_data')
         alf_path.mkdir()
@@ -231,8 +233,12 @@ class TestMesoscopeFOVOutput(IntegrationTestCase):
         # Mean image brain locations should be int
         file = next(f for f in task.outputs if 'mpciMeanImage.brainLocationIds_ccf_2017_estimate' in f.name)
         self.assertIs(np.load(file).dtype, np.dtype('int'))
+        # The mean image datasets should be in the FOV folder; ROI datasets in the suite2p folder
+        fov_path = self.session_path / 'alf' / 'FOV_00'
+        self.assertTrue(any(f.parent == fov_path for f in task.outputs))
+        self.assertFalse(any(f.parent == fov_path for f in task.outputs if 'mpciROIs' in f.name))
         # Check ROI MLAPDV and brain locations
-        rois = alfio.load_object(self.session_path / 'alf' / 'FOV_00', 'mpciROIs')
+        rois = alfio.load_object(fov_path / 'suite2p', 'mpciROIs')
         expected = {'brainLocationIds_ccf_2017_estimate', 'mlapdv_estimate', 'stackPos'}
         self.assertCountEqual(expected, rois.keys())
         expected = self.expected_roi_mlapdv[0]
@@ -254,13 +260,35 @@ class TestMesoscopeFOVOutput(IntegrationTestCase):
             mock_obj.assert_called_once_with(unittest.mock.ANY, Provenance.HISTOLOGY)
         self.assertEqual((self.n_fov * 4) + 1, len(task.outputs))  # + 1 for modified meta file
         self.assertFalse(any('_estimate' in x.name for x in task.outputs))
-        rois = alfio.load_object(self.session_path / 'alf' / 'FOV_00', 'mpciROIs')
+        rois = alfio.load_object(fov_path / 'suite2p', 'mpciROIs')
         expected = {'brainLocationIds_ccf_2017', 'mlapdv', 'stackPos'}
         self.assertTrue(expected <= set(rois.keys()))
 
         # Check behaviour when there are incomplete datasets
-        self.session_path.joinpath('alf', 'FOV_00', 'mpciROIs.stackPos.npy').unlink()
+        fov_path.joinpath('suite2p', 'mpciROIs.stackPos.npy').unlink()
         self.assertRaises(FileNotFoundError, task.roi_mlapdv, self.n_fov)
+
+    def test_mesoscope_fov_masknmf(self):
+        """Test MesoscopeFOV._run with masknmf ROIs, whose positions are sub-pixel."""
+        for i in range(self.n_fov):
+            alf_path = self.session_path.joinpath('alf', f'FOV_{i:02}')
+            stack_pos = np.load(alf_path / 'suite2p' / 'mpciROIs.stackPos.npy').astype(float)
+            stack_pos[:, :2] += .3  # centres of mass
+            (alf_path / 'masknmf').mkdir()
+            np.save(alf_path / 'masknmf' / 'mpciROIs.stackPos.npy', stack_pos)
+        task = MesoscopeFOV(self.session_path, device_collection='raw_imaging_data',
+                            one=self.one, algorithm='masknmf')
+        mean_img_map = (self.mean_img_mlapdv, self.mean_img_ids)
+        with mock.patch.object(task, 'register_fov'), \
+                mock.patch.object(task, 'project_mlapdv', return_value=mean_img_map):
+            self.assertEqual(0, task.run())
+        self.assertEqual(self.n_fov * 4 + 1, len(task.outputs))
+        rois = alfio.load_object(self.session_path / 'alf' / 'FOV_00' / 'masknmf', 'mpciROIs')
+        np.testing.assert_array_equal(self.expected_roi_mlapdv[0], rois['mlapdv_estimate'])
+        # The suite2p ROIs should be unaffected
+        suite2p_files = self.session_path.joinpath('alf', 'FOV_00', 'suite2p').iterdir()
+        self.assertEqual(['mpciROIs.stackPos.npy'], [f.name for f in suite2p_files])
+        self.assertRaises(ValueError, MesoscopeFOV, self.session_path, algorithm='foo')
 
 
 class TestProjectFOV(IntegrationTestCase):
