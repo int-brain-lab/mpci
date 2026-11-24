@@ -42,6 +42,8 @@ from mpci.alignment.stack_registration import (
 from mpci.alyx.tasks import MesoscopeTask, Provenance
 from mpci.loaders.local import (
     HISTOLOGY_FILENAME,
+    HISTOLOGY_TRANSFORM_FILENAMES,
+    HISTOLOGY_TRANSFORM_FOLDER,
     MISSING_DATA_ERRORS,
     MesoscopeLocalDataLoader,
     find_file,
@@ -361,21 +363,24 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             / self.ref_session_path.session_path_short()
         )
 
-    def _symlink_into_mirror(self, source: Path) -> Path:
-        """Symlink one of the reference session's files into the quarantine mirror.
+    def _symlink_into_mirror(self, source: Path, link: Path | None = None) -> Path:
+        """Symlink one of the reference session's files or folders into the quarantine mirror.
 
         Parameters
         ----------
         source : pathlib.Path
-            The file to link to, on a mount the loader cannot read from directly.
+            The file or folder to link to, on a mount the loader cannot read from directly.
+        link : pathlib.Path, optional
+            Where the link goes, inside the mirror. Defaults to the mirror's reference
+            collection, under the name of `source`.
 
         Returns
         -------
         pathlib.Path
-            Path of the created symlink, inside the mirror's reference collection. An existing
-            link is replaced, and the new one is unlinked on teardown.
+            Path of the created symlink. An existing link is replaced, and the new one is
+            unlinked on teardown.
         """
-        link = self.reference_data_loader.reference_path / source.name
+        link = link or self.reference_data_loader.reference_path / source.name
         if link.is_symlink() or link.exists():
             link.unlink()
         link.parent.mkdir(parents=True, exist_ok=True)
@@ -534,6 +539,50 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             f"histology ended up at {local_file} rather than at {histology_path}"
         )
         return histology_path
+
+    def ensure_local_reference_session_histology_transform(self) -> Path:
+        """Make the registration of the subject's cleared brain readable, and return its path.
+
+        This is brainregister's `ARA2sample` folder, one per subject, in the subject's folder
+        of the histology folder. On popeye that folder is symlinked into the mirror; anywhere
+        else its two parameter files are downloaded over HTTP into the subject folder.
+
+        Returns
+        -------
+        pathlib.Path
+            Path the loader reads the registration from, i.e.
+            `reference_data_loader.histology_transform.path`.
+
+        Raises
+        ------
+        ValueError
+            If the task was constructed without a reference session path.
+        """
+        self._assert_reference_session("the subject's histology transform")
+        transform_loader = self.reference_data_loader.histology_transform
+        if transform_loader.available():
+            return transform_loader.path
+
+        # the folder's place in the histology folder, below its root
+        lab = self.one.get_details(self.ref_session_path)["lab"]
+        transform_folder = Path(lab, self.ref_session_path.subject, HISTOLOGY_TRANSFORM_FOLDER)
+
+        if self.location == "popeye":
+            return self._symlink_into_mirror(
+                self.data_handler.root_path / "histology" / transform_folder,
+                link=transform_loader.path,
+            )
+
+        remote_folder = (
+            f"{self.one.alyx._par.HTTP_DATA_SERVER}/histology/{transform_folder.as_posix()}"
+        )
+        _logger.info("downloading the histology transform from %s", remote_folder)
+        transform_loader.path.mkdir(parents=True, exist_ok=True)
+        self.one.alyx.download_file(
+            [f"{remote_folder}/{filename}" for filename in HISTOLOGY_TRANSFORM_FILENAMES],
+            target_dir=transform_loader.path,
+        )
+        return transform_loader.path
 
     def backup_file(self, filepath: Path) -> Path:
         """Copy a dataset into the backup folder, before it is overwritten.
@@ -811,10 +860,12 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         -------
         numpy.ndarray
             Array with shape (h, w, 3) holding the (ml, ap, dv) coordinates in μm of each
-            pixel of the reference session's reference image.
+            pixel of the reference session's reference image. Pixels without histology, stored
+            as all zeros in the file, are NaN.
         numpy.ndarray
             Array with shape (h, w, 3) holding the corresponding Allen atlas volume indices,
-            with the AP axis flipped to match the atlas volume orientation.
+            with the AP axis flipped (index i of n becomes n - 1 - i) to match the atlas volume
+            orientation. Pixels without histology are not marked here.
 
         Raises
         ------
@@ -827,14 +878,18 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         ccf_idx = self.reference_data_loader.histology.load()
         self.reference_data_loader.histology.validate(ccf_idx)
         atlas = self.histology_atlas
+        # the file holds all zeros where a pixel has no histology; read literally, that would be
+        # the corner voxel of the atlas
+        missing = (ccf_idx == 0).all(axis=-1)
 
-        # flip the ap axis to match the atlas volume orientation
-        ccf_idx[:, :, 1] = np.abs(ccf_idx[:, :, 1].astype("int64") - atlas.label.shape[0]).astype(
-            ccf_idx.dtype
-        )
+        # flip the ap axis to match the atlas volume orientation: of n voxels, index i becomes
+        # n - 1 - i, the convention of ibl-brain-transforms
+        n_ap = atlas.label.shape[0]
+        ccf_idx[:, :, 1] = (n_ap - 1 - ccf_idx[:, :, 1].astype("int64")).astype(ccf_idx.dtype)
         ref_img_histo_mlapdv = (
             atlas.ccf2xyz(ccf_idx * atlas.res_um, ccf_order="mlapdv") * 1e6
         )  # m -> μm
+        ref_img_histo_mlapdv[missing] = np.nan
         _logger.debug("resolved histology MLAPDV grid with shape %s", ref_img_histo_mlapdv.shape)
         return ref_img_histo_mlapdv, ccf_idx
 
@@ -882,13 +937,15 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             pixel of the reference session's reference image, from `load_histology_mlapdv`.
         sigma : float, optional
             Standard deviation, in pixels, of the Gaussian filter applied to the ML/AP grid
-            before building the interpolator. If None, no smoothing is applied.
+            before building the interpolator. Missing (NaN) pixels are left out of the
+            smoothing and stay missing. If None, no smoothing is applied.
 
         Returns
         -------
         scipy.interpolate.RegularGridInterpolator
             Interpolator mapping a (row, column) pixel position to its (ml, ap) coordinate.
-            Extrapolates for positions outside the grid.
+            Extrapolates for positions outside the grid. Positions whose interpolation cell
+            touches a missing pixel are NaN.
         """
         grid = histo_mlapdv[:, :, :-1]
 
@@ -896,7 +953,12 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         ys = np.arange(grid.shape[1])
 
         if sigma is not None:
-            grid = gaussian_filter(grid.astype(float), sigma=(sigma, sigma, 0))
+            # normalized convolution: missing pixels add neither value nor weight to their
+            # neighbours, and stay missing themselves
+            missing = np.isnan(grid)
+            weights = gaussian_filter((~missing).astype(float), sigma=(sigma, sigma, 0))
+            grid = gaussian_filter(np.where(missing, 0.0, grid), sigma=(sigma, sigma, 0)) / weights
+            grid[missing] = np.nan
 
         interpolator = RegularGridInterpolator(
             (xs, ys),
@@ -1063,11 +1125,17 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         Returns
         -------
         dict of str to bool
-            Whether `align_FOVs` can run with `use_histology`, `lateral_correct` and
-            `tilt_correct`.
+            Whether `align_FOVs` can run with `use_histology`, `histology_3d`,
+            `lateral_correct` and `tilt_correct`. `histology_3d` is always False for now.
         """
         _logger.info("Inferring possible corrections for %s", self.session_path)
-        corrections = {"use_histology": False, "lateral_correct": False, "tilt_correct": False}
+        # the 3D histology lookup through ibl-brain-transforms is not wired up yet, so it stays off
+        corrections = {
+            "use_histology": False,
+            "histology_3d": False,
+            "lateral_correct": False,
+            "tilt_correct": False,
+        }
 
         # the tilt is corrected against the brain surface, so its points are all it takes
         corrections["tilt_correct"] = self.data_loader.brain_surface_points.usable()
@@ -1116,6 +1184,7 @@ class MesoscopeFOVAlignment(MesoscopeTask):
     def align_FOVs(
         self,
         use_histology: bool = True,
+        histology_3d: bool = False,
         lateral_correct: bool = True,
         tilt_correct: bool = True,
         debug: bool = False,  # debug flag: just downsample
@@ -1136,6 +1205,12 @@ class MesoscopeFOVAlignment(MesoscopeTask):
             If False, project onto the atlas surface along the brain normal instead, which
             assumes the optical axis and the brain normal to be aligned. Either way, depth
             below the surface is resolved separately, from the brain surface points.
+        histology_3d : bool
+            If True, keep all three coordinates of each pixel's histology surface point, step
+            it into the brain along the optical axis inside the subject's histology sample, and
+            map it back to the atlas through ibl-brain-transforms (see
+            `mpci.alignment.histology`), instead of the 2D histology lookup. Needs
+            `use_histology` and `tilt_correct`.
         lateral_correct : bool
             If True, correct for the session-to-session lateral shift by registering this
             session's reference stack onto the reference session's.
@@ -1149,11 +1224,21 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
         Returns
         -------
-        dict of str to dict of str to numpy.ndarray
-            Per-FOV-UUID coordinate dictionaries. Every FOV holds 'pixel', 'um_global' and
-            'mlapdv_on_surface'; 'dv_below_surface', 'um_corrected',
-            'dv_below_surface_corrected' and 'mlapdv' are added when `tilt_correct` runs.
+        plane2brain.projections.Projection
+            The projection, whose `coordinates` hold one (n, 3) array per FOV index under
+            'on_surface' and 'in_brain', in atlas µm. With `histology_3d`, 'in_sample' holds the
+            stepped points in histology sample voxels (ml, dv, ap), not atlas µm. Pixels without
+            histology are NaN.
+
+        Raises
+        ------
+        ValueError
+            If `histology_3d` is set without `use_histology` or without `tilt_correct`.
         """
+        if histology_3d and not use_histology:
+            raise ValueError("histology_3d needs use_histology")
+        if histology_3d and not tilt_correct:
+            raise ValueError("histology_3d needs tilt_correct, for the surface normal and depth")
         _logger.info(
             "Aligning FOVs for %s (use_histology=%s, lateral_correct=%s, tilt_correct=%s, "
             "debug=%s)",
@@ -1255,9 +1340,19 @@ class MesoscopeFOVAlignment(MesoscopeTask):
                 self.interpolation_sigma,
             )
             ref_img_histo_mlapdv, _ = self.load_histology_mlapdv()
-            histo_interp_fn = self.interpolate_histology(
-                ref_img_histo_mlapdv, sigma=self.interpolation_sigma
-            )
+            if histology_3d:
+                # imported here, as the 3D path needs the optional ibl-brain-transforms
+                from mpci.alignment import histology
+
+                histo_interp_fn = histology.interpolate_histology_3d(
+                    ref_img_histo_mlapdv, sigma=self.interpolation_sigma
+                )
+                transform_folder = self.ensure_local_reference_session_histology_transform()
+                histology_transform = self.reference_data_loader.histology_transform.load()
+            else:
+                histo_interp_fn = self.interpolate_histology(
+                    ref_img_histo_mlapdv, sigma=self.interpolation_sigma
+                )
         else:
             _logger.info("Projecting onto atlas surface along the brain normal (no histology)")
 
@@ -1296,11 +1391,27 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
         projection = Projection(atlas, imaging_plane)
 
+        if histology_3d:
+            # one optical axis per session, from the tilt of the labeled surface, in sample
+            # voxels per µm of depth
+            optical_axis = histology.optical_axis_in_atlas(
+                n_surface, brain_normal, imaging_plane.coordinate_systems_3d
+            )
+            axis_sample = histology.axis_in_sample(
+                optical_axis,
+                transform_folder / HISTOLOGY_TRANSFORM_FILENAMES[0],
+                self.histology_atlas,
+                center_mlapdv,
+            )
+            projection.coordinates["in_sample"] = {}
+
         # iterate and project
         for _, row in fov_map.iterrows():
             image_ix = row["index"]
             image = images[image_ix]
-            if tilt_correct:
+            # the 3D path steps along the optical axis, which carries the tilt itself, so it
+            # takes the pixels where they are
+            if tilt_correct and not histology_3d:
                 # use the tilt-corrected um coordinates to transform back to reference-image px
                 px = ref_image.coordinate_systems.transform(
                     image.coordinates["um_corrected"], "um_global", "pixel"
@@ -1320,15 +1431,27 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
             # histo lookup
             if use_histology:
-                mlap_interp = histo_interp_fn(px)
-                # find point on surface
-                on_surface = atlas.get_dv_for_mlap(mlap_interp)
-                # and project down into the brain
-                in_brain = project_down_from_surface(
-                    on_surface,
-                    atlas,
-                    image.depth_below_surface,
-                )
+                if not histology_3d:
+                    mlap_interp = histo_interp_fn(px)
+                    # pixels on missing histology have no surface point, and stay NaN
+                    valid = ~np.isnan(mlap_interp).any(axis=1)
+                    depths = np.broadcast_to(image.depth_below_surface, len(px))[valid]
+                    on_surface = np.full((len(px), 3), np.nan)
+                    in_brain = np.full((len(px), 3), np.nan)
+                    # find point on surface
+                    on_surface[valid] = atlas.get_dv_for_mlap(mlap_interp[valid])
+                    # and project down into the brain
+                    in_brain[valid] = project_down_from_surface(on_surface[valid], atlas, depths)
+                else:
+                    on_surface = histo_interp_fn(px)
+                    in_sample, in_brain = histology.step_through_sample(
+                        on_surface,
+                        image.depth_below_surface,
+                        axis_sample,
+                        histology_transform,
+                        self.histology_atlas,
+                    )
+                    projection.coordinates["in_sample"][image_ix] = in_sample
             else:
                 # if no histology is present - project based on geometry
                 um_global = ref_image.coordinate_systems.transform(px, "pixel", "um_global")

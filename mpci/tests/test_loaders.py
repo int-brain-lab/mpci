@@ -20,13 +20,16 @@ from unittest import mock
 
 import numpy as np
 import tifffile
+from ibl_brain_transforms.transforms import Atlas2Sample
 
 from mpci.loaders.local import (
     HISTOLOGY_FILENAME,
+    HISTOLOGY_TRANSFORM_FOLDER,
     RAW_IMAGING_METADATA_FILENAME,
     BrainSurfacePointsLoader,
     DataLoader,
     HistologyLoader,
+    HistologyTransformLoader,
     MesoscopeLocalDataLoader,
     RawImagingMetadataLoader,
     ReferenceStackLoader,
@@ -38,6 +41,8 @@ from mpci.loaders.local import (
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "alignment"
 RAW_IMAGING_META_FILE = FIXTURE_PATH / "_ibl_rawImagingData.meta.json"
 REFERENCE_META_FILE = FIXTURE_PATH / "referenceImage.meta.json"
+# a synthetic brainregister ARA2sample folder, from the ibl-brain-transforms test fixtures
+TRANSFORM_FIXTURE_PATH = FIXTURE_PATH.parent / "histology_transform" / "ARA2sample"
 
 LOGGER_NAME = "mpci.loaders.local"
 
@@ -486,6 +491,22 @@ class TestHistology(LoaderTestCase):
         np.testing.assert_array_equal(written, HistologyLoader(bare).load())
 
 
+class TestHistologyTransform(LoaderTestCase):
+    """Tests for the brainregister registration of the subject's cleared brain."""
+
+    def test_reads_the_registration_folder(self):
+        """Test that the folder is known before it exists, and loads as sample -> atlas."""
+        subject_path = self.session_path.parents[1]
+        source = HistologyTransformLoader(subject_path)
+        expected = subject_path / HISTOLOGY_TRANSFORM_FOLDER
+        self.assertEqual(expected, Path(source.path))
+        self.assertFalse(source.available())
+
+        shutil.copytree(TRANSFORM_FIXTURE_PATH, expected)
+        self.assertTrue(source.available())
+        self.assertIsInstance(source.load(), Atlas2Sample)
+
+
 class TestMesoscopeLocalDataLoader(LoaderTestCase):
     """Tests for the loader that holds one source per kind of data."""
 
@@ -498,6 +519,7 @@ class TestMesoscopeLocalDataLoader(LoaderTestCase):
             "reference_stack_metadata": self.reference_path,
             "brain_surface_points": self.reference_path,
             "histology": self.reference_path,
+            "histology_transform": self.session_path.parents[1],
         }
         for name, folder in expected.items():
             with self.subTest(source=name):

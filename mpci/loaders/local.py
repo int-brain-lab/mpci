@@ -33,7 +33,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import tifffile
@@ -43,6 +43,9 @@ from one.alf.path import ALFPath
 from mpci.scanimage.io import patch_imaging_meta
 
 from plane2brain import scanimage
+
+if TYPE_CHECKING:
+    from ibl_brain_transforms.transforms import Transform
 
 # the exceptions the loaders raise when their data is absent or unusable: nothing found on
 # disk, an ambiguous glob, a field missing from a metadata file, and inconsistent metadata
@@ -56,6 +59,16 @@ RAW_IMAGING_METADATA_FILENAME = "_ibl_rawImagingData.meta.json"
 
 # name of the histology file the histology pipeline writes into the reference collection
 HISTOLOGY_FILENAME = "referenceImage.mlapdv.npy"
+
+# brainregister's sample -> atlas registration of a subject's cleared brain, relative to the
+# subject folder, as it sits in the histology folder on flatiron
+HISTOLOGY_TRANSFORM_FOLDER = Path("downsampledStacks_25", "ARA2sample")
+
+# the affine and the B-spline parameter file brainregister writes into that folder
+HISTOLOGY_TRANSFORM_FILENAMES = (
+    "brainregister-affine_downsampled-to-sample.txt",
+    "brainregister-bspline_downsampled-to-sample.txt",
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -902,6 +915,63 @@ class HistologyLoader(DataLoader):
                 )
 
 
+class HistologyTransformLoader(DataLoader):
+    """brainregister's registration of a subject's cleared brain to the Allen atlas.
+
+    Built on the subject folder rather than on a session, as there is one cleared brain per
+    subject. Read through ibl-brain-transforms, which is part of the `alignment` extra.
+    """
+
+    @property
+    def path(self) -> Path:
+        """pathlib.Path: where the registration folder belongs, whether or not it is there."""
+        return self.data_path / HISTOLOGY_TRANSFORM_FOLDER
+
+    def available(self) -> bool:
+        """Report whether the registration folder is on disk locally.
+
+        Returns
+        -------
+        bool
+            True if the local `ARA2sample` folder exists.
+        """
+        return self.path.is_dir()
+
+    def load(self, res_um: int = 25) -> Transform:
+        """Read the registration as a point mapping between the sample and the atlas.
+
+        Parameters
+        ----------
+        res_um : int
+            Voxel size, in µm, of the atlas grid the registration was made on.
+
+        Returns
+        -------
+        ibl_brain_transforms.transforms.Transform
+            The registration; its `sample2atlas` maps sample voxels to atlas voxels directly.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the folder is not on disk locally.
+        ValueError
+            If the folder does not hold exactly one affine and one B-spline parameter file.
+        """
+        # an optional dependency, from the alignment extra
+        from ibl_brain_transforms.io import read_transform
+
+        return read_transform(self.path, res_um=res_um)
+
+    def validate(self, transform: Transform) -> None:
+        """Accept any registration that loads; `read_transform` checks the files itself.
+
+        Parameters
+        ----------
+        transform : ibl_brain_transforms.transforms.Transform
+            What `load` returned.
+        """
+
+
 class MesoscopeLocalDataLoader:
     """All the data of one mesoscope session, one `DataLoader` per source.
 
@@ -930,6 +1000,8 @@ class MesoscopeLocalDataLoader:
         The brain surface points, from a file or from the stack metadata.
     histology : HistologyLoader
         The atlas indices of the reference image, if this session is aligned to histology.
+    histology_transform : HistologyTransformLoader
+        The registration of the subject's cleared brain to the atlas, if it has been cleared.
     """
 
     def __init__(
@@ -970,3 +1042,5 @@ class MesoscopeLocalDataLoader:
             self.reference_path, self.reference_stack_metadata
         )
         self.histology = HistologyLoader(self.reference_path)
+        # there is one cleared brain per subject, so its registration sits in the subject folder
+        self.histology_transform = HistologyTransformLoader(self.session_path.parents[1])

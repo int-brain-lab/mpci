@@ -19,8 +19,11 @@ The metadata fixtures in `fixtures/alignment` are the real files of
 be read from them rather than chosen.
 """
 
+import inspect
 import json
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -39,6 +42,8 @@ from mpci.loaders.local import HistologyLoader
 from mpci.tests import TEST_DB, IntegrationTestCase
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "alignment"
+# a synthetic brainregister ARA2sample folder, from the ibl-brain-transforms test fixtures
+TRANSFORM_FIXTURE_PATH = FIXTURE_PATH.parent / "histology_transform" / "ARA2sample"
 RAW_IMAGING_META_FILE = FIXTURE_PATH / "_ibl_rawImagingData.meta.json"
 REFERENCE_META_FILE = FIXTURE_PATH / "referenceImage.meta.json"
 
@@ -447,6 +452,53 @@ class TestStaging(AlignmentTestCase):
         self.assertTrue(task.reference_data_loader.reference_stack.available())
         self.assertEqual([], task.links)
 
+    def test_histology_transform_on_popeye_is_linked_from_the_histology_folder(self):
+        """Test that the subject's registration folder is linked into the mirror's subject."""
+        task = self.make_popeye_task()
+        transform_source = (
+            self.root / "histology" / "cortexlab" / "SP000" / "downsampledStacks_25" / "ARA2sample"
+        )
+        shutil.copytree(TRANSFORM_FIXTURE_PATH, transform_source)
+
+        self.assertFalse(task.reference_data_loader.histology_transform.available())
+        local_folder = task.ensure_local_reference_session_histology_transform()
+
+        self.assertTrue(task.reference_data_loader.histology_transform.available())
+        self.assertEqual(task.reference_data_loader.histology_transform.path, local_folder)
+        self.assertEqual(transform_source, local_folder.readlink())
+        self.assertTrue(local_folder.is_relative_to(self.root / "quarantine"))
+        self.assertEqual([local_folder], task.links)
+
+    def test_histology_transform_downloaded_over_http(self):
+        """Test that off popeye both registration files are downloaded into the subject."""
+        task = self.make_task()
+        task.one.get_details.return_value = {"lab": "cortexlab"}
+        task.one.alyx._par.HTTP_DATA_SERVER = "https://data.server"
+
+        def copy_fixture(urls: list[str], target_dir: Path) -> list[Path]:
+            """Stand in for the download, copying the fixture files the URLs name."""
+            return [
+                Path(shutil.copy(TRANSFORM_FIXTURE_PATH / url.rsplit("/", 1)[-1], target_dir))
+                for url in urls
+            ]
+
+        task.one.alyx.download_file.side_effect = copy_fixture
+        local_folder = task.ensure_local_reference_session_histology_transform()
+
+        self.assertEqual(task.reference_data_loader.histology_transform.path, local_folder)
+        self.assertEqual(self.ref_session_path.parents[1], local_folder.parents[1])
+        self.assertTrue(task.reference_data_loader.histology_transform.usable())
+        remote_folder = (
+            "https://data.server/histology/cortexlab/SP000/downsampledStacks_25/ARA2sample/"
+        )
+        self.assertEqual(
+            [
+                remote_folder + "brainregister-affine_downsampled-to-sample.txt",
+                remote_folder + "brainregister-bspline_downsampled-to-sample.txt",
+            ],
+            task.one.alyx.download_file.call_args[0][0],
+        )
+
     def test_reference_stack_on_popeye_is_linked_into_the_mirror(self):
         """Test that on popeye the stack is symlinked out of the read-only mount."""
         task = self.make_popeye_task()
@@ -507,6 +559,77 @@ class TestProcessing(AlignmentTestCase):
         expected = {f"FOV_{i:02}": fov_uuid for i, fov_uuid in enumerate(FOV_UUIDS)}
         self.assertEqual(expected, fov_map)
 
+    def test_infer_possible_corrections_histology_3d(self):
+        """Test that 3D histology is off, and that align_FOVs takes every correction."""
+        task = self.make_task(reference_session_path=None)
+        corrections = task.infer_possible_corrections()
+        self.assertIs(False, corrections["histology_3d"])
+        align_parameters = inspect.signature(task.align_FOVs).parameters
+        self.assertLessEqual(corrections.keys(), align_parameters.keys())
+
+    def test_task_imports_without_ibl_brain_transforms(self):
+        """Test that the task module, and with it the 2D path, does not need the 3D dependency."""
+        blocker = "import sys; sys.modules['ibl_brain_transforms'] = None; "
+        result = subprocess.run(
+            [sys.executable, "-c", blocker + "import mpci.alignment.task"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_histology_3d_needs_use_histology(self):
+        """Test that the 3D path refuses to run without histology, before loading anything."""
+        task = self.make_task()
+        with self.assertRaisesRegex(ValueError, "use_histology"):
+            task.align_FOVs(use_histology=False, histology_3d=True)
+
+    def test_histology_3d_needs_tilt_correct(self):
+        """Test that the 3D path refuses to run without the brain surface points."""
+        task = self.make_task()
+        with self.assertRaisesRegex(ValueError, "tilt_correct"):
+            task.align_FOVs(use_histology=True, histology_3d=True, tilt_correct=False)
+
+    def load_histology(self, ccf_idx: np.ndarray) -> np.ndarray:
+        """Run `load_histology_mlapdv` on a given histology file, with an identity `ccf2xyz`.
+
+        Parameters
+        ----------
+        ccf_idx : numpy.ndarray
+            The (h, w, 3) uint16 content of `referenceImage.mlapdv.npy`.
+
+        Returns
+        -------
+        numpy.ndarray
+            The (h, w, 3) µm coordinates, which with the identity `ccf2xyz` are the flipped
+            atlas indices times the voxel size.
+        """
+        task = self.make_task()
+        # with ccf2xyz returning its input, the output shows the indices it was handed, in µm
+        self.atlas.ccf2xyz.side_effect = lambda ccf, ccf_order: np.asarray(ccf, float) / 1e6
+        histology = task.reference_data_loader.histology
+        with (
+            mock.patch.object(task, "ensure_local_reference_session_histology"),
+            mock.patch.object(histology, "load", return_value=ccf_idx),
+            mock.patch.object(histology, "validate"),
+        ):
+            mlapdv, _ = task.load_histology_mlapdv()
+        return mlapdv
+
+    def test_load_histology_flips_ap_onto_the_last_voxel(self):
+        """Test that AP index i of n voxels lands on n - 1 - i, as in ibl-brain-transforms."""
+        ccf_idx = np.array([[[10, 0, 5], [20, 527, 7]]], dtype="uint16")
+        mlapdv = self.load_histology(ccf_idx)
+        n_ap = self.atlas.label.shape[0]
+        np.testing.assert_array_equal([n_ap - 1, 0], mlapdv[0, :, 1] / self.atlas.res_um)
+
+    def test_load_histology_marks_pixels_without_histology_missing(self):
+        """Test that all-zero pixels come out as NaN, and every other pixel stays finite."""
+        ccf_idx = np.array([[[10, 0, 5], [0, 0, 0]], [[20, 30, 7], [0, 0, 1]]], dtype="uint16")
+        mlapdv = self.load_histology(ccf_idx)
+        missing = np.isnan(mlapdv)
+        np.testing.assert_array_equal([[False, True], [False, False]], missing.all(axis=-1))
+        self.assertFalse(missing.any(axis=-1)[~missing.all(axis=-1)].any())
+
     def test_interpolate_histology(self):
         """Test that the interpolator returns the ML/AP coordinates of the sampled pixels."""
         histo = histology_mlapdv()
@@ -520,6 +643,24 @@ class TestProcessing(AlignmentTestCase):
 
         # positions outside the grid are extrapolated rather than filled with NaN
         self.assertFalse(np.isnan(interpolator(np.array([[-5.0, -5.0]]))).any())
+
+    def test_interpolate_histology_smooths_around_missing_pixels(self):
+        """Test that missing pixels do not pull their neighbours, and stay missing."""
+        histo = np.full((8, 8, 3), 100.0)
+        histo[3:5, 3:5] = np.nan
+        interpolator = MesoscopeFOVAlignment.interpolate_histology(histo, sigma=1.5)
+
+        rows, columns = np.meshgrid(np.arange(8.0), np.arange(8.0), indexing="ij")
+        pixels = np.c_[rows.ravel(), columns.ravel()]
+        values = interpolator(pixels)
+        missing = np.isnan(histo[..., 0]).ravel()
+        self.assertTrue(np.isnan(values[missing]).all())
+        # linear interpolation in a cell with a missing corner is missing too, so only pixels
+        # more than one pixel away from the hole are sure to have a value
+        away = (np.abs(pixels - 3.5) > 2).any(axis=1)
+        self.assertFalse(np.isnan(values[away]).any())
+        # and no value is pulled towards zero by its missing neighbours
+        np.testing.assert_array_almost_equal(100.0, values[~np.isnan(values)])
 
     def test_register_reference_stacks(self):
         """Test that the image transform is returned and written to disk."""
