@@ -1283,12 +1283,13 @@ class MesoscopeFOVAlignment(MesoscopeTask):
 
         # adding depth below surface information to the images, if possible
         if self.data_loader.brain_surface_points.usable():
-            brain_surface_points = self.data_loader.brain_surface_points.load(prefer="metadata")
+            brain_surface_points = self.data_loader.brain_surface_points.load()
             # this normal is expressed in the coordinate system of the reference stack
             p_surface, n_surface, dv_avg = brain_surface.get_brain_surface_normal(
                 brain_surface_points,
                 ref_img_meta=ref_img_meta,
                 coordinate_systems_ref=ref_image.coordinate_systems,
+                cortical_depth=self.data_loader.brain_surface_points.load_cortical_depth(),
             )
             # dv_avg is negated stack z, while the FOVs' z is raw ScanImage z, which grows with
             # depth: their sum is the depth below the (level) surface, positive below it
@@ -1303,12 +1304,13 @@ class MesoscopeFOVAlignment(MesoscopeTask):
         # they resolve the depth and the tilt around it in one go
         if tilt_correct:
             _logger.info("Applying tilt correction from brain surface points")
-            brain_surface_points = self.data_loader.brain_surface_points.load(prefer="metadata")
+            brain_surface_points = self.data_loader.brain_surface_points.load()
             # this normal is expressed in the coordinate system of the reference stack
             p_surface, n_surface, _ = brain_surface.get_brain_surface_normal(
                 brain_surface_points,
                 ref_img_meta=ref_img_meta,
                 coordinate_systems_ref=ref_image.coordinate_systems,
+                cortical_depth=self.data_loader.brain_surface_points.load_cortical_depth(),
             )
 
             # correct each image for the tilt between the brain surface and the optical axis,

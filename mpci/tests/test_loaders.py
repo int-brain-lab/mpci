@@ -405,8 +405,19 @@ class TestBrainSurfacePoints(LoaderTestCase):
         """Test that `prefer` picks the source when both exist with different contents."""
         expected = self.points_from_metadata_differing()
         self.assertEqual(expected, self.source.load(prefer="metadata"))
-        self.assertEqual(99, self.source.load()[0]["stack_idx"])  # metadata is the default
+        self.assertNotEqual(99, self.source.load()[0]["stack_idx"])  # the file is the default
         self.assertNotEqual(expected, self.source.load(prefer="file"))
+
+    def test_cortical_depth_comes_from_the_source_of_the_points(self):
+        """Test that the logged depth follows the points' source, and is 0 when not logged."""
+        self.assertEqual(0.0, self.source.load_cortical_depth())
+        record = {"points": self.source.load_from_file(), "cortical_depth": 20}
+        self.points_file.write_text(json.dumps(record))
+        self.assertEqual(20.0, self.source.load_cortical_depth())
+        # with disagreeing points, preferring the metadata takes its (unlogged) depth
+        self.points_from_metadata_differing()
+        self.assertEqual(20.0, self.source.load_cortical_depth(prefer="file"))
+        self.assertEqual(0.0, self.source.load_cortical_depth(prefer="metadata"))
 
     def remove_metadata_points(self) -> None:
         """Drop the points from the reference stack metadata, leaving only the file source."""

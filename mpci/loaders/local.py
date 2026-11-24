@@ -695,6 +695,23 @@ class BrainSurfacePointsLoader(DataLoader):
         """
         return self._can_find(self.path)
 
+    def _record_from_file(self) -> dict:
+        """Read the dedicated points file: 'points', and optionally 'cortical_depth'.
+
+        Raises
+        ------
+        FileNotFoundError
+            If no points file exists.
+        ValueError
+            If more than one points file exists.
+        KeyError
+            If the file holds no points.
+        """
+        record = json.loads(self.path().read_text(encoding="utf-8"))
+        if "points" not in record:
+            raise KeyError("points")
+        return record
+
     def load_from_file(self) -> list[dict]:
         """Read the brain surface points from the dedicated points file.
 
@@ -712,7 +729,7 @@ class BrainSurfacePointsLoader(DataLoader):
         KeyError
             If the file holds no points.
         """
-        return json.loads(self.path().read_text(encoding="utf-8"))["points"]
+        return self._record_from_file()["points"]
 
     def available_from_metadata(self) -> bool:
         """Report whether the reference stack metadata carries brain surface points.
@@ -729,6 +746,19 @@ class BrainSurfacePointsLoader(DataLoader):
             return False
         return "points" in self.reference_stack_metadata.load()
 
+    def _record_from_metadata(self) -> dict:
+        """Read the reference stack metadata: 'points', and optionally 'cortical_depth'.
+
+        Raises
+        ------
+        KeyError
+            If the metadata does not contain any points.
+        """
+        record = self.reference_stack_metadata.load()
+        if "points" not in record:
+            raise KeyError("points")
+        return record
+
     def load_from_metadata(self) -> list[dict]:
         """Read the brain surface points from the reference stack metadata.
 
@@ -742,7 +772,7 @@ class BrainSurfacePointsLoader(DataLoader):
         KeyError
             If the metadata does not contain any points.
         """
-        return self.reference_stack_metadata.load()["points"]
+        return self._record_from_metadata()["points"]
 
     def available(self) -> bool:
         """Report whether brain surface points are available from either source.
@@ -754,16 +784,66 @@ class BrainSurfacePointsLoader(DataLoader):
         """
         return self.available_from_file() or self.available_from_metadata()
 
-    def load(self, prefer: Literal["metadata", "file"] = "metadata") -> list[dict]:
-        """Load the brain surface points, from either the points file or the stack metadata.
+    def _load_record(self, prefer: Literal["file", "metadata"]) -> dict:
+        """Pick the source of the brain surface points, and return all it holds about them.
 
-        Both sources are tried. If they exist and disagree, `prefer` decides which one wins;
-        if only the non-preferred source exists, it is used and a warning is logged.
+        Both sources are tried. If they exist and their points disagree, `prefer` decides which
+        one wins; if only the non-preferred source exists, it is used and a warning is logged.
 
         Parameters
         ----------
-        prefer : {'metadata', 'file'}
-            Source to use when both exist and their contents differ.
+        prefer : {'file', 'metadata'}
+            Source to use when both exist and their points differ.
+
+        Returns
+        -------
+        dict
+            The chosen source's record: 'points', and 'cortical_depth' if it was logged.
+
+        Raises
+        ------
+        ValueError
+            If neither source provides points, or if `prefer` is not a valid source.
+        """
+        if prefer not in ("metadata", "file"):
+            raise ValueError(f"invalid preference: {prefer}")
+
+        try:
+            from_file = self._record_from_file()
+        except MISSING_DATA_ERRORS:
+            from_file = None
+        try:
+            from_metadata = self._record_from_metadata()
+        except MISSING_DATA_ERRORS:
+            from_metadata = None
+
+        if from_file is None and from_metadata is None:
+            raise ValueError(f"no brain surface points found for {self.data_path}")
+
+        # only one source has them, so the preference does not get a say
+        if from_file is None:
+            if prefer == "file":
+                _logger.warning("using metadata as a non-preferred source of brain surface points")
+            return from_metadata
+        if from_metadata is None:
+            if prefer == "metadata":
+                _logger.warning(
+                    "using points.json file as a non-preferred source of brain surface points"
+                )
+            return from_file
+
+        # both have them, and where their points agree the preference makes no difference
+        if from_file["points"] == from_metadata["points"]:
+            return from_file
+        return from_metadata if prefer == "metadata" else from_file
+
+    def load(self, prefer: Literal["file", "metadata"] = "file") -> list[dict]:
+        """Load the brain surface points, from either the points file or the stack metadata.
+
+        Parameters
+        ----------
+        prefer : {'file', 'metadata'}
+            Source to use when both exist and their points differ, see `_load_record`.
 
         Returns
         -------
@@ -775,37 +855,31 @@ class BrainSurfacePointsLoader(DataLoader):
         ValueError
             If neither source provides points, or if `prefer` is not a valid source.
         """
-        if prefer not in ("metadata", "file"):
-            raise ValueError(f"invalid preference: {prefer}")
+        return self._load_record(prefer)["points"]
 
-        try:
-            points_from_file = self.load_from_file()
-        except MISSING_DATA_ERRORS:
-            points_from_file = None
-        try:
-            points_from_metadata = self.load_from_metadata()
-        except MISSING_DATA_ERRORS:
-            points_from_metadata = None
+    def load_cortical_depth(self, prefer: Literal["file", "metadata"] = "file") -> float:
+        """Load the depth below the brain surface the points were picked at.
 
-        if points_from_file is None and points_from_metadata is None:
-            raise ValueError(f"no brain surface points found for {self.data_path}")
+        When the reference stack does not reach the brain surface, the points are picked on a
+        plane below it and the GUI logs that plane's estimated depth, in µm, as
+        'cortical_depth'. It is read from the same source as the points.
 
-        # only one source has them, so the preference does not get a say
-        if points_from_file is None:
-            if prefer == "file":
-                _logger.warning("using metadata as a non-preferred source of brain surface points")
-            return points_from_metadata
-        if points_from_metadata is None:
-            if prefer == "metadata":
-                _logger.warning(
-                    "using points.json file as a non-preferred source of brain surface points"
-                )
-            return points_from_file
+        Parameters
+        ----------
+        prefer : {'file', 'metadata'}
+            Source to use when both exist and their points differ, as for `load`.
 
-        # both have them, and where they agree the preference makes no difference
-        if points_from_file == points_from_metadata:
-            return points_from_file
-        return points_from_metadata if prefer == "metadata" else points_from_file
+        Returns
+        -------
+        float
+            The logged depth in µm, or 0 if none was logged, i.e. the points lie on the surface.
+
+        Raises
+        ------
+        ValueError
+            If neither source provides points, or if `prefer` is not a valid source.
+        """
+        return float(self._load_record(prefer).get("cortical_depth", 0))
 
     def validate(self, brain_surface_points: list[dict]) -> None:
         """Check that the brain surface points can define a plane.
